@@ -4,8 +4,7 @@ A lightweight Python library for lazy operations on Zarr arrays.
 
 ## Overview
 
-**dyna_zarr** provides a thin abstraction layer on top of
-[zarr](https://zarr-python.readthedocs.io/) for lazy and dynamic array processing. It is designed to simplify working with large, multidimensional datasets by enabling memory-efficient, region-wise I/O and computation.
+**dyna_zarr** provides a thin layer on top of [Zarr](https://zarr-python.readthedocs.io/) for lazy and dynamic array processing. It is designed to simplify working with large, multidimensional datasets by enabling memory-efficient, region-wise I/O and computation.
 
 ## Features
 
@@ -17,7 +16,7 @@ A lightweight Python library for lazy operations on Zarr arrays.
 ## Installation
 
 ```bash
-pip install dyna_zarr
+pip install git+https://github.com/bugraoezdemir/dyna_zarr.git
 ```
 
 For development:
