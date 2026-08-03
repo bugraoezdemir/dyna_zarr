@@ -42,8 +42,15 @@ def random_key(rng, shape):
     return tuple(key)
 
 
+_KERNEL = np.random.default_rng(7).random((3, 3, 3)).astype(np.float32)   # fixed conv kernel
+
+
 # name -> (dyna_op, scipy_reference); reference uses mode='reflect' to match default boundary
 OPS = {
+    "convolve_3":       (lambda da: ops.convolve(da, _KERNEL),
+                         lambda a: ndi.convolve(a, _KERNEL, mode="reflect")),
+    "correlate_3":      (lambda da: ops.correlate(da, _KERNEL),
+                         lambda a: ndi.correlate(a, _KERNEL, mode="reflect")),
     "gaussian_s2":      (lambda da: ops.gaussian_filter(da, 2.0),
                          lambda a: ndi.gaussian_filter(a, 2.0, mode="reflect")),
     "gaussian_aniso":   (lambda da: ops.gaussian_filter(da, (1.0, 2.0, 0.5)),

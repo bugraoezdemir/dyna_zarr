@@ -210,8 +210,40 @@ def grey_dilation(array, size, boundary="reflect", device=None, **kw):
                        name="grey_dilation", device=device)
 
 
+def _kernel_depth(weights, ndim):
+    """Halo per axis for a convolution/correlation kernel: half the kernel size (>= the
+    kernel's reach on either side, so map_overlap stays exact vs the whole-array result)."""
+    w = np.asarray(weights)
+    if w.ndim != ndim:
+        raise ValueError(
+            f"weights ndim {w.ndim} must match array ndim {ndim}; use size-1 axes to leave "
+            f"an axis untouched (e.g. a (1, ky, kx) kernel over a (z, y, x) volume)"
+        )
+    return w, tuple(int(s) // 2 for s in w.shape)
+
+
+def convolve(array, weights, boundary="reflect", cval=0.0, device=None):
+    """Multidimensional convolution with a ``weights`` kernel (like scipy.ndimage.convolve).
+    ``weights`` must have the same ndim as ``array`` (size-1 axes leave an axis untouched).
+    The kernel is moved to the block's namespace, so this runs on CPU or GPU per ``device``."""
+    w, depth = _kernel_depth(weights, array.ndim)
+    func = lambda b: ndimage_namespace(b).convolve(
+        b, array_namespace(b).asarray(w), mode=boundary, cval=cval)
+    return map_overlap(array, func, depth, boundary=boundary, name="convolve", device=device)
+
+
+def correlate(array, weights, boundary="reflect", cval=0.0, device=None):
+    """Multidimensional cross-correlation with a ``weights`` kernel (like
+    scipy.ndimage.correlate). Same as ``convolve`` but the kernel is not flipped."""
+    w, depth = _kernel_depth(weights, array.ndim)
+    func = lambda b: ndimage_namespace(b).correlate(
+        b, array_namespace(b).asarray(w), mode=boundary, cval=cval)
+    return map_overlap(array, func, depth, boundary=boundary, name="correlate", device=device)
+
+
 __all__ = [
     "MapOverlapTransform", "map_overlap",
     "gaussian_filter", "uniform_filter", "median_filter",
     "minimum_filter", "maximum_filter", "grey_erosion", "grey_dilation",
+    "convolve", "correlate",
 ]
