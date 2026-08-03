@@ -19,10 +19,15 @@ import threading
 import gc
 from queue import Queue
 
-from .tiff_reader import read_tiff_lazy
+from .tiff_reader import open_tiff_zarr, read_tiff_lazy
 from .codecs import Codecs
 from .dynamic_array import DynamicArray
 from .utils import parse_dtype
+from .operations._backend import (
+    device_context as _device_context, asnumpy as _asnumpy,
+    asnumpy_pinned as _asnumpy_pinned,
+    new_stream as _new_stream, use_stream as _use_stream,
+)
 
 
 def _parse_storage_location(file_path):
@@ -36,7 +41,12 @@ def _parse_storage_location(file_path):
     """
     if not isinstance(file_path, str):
         file_path = str(file_path)
-    
+
+    # Windows drive-letter path (e.g. C:\foo or C:/foo): urlparse would mistake
+    # the drive letter for a single-character URL scheme, so short-circuit to local.
+    if len(file_path) >= 2 and file_path[0].isalpha() and file_path[1] == ':':
+        return 'local', Path(file_path)
+
     # Parse URL scheme
     parsed = urlparse(file_path)
     
@@ -147,9 +157,9 @@ def read_file(file_path):
                 )
         
         elif _is_tiff_path(str(parsed_path)):
-            # Local TIFF file
-            return read_tiff_lazy(parsed_path)
-        
+            # Local TIFF file -> lazy zarr array (raw backend object; read_array wraps it)
+            return open_tiff_zarr(parsed_path)
+
         else:
             raise ValueError(
                 f"Unsupported file type: {parsed_path.suffix}. "
@@ -162,10 +172,8 @@ def read_file(file_path):
         path_str = str(parsed_path)
         
         if _is_tiff_path(path_str):
-            # TIFF file on cloud storage
-            # Note: tifffile may support remote TIFF via fsspec
-            # For now, try to read via tifffile (it should handle the URL)
-            return read_tiff_lazy(file_path)
+            # TIFF file on cloud storage (tifffile may support remote via fsspec)
+            return open_tiff_zarr(file_path)
         
         else:
             # Assume it's a Zarr array on cloud storage
@@ -234,7 +242,7 @@ def read_file(file_path):
         
         if _is_tiff_path(path_str):
             # TIFF over HTTP - pass to tifffile (may support via fsspec)
-            return read_tiff_lazy(file_path)
+            return open_tiff_zarr(file_path)
         else:
             # Zarr over HTTP
             spec = {
@@ -276,26 +284,10 @@ def read_array(source: Union[str, Path]) -> 'DynamicArray':
     
     source_path = Path(source) if not isinstance(source, Path) else source
     
-    # Check if it's a TIFF or zarr file - use read_file for both
+    # TIFF -> lazy zarr array via tifffile's bridge, wrapped as a normal zarr-backed
+    # DynamicArray (laziness/slicing/memory-bounded reads all come from DynamicArray).
     if str(source_path).lower().endswith(('.tif', '.tiff')):
-        # TIFF file
-        ts_array = read_file(source)
-        dyn_array = object.__new__(DynamicArray)
-        dyn_array._ts_array = ts_array
-        dyn_array._is_tensorstore = True
-        dyn_array._source = source
-        dyn_array._shape = tuple(ts_array.shape)
-        dyn_array._dtype = ts_array.dtype
-        dyn_array._transform = None
-        dyn_array._chunks = ts_array.chunks if hasattr(ts_array, 'chunks') else None
-        # TIFF files don't have zarr metadata, set defaults
-        dyn_array._zarr_array = None
-        dyn_array._zarr_format = None
-        dyn_array._compressor = None
-        dyn_array._compressors = None
-        dyn_array._shards = None
-        dyn_array._codecs = None
-        return dyn_array
+        return read_tiff_lazy(source)
     
     elif (isinstance(source_path, Path) and source_path.is_dir() and 
           ((source_path / ".zarray").exists() or 
@@ -480,6 +472,8 @@ def write_array(
     gc_interval: float = 15.0,
     early_quarter_timeout: Optional[float] = None,
     early_tenth_timeout: Optional[float] = None,
+    max_inflight_writes: Optional[int] = None,
+    device: Optional[str] = None,
     **kwargs
 ):
     """
@@ -518,9 +512,36 @@ def write_array(
     gc_interval : float
         Seconds between GC runs (default: 15.0)
     """
+    # A reshape/flatten as the OUTERMOST op is a C-order flat re-index that conflicts with
+    # nd chunk layout -- the region writer can't do it memory-bound. Route it to the
+    # streaming reindex writer (per-output-chunk, one input chunk at a time): hard-bounded
+    # to ~1 input chunk + 1 output chunk, race-free, on any chunking.
+    _tr = getattr(array, "_transform", None)
+    _trname = type(_tr).__name__
+    _local = _parse_storage_location(str(output_path))[0] == "local"
+    if _trname == "FlattenTransform" and _local:
+        # disk-staged rechunk-to-flat-contiguous + relabel: read-once source. Per-worker memory
+        # = region_size_mb; peak ~= max_workers * region_size_mb (same knobs as the region path).
+        from .rechunk import flatten_write
+        return flatten_write(_tr.array, output_path, output_chunks=chunks,
+                             max_mem=int(region_size_mb * 1024 * 1024), max_workers=max_workers,
+                             dtype=dtype, zarr_format=zarr_format or 2)
+    if _trname == "ReshapeTransform" and _local:
+        # staged: flatten source to 1D contiguous F (read-once, bounded), then reindex F ->
+        # target shape (contiguous input => no chunk-amplification). Per-worker memory =
+        # region_size_mb; forwards max_workers. Same knobs as the region path.
+        from .rechunk import reshape_write
+        return reshape_write(_tr.array, array.shape, output_path, output_chunks=chunks,
+                             max_mem=int(region_size_mb * 1024 * 1024), max_workers=max_workers,
+                             dtype=dtype, zarr_format=zarr_format or 2)
     import tensorstore as ts
     if num_readers is None:
-        num_readers = max(1, max_workers * 2)
+        # One reader per writer (balanced). The async writes are the bottleneck, so extra
+        # readers just race ahead and pin more region buffers (peak RAM scales with reader
+        # count) without improving throughput -- measured 2x readers was both heavier AND
+        # slower than 1x. Raise num_readers explicitly to hide read latency on slow/remote
+        # stores. Peak RAM ~= 2 * (num_readers + queue_size + max_inflight_writes) * region_size_mb.
+        num_readers = max(1, max_workers)
     
     # Aggressive memory cleanup before starting
     gc.collect()
@@ -661,9 +682,23 @@ def write_array(
     
     print(f"[Optimized] Total regions to process: {total_chunks}, Shape: {input_shape}, Region: {region_shape}", flush=True)
     
-    # Queue for work distribution (good for pipeline buffering)
+    # Queue for work distribution (good for pipeline buffering).
+    # Peak RAM ~= 2 * (num_readers + queue_size + max_inflight_writes) * region_size_mb.
+    # The floor of 4 gives read-ahead/write-behind headroom so readers and writers
+    # overlap even at low worker counts. (Measured: dropping the floor to scale purely
+    # with max_workers trimmed RAM only at 1 worker, at a throughput cost, and was
+    # same-or-worse at >=2 workers -- the floor is NOT the memory driver; the staged
+    # read->queue->async-write pipeline structurally holds more live blocks than dask's
+    # single-stage model, which is also why it is faster.) Old default was
+    # min(128, max(32, num_readers)) = 32 -> a ~256MB queue ceiling regardless of size.
     if queue_size is None:
-        queue_size = min(128, max(32, num_readers))
+        queue_size = max(4, max_workers)
+
+    # Cap concurrent async writes: each pending tensorstore write future pins its
+    # ~region_size data buffer until it commits, so without this fast submission keeps
+    # the whole array's buffers alive at once (RSS ~= array size). See writer_thread.
+    if max_inflight_writes is None:
+        max_inflight_writes = max(4, 2 * max_workers)
     
     chunk_queue = Queue(maxsize=queue_size)
     sentinel_lock = threading.Lock()
@@ -688,6 +723,9 @@ def write_array(
     
     def reader_thread():
         """Fast producer - no overhead."""
+        # Each reader thread owns a CUDA stream so region GPU pipelines overlap (one
+        # region's compute runs while another's H2D/D2H copies). None on CPU.
+        gpu_stream = _new_stream(device)
         try:
             while not shutdown_flag.is_set():
                 if state.get('error'):  # Check for errors
@@ -714,13 +752,21 @@ def write_array(
                         for start, rs, dim_size in zip(chunk_start, region_shape, input_shape)
                     )
                     
-                    # Read actual data using _read_direct to avoid creating SliceTransform
-                    data = input_array._read_direct(chunk_slice)
-                    
+                    # Read actual data using _read_direct to avoid creating SliceTransform.
+                    # device_context is thread-local, so set it here (in the reader thread)
+                    # so the op chain runs on the requested device for this region; the
+                    # per-thread stream lets regions overlap on the GPU. Then bring the
+                    # region back to host (D2H) since tensorstore writes numpy.
+                    with _use_stream(gpu_stream), _device_context(device):
+                        data = input_array._read_direct(chunk_slice)
+                        # pinned D2H: faster + avoids pinned-staging contention across
+                        # the concurrent reader threads (measured ~7-18% faster on GPU).
+                        data = _asnumpy_pinned(data)
+
                     # Convert dtype if needed (allows unsafe casting if explicitly requested)
                     if data.dtype != final_dtype_obj:
                         data = data.astype(final_dtype_obj, copy=False)
-                    
+
                     chunk_queue.put((chunk_slice, data))
                     
                     if current_idx % 10 == 0:
@@ -776,8 +822,28 @@ def write_array(
                     # Commit futures immediately to ensure all are tracked
                     with futures_lock:
                         write_futures.append(write_future)
-                    
+
                     chunk_queue.task_done()
+
+                    # Backpressure + release. Each pending write future pins its
+                    # ~region_size data buffer until it commits, and a *done* future keeps
+                    # pinning it until the future object itself is dropped. So we must both
+                    # (a) prune completed futures here to free their buffers, and (b) block
+                    # while too many writes are still in flight. Without this, buffers for
+                    # the whole array stay alive at once (RSS grows with array size); with
+                    # it, peak RAM stays ~ max_inflight_writes * region_size, array-independent.
+                    while not shutdown_flag.is_set() and not state.get('error'):
+                        with futures_lock:
+                            done = [f for f in write_futures if f.done()]
+                            for f in done:
+                                write_futures.remove(f)
+                            n_inflight = len(write_futures)
+                        for f in done:
+                            f.result()  # surface any write error early (already complete)
+                        del done
+                        if n_inflight < max_inflight_writes:
+                            break
+                        time.sleep(0.001)
                     
                 except Exception as e:
                     print(f"[Writer] ERROR: {e}", flush=True)
@@ -818,7 +884,12 @@ def write_array(
         quarter_checked = False
         
         while not stop_monitor.is_set():
-            time.sleep(2.0)
+            # Interruptible wait: Event.wait() returns immediately when stop_monitor is
+            # set, so a fast write isn't padded by a full sleep interval. Using a plain
+            # time.sleep(2.0) here left monitor.join(timeout=2.0) blocking ~2s on every
+            # write (a fixed latency floor that dominated small/medium writes).
+            if stop_monitor.wait(2.0):
+                break
             try:
                 current_read = state['read_idx']
                 with futures_lock:
@@ -1005,12 +1076,15 @@ class io:
         gc_interval: float = 15.0,
         early_quarter_timeout: Optional[float] = None,
         early_tenth_timeout: Optional[float] = None,
+        max_inflight_writes: Optional[int] = None,
+        device: Optional[str] = None,
         **kwargs
     ):
-        """Write array to Zarr. See write_array() for details."""
+        """Write array to Zarr. See write_array() for details. ``device`` ('cpu'|'cuda')
+        runs each region's op chain on that device (results are written from host)."""
         return write_array(
             array, output_path, max_workers, num_readers, queue_size,
             chunks, shard_coefficients, dtype, compressor, zarr_format,
             region_size_mb, gc_interval, early_quarter_timeout,
-            early_tenth_timeout, **kwargs
+            early_tenth_timeout, max_inflight_writes, device, **kwargs
         )
