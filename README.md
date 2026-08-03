@@ -1,17 +1,21 @@
 # dyna_zarr
 
-A lightweight Python library for lazy operations on Zarr arrays.
+A lightweight, **dask-free** Python library for lazy, **memory-bounded** operations on large Zarr (and TIFF) arrays — with an optional GPU path.
 
 ## Overview
 
-**dyna_zarr** provides a thin layer on top of [Zarr](https://zarr-python.readthedocs.io/) for lazy and dynamic array processing. It is designed to simplify working with large, multidimensional datasets by enabling memory-efficient, region-wise I/O and computation.
+**dyna_zarr** is a thin, pull-based array layer over [Zarr](https://zarr-python.readthedocs.io/). Instead of building a task graph, every operation is a lazy *transform* whose `read(key)` maps an output slice back to a bounded input read, ending at a direct zarr/TensorStore read. Slicing a result pulls **only** that region through the whole operation chain — no intermediates are materialized.
 
-## Features
+The practical consequence is **memory-boundedness**: the streaming `io.write` path processes a large array region by region, so peak RAM is a function of the region/worker budget, not of the array size. This makes it possible to read, transform, and write arrays far larger than memory.
 
-- **Lazy evaluation** – Operations are deferred until explicitly computed
-- **Multi-format I/O** – Read from TIFF, Zarr v2, and Zarr v3; write to Zarr v2 or Zarr v3
-- **Efficient region-wise processing** – Data is processed in regions, where each region may span multiple chunks
-- **Minimal dependencies** – Requires only `zarr`, `numpy`, `tensorstore`, and `tifffile`
+Highlights:
+
+- **Pull-based & lazy** — operations defer until `.compute()` (materialize) or `io.write` (stream to disk).
+- **Memory-bounded streaming** — region-wise `io.write` with per-worker memory + worker-count knobs; even reshape/flatten/rechunk of incompatibly-chunked data stay bounded.
+- **NumPy-like** — operator overloads, array methods (`.astype/.clip/.round`), and the NumPy ufunc protocol (`np.sqrt(a)`, `np.add(a, 2)`) all work on a `DynamicArray`.
+- **Rich op set** — pointwise ufuncs, streaming reductions, neighborhood (halo) filters, structural reshaping, differences, and array creation — ~85 operations.
+- **Multi-format I/O** — read TIFF, Zarr v2, Zarr v3 (local, S3/GCS, HTTP); write Zarr v2/v3 with optional sharding.
+- **Optional GPU** — run an op chain on CUDA via CuPy, with a single host↔device transfer per region.
 
 ## Installation
 
@@ -19,154 +23,113 @@ A lightweight Python library for lazy operations on Zarr arrays.
 pip install git+https://github.com/bugraoezdemir/dyna_zarr.git
 ```
 
-For development:
+Optional GPU support (pick the extra matching your CUDA toolkit from `nvidia-smi`):
 
 ```bash
-git clone https://github.com/bugraoezdemir/dyna_zarr.git
-cd dyna_zarr
-pip install -e ".[dev]"
+pip install "dyna_zarr[gpu-cu12]"   # CUDA 12.x  (`[gpu]` is an alias for this)
+pip install "dyna_zarr[gpu-cu11]"   # CUDA 11.x
+pip install "dyna_zarr[gpu-cu13]"   # CUDA 13.x (e.g. Blackwell)
 ```
 
-## Quick Start
+## Quick start
 
-### Reading Arrays
+### Read
 
 ```python
 from dyna_zarr import io
 
-# Read a TIFF file as a DynamicArray
-arr = io.read("image.tiff")
-print(arr.shape)   # (100, 256, 256)
-print(arr.dtype)   # dtype('uint16')
+arr = io.read("image.tiff")      # TIFF via tifffile's zarr bridge
+arr = io.read("array_v2.zarr")   # Zarr v2
+arr = io.read("array_v3.zarr")   # Zarr v3  (also s3://, gs://, http://)
 
-# Read Zarr v2
-arr = io.read("array_v2.zarr")
+print(arr.shape, arr.dtype, arr.chunks)
 
-# Read Zarr v3
-arr = io.read("array_v3.zarr")
-
-# Compute the full array into memory
-data = arr.compute()
-
-# Compute a region of interest
-region = arr[10:20, 50:150, 100:200].compute()
+data   = arr.compute()                    # materialize the whole array
+region = arr[10:20, 50:150, 100:200].compute()   # pull just this region
 ```
 
-### Writing Arrays
+### Write (memory-bounded streaming)
 
 ```python
 from dyna_zarr import io, Codecs
 
-# Write to Zarr v3
-io.write(arr, "output_v3.zarr", zarr_format=3)
+io.write(arr, "out_v3.zarr", zarr_format=3)
+io.write(arr, "out.zarr", chunks=(64, 64, 64), zarr_format=3)
+io.write(arr, "out.zarr", dtype="float32", zarr_format=3)       # cast on write
+io.write(arr, "out.zarr", compressor=Codecs(compressor="zstd", clevel=5), zarr_format=3)
 
-# Write to Zarr v2
-io.write(arr, "output_v2.zarr", zarr_format=2)
-
-# Specify custom chunks
-io.write(arr, "output.zarr", chunks=(64, 64, 64), zarr_format=3)
-
-# Enable compression
-codecs = Codecs(compressor="zstd", clevel=5)
-io.write(arr, "output.zarr", compressor=codecs, zarr_format=3)
-
-# Convert dtype during write
-io.write(arr, "output.zarr", dtype="float32", zarr_format=3)
+# memory / parallelism controls (peak RAM ~ region_size_mb * max_workers)
+io.write(arr, "out.zarr", region_size_mb=64, max_workers=4)
 ```
 
-### Lazy Operations
+### Lazy operation chains
 
 ```python
-from dyna_zarr import io, operations
+from dyna_zarr import io, operations as ops
 
-# Read array
 arr = io.read("input.zarr")
 
-# Apply lazy transformations (no computation yet)
-result = operations.abs(arr)
-result = operations.clip(result, 0, 1)
-result = operations.sqrt(result)
-
-# Write result using region-wise processing
-io.write(result, "output.zarr", zarr_format=3)
-
-# Or fully materialize the result
-final_data = result.compute()
+result = ops.sqrt(ops.clip(ops.abs(arr), 0, 1))   # nothing computed yet
+io.write(result, "output.zarr", zarr_format=3)     # streamed, region by region
+# ...or result.compute() to materialize
 ```
 
-### Multi-source Operations
+### NumPy-like interface
+
+A `DynamicArray` behaves like a NumPy/dask array — operators, methods, and ufuncs are all lazy:
 
 ```python
-from dyna_zarr import io, operations
+import numpy as np
 
-# Read multiple sources
-arr1 = io.read("input1.zarr")
-arr2 = io.read("input2.zarr")
-
-# Chain operations
-result = operations.concatenate([arr1, arr2], axis=0)
-result = operations.clip(result, -1, 1)
-
-# Write result
-io.write(result, "concatenated_output.zarr", zarr_format=3)
+masked = (arr > 3) & (arr < 100)     # elementwise operators -> lazy mask
+scaled = (arr.astype("float32") / 255).clip(0, 1)
+out    = np.sqrt(np.abs(arr))        # NumPy ufunc protocol dispatches to lazy ops
 ```
 
-## Core Components
+## Operations catalog
 
-- **`io.read()`** – Read TIFF, Zarr v2, or Zarr v3 sources and return a
-  `DynamicArray`
-- **`io.write()`** – Write a `DynamicArray` to Zarr v2 or v3 with optional
-  region-wise execution
-- **`operations`** – Lazy transformation functions such as `abs`,
-  `clip`, `sqrt`, `concatenate`, `reshape`, and `slice`
-- **`DynamicArray`** – Core lazy array abstraction supporting slicing,
-  shape/dtype inspection, and `.compute()`
-- **`Codecs`** – Compression configuration for Zarr v2 and v3
+All are lazy and available flat on `dyna_zarr.operations` (also grouped by category submodule).
 
-## Further Examples
+- **Pointwise / ufuncs** — `abs`, `negative`, `sign`, `sqrt`, `square`, `exp`, `log`, `log2`, `log10`, `floor`, `ceil`, `reciprocal`, `round`, `clip`, `astype`; binary `add`, `subtract`, `multiply`, `divide`, `floor_divide`, `mod`, `power`, `maximum`, `minimum`; comparisons `greater(_equal)`, `less(_equal)`, `equal`, `not_equal`; logical `and/or/xor/not`; `where`, `isin`, `digitize`.
+- **Reductions (streaming, memory-bounded)** — `min`, `max`, `sum`, `prod`, `mean`, `any`, `all`, `var`, `std`, `argmin`, `argmax`, `median`, `histogram` (`axis=`/`keepdims=`).
+- **Neighborhood (halo/overlap)** — `gaussian_filter`, `uniform_filter`, `median_filter`, `minimum_filter`, `maximum_filter`, `grey_erosion`, `grey_dilation`.
+- **Structural** — `concatenate`, `stack`, `transpose`, `swap_axes`, `reshape`, `flatten`, `squeeze`, `expand_dims`, `pad`, `tile`, `roll`, `flip`, `rot90`, `slice_array`.
+- **Differences** — `diff`, `gradient`.
+- **Creation** — `zeros`, `ones`, `full`, `empty`, `random` (+ `*_like`). `random` is position-deterministic, so the result is independent of chunking.
+- **Primitives** — `map_blocks` (pointwise), `map_overlap` (neighborhood with a halo), `reduce` (streaming) — build your own ops.
 
-### Manual Configuration of Region Size
+## Memory-bounded reshape / flatten / rechunk
+
+C-order reshape/flatten conflict with n-d chunk layout, so a naive implementation blows up. dyna_zarr stages these through disk (a Rechunker-style two-phase, read-once/write-once copy), so peak RAM stays a function of the per-worker budget rather than the array size. When you `io.write` an outermost `reshape`/`flatten`, this path is used automatically:
 
 ```python
-from dyna_zarr import io
+from dyna_zarr import io, operations as ops
 
-arr = io.read("large_array.zarr")
-
-# Process approximately 64 MB regions at a time
-io.write(arr, "output.zarr", region_size_mb=64)
+arr = io.read("big_4d.zarr")                 # e.g. 5 GB, awkward chunks
+io.write(ops.flatten(arr), "flat.zarr", region_size_mb=128, max_workers=2)
+io.write(ops.reshape(arr, (a, b)), "reshaped.zarr")
 ```
 
-### Zarr Sharding (Zarr v3 only)
+## GPU (optional)
+
+With a CuPy install, run a chain on the GPU. `device='cuda'` on a terminal (`compute` / `io.write`) makes device-inheriting ops run on the GPU; a single host→device transfer happens at the first CUDA op and the data stays resident up the chain (results are returned/written from the host).
 
 ```python
-io.write(
-    arr,
-    "sharded_output.zarr",
-    chunks=(64, 64, 64),            # Inner chunk size
-    shard_coefficients=(4, 4, 4),   # Shard size = 4x chunks in each dimension
-    zarr_format=3,
-)
+result = ops.gaussian_filter(arr, sigma=3)
+out = result.compute(device="cuda")          # whole chain on GPU
+io.write(result, "out.zarr", device="cuda")  # per-region GPU compute, streamed write
 ```
+
+## Core components
+
+- **`io.read(source)`** — read TIFF / Zarr v2 / Zarr v3 (local or remote) → `DynamicArray`.
+- **`io.write(array, path, ...)`** — stream a `DynamicArray` to Zarr v2/v3 (chunks, sharding, compression, dtype cast, `region_size_mb`, `max_workers`, `device`).
+- **`operations`** — the lazy op set above.
+- **`DynamicArray`** — the pull-based lazy array (slicing, `.compute()`, operators, `.astype/.clip/.round`, ufunc protocol).
+- **`Codecs`** — compression configuration for Zarr v2 and v3.
 
 ## Requirements
 
-- Python >= 3.11
-- zarr >= 3.0.0
-- numpy >= 1.20.0
-- tensorstore
-- tifffile
-
-## Testing
-
-Run the test suite:
-
-```bash
-pytest tests/ -v
-```
-
-Run tests with coverage:
-
-```bash
-pytest tests/ --cov=src/dyna_zarr --cov-report=html
-```
-
+- Python ≥ 3.11
+- zarr ≥ 3.0.0, numpy ≥ 1.20, scipy ≥ 1.6, tensorstore, tifffile
+- Optional: CuPy (via the `gpu-cuXX` extras) for the GPU path

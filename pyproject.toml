@@ -32,6 +32,7 @@ classifiers = [
 dependencies = [
     "zarr>=3.0.0",
     "numpy>=1.20.0",
+    "scipy>=1.6.0",
     "tensorstore",
     "tifffile"
 ]
@@ -49,6 +50,18 @@ docs = [
     "sphinx>=5.0",
     "sphinx-rtd-theme>=1.0",
 ]
+# GPU execution (optional). CuPy ships CUDA-version-specific wheels and pip CANNOT
+# auto-detect your CUDA, so pick the extra that matches `nvidia-smi` (CUDA Version):
+#   pip install dyna_zarr[gpu-cu11]   # CUDA 11.x
+#   pip install dyna_zarr[gpu-cu12]   # CUDA 12.x
+#   pip install dyna_zarr[gpu-cu13]   # CUDA 13.x (e.g. Blackwell)
+# `[gpu]` is a convenience alias for CUDA 12.x. The [ctk] extra ships the NVRTC headers
+# CuPy needs to JIT kernels (without it every kernel raises "Failed to find CUDA headers").
+# Auto-detect alternative (may lag new CUDA releases): pip install cupy-wheel
+gpu = ["cupy-cuda12x[ctk]"]
+gpu-cu11 = ["cupy-cuda11x[ctk]"]
+gpu-cu12 = ["cupy-cuda12x[ctk]"]
+gpu-cu13 = ["cupy-cuda13x[ctk]"]
 
 [project.urls]
 Homepage = "https://github.com/bugraoezdemir/dyna_zarr"
