@@ -128,6 +128,7 @@ Every operation is lazy, and memory-bounded on the `io.write` path except `media
 - **Neighborhood (halo/overlap).** `gaussian_filter`, `uniform_filter`, `median_filter`, `minimum_filter`, `maximum_filter`, `grey_erosion`, `grey_dilation`, `convolve`, `correlate`, `laplace`, `gaussian_laplace`, `gaussian_gradient_magnitude`.
 - **Structural.** `concatenate`, `stack`, `transpose`, `swap_axes`, `reshape`, `flatten`, `squeeze`, `expand_dims`, `pad`, `tile`, `roll`, `flip`, `rot90`, `slice_array`.
 - **Differences.** `diff`, `gradient`.
+- **Scan (prefix, along one axis).** `cumsum`, `cumprod`, `cummax`, `cummin`. Streamed with a bounded carry on the `io.write` path, so memory-bounded despite the sequential dependency.
 - **Creation.** `zeros`, `ones`, `full`, `empty`, `random` (and the `*_like` variants). `random` is position-deterministic, so the result is independent of chunking.
 - **Primitives.** `map_blocks` (pointwise), `map_overlap` (neighborhood with a halo), `reduce` (streaming). Use these to build your own ops.
 

@@ -352,8 +352,30 @@ def histogram(array, bins=256, range=None, strip_bytes=_DEFAULT_STRIP_BYTES, dev
     return asnumpy(counts).astype(np.int64), asnumpy(edges)
 
 
+def unique(array, strip_bytes=_DEFAULT_STRIP_BYTES, device=None):
+    """Streaming distinct values over the whole array (like ``numpy.unique``: a sorted 1-D
+    array of the distinct values). Memory-bounded by the running set of distinct values plus
+    one region, so it is cheap when there are few distinct values (e.g. a label image) and
+    grows with that count otherwise. Eager, like ``histogram``: returns a host numpy array.
+    """
+    from ..utils import parse_dtype
+    dev = resolve_device(device)
+    dt = parse_dtype(array.dtype)[0]
+    if 0 in tuple(array.shape):                # empty array -> no distinct values
+        return np.array([], dtype=dt)
+    acc = None
+    for region in _iter_region_slices(array.shape, dt.itemsize, strip_bytes):
+        block = to_device(array._read_direct(region), dev)
+        xp = array_namespace(block)
+        u = xp.unique(block)
+        acc = u if acc is None else xp.unique(xp.concatenate([acc, u]))
+    if acc is None:                       # empty array
+        return np.array([], dtype=dt)
+    return asnumpy(acc)
+
+
 __all__ = [
     "ReduceTransform", "reduce",
     "min", "max", "sum", "prod", "mean", "any", "all",
-    "var", "std", "argmin", "argmax", "median", "histogram",
+    "var", "std", "argmin", "argmax", "median", "histogram", "unique",
 ]

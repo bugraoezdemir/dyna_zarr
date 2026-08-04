@@ -306,6 +306,50 @@ class DynamicArray:
         from . import operations as o
         return o.round(self, decimals)
 
+    def rechunk(self, chunks=None, **kwargs):
+        """No-op for the pull model (accepts dask's signature for backend compatibility).
+
+        In dask, ``rechunk`` changes the chunk grid so cross-chunk ops behave. A DynamicArray
+        is chunk-invariant: every lazy read pulls exactly the region asked for, independent of
+        any chunk grid, and streaming reductions/scans already see whole axes. So a lazy
+        rechunk changes nothing about correctness and returns the array unchanged. Storage
+        chunking is a separate concern, set via ``io.write(chunks=...)`` or the rechunk engine.
+        """
+        return self
+
+    def persist(self, **kwargs):
+        """No-op (accepts dask's signature). dask ``persist`` materializes and caches an
+        intermediate; the pull model has no graph to cache, so this returns the array
+        unchanged. Use ``io.write`` to stage an intermediate to disk when needed."""
+        return self
+
+    def map_blocks(self, func, *args, dtype=None, **kwargs):
+        """dask-compatible ``map_blocks``: apply ``func`` blockwise (shape-preserving). Extra
+        array/scalar ``args`` become additional equally-shaped operands; dask-only kwargs
+        (``meta``/``chunks``/``name``/``block_info``/...) are ignored, and any remaining kwargs
+        are bound to ``func``. ``drop_axis``/``new_axis`` (shape-changing) are not supported."""
+        from . import operations as o
+        if kwargs.get("drop_axis") is not None or kwargs.get("new_axis") is not None:
+            raise NotImplementedError(
+                "map_blocks drop_axis/new_axis is not supported (shape-preserving only)")
+        for k in ("meta", "chunks", "name", "token", "drop_axis", "new_axis",
+                  "block_info", "block_id", "enforce_ndim"):
+            kwargs.pop(k, None)
+        f = (lambda *bs, _f=func, _kw=kwargs: _f(*bs, **_kw)) if kwargs else func
+        return o.map_blocks(f, self, *args, dtype=dtype)
+
+    def map_overlap(self, func, depth=0, boundary="reflect", trim=True, dtype=None, **kwargs):
+        """dask-compatible ``map_overlap``: apply a shape-preserving neighbourhood ``func``
+        with a ``depth`` halo. dask-only kwargs are ignored and any remaining kwargs are bound
+        to ``func``. ``trim=False`` (shrinking output) is not supported."""
+        from . import operations as o
+        if not trim:
+            raise NotImplementedError("map_overlap trim=False is not supported")
+        for k in ("meta", "chunks", "name"):
+            kwargs.pop(k, None)
+        f = (lambda b, _f=func, _kw=kwargs: _f(b, **_kw)) if kwargs else func
+        return o.map_overlap(self, f, depth, boundary=boundary, dtype=dtype)
+
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         """NumPy ufunc protocol -> lazy ops, so ``np.sqrt(a)`` / ``np.add(a, 2)`` work on a
         DynamicArray exactly as on a dask array. Only the plain ``__call__`` form (no ``out=``,

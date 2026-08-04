@@ -534,6 +534,14 @@ def write_array(
         return reshape_write(_tr.array, array.shape, output_path, output_chunks=chunks,
                              max_mem=int(region_size_mb * 1024 * 1024), max_workers=max_workers,
                              dtype=dtype, zarr_format=zarr_format or 2)
+    if _trname == "ScanTransform" and _local:
+        # bounded-carry streaming scan (tile cross-section, walk the scan axis in strips with a
+        # running carry): fully memory-bounded, read-once/write-once. Per-call budget =
+        # region_size_mb (the pull read(key) path stays prefix-bounded for lazy sub-slices).
+        from .operations.scan import scan_write
+        return scan_write(_tr.array, _tr.op, _tr.axis, output_path, output_chunks=chunks,
+                          max_mem=int(region_size_mb * 1024 * 1024),
+                          dtype=dtype, zarr_format=zarr_format or 2)
     import tensorstore as ts
     if num_readers is None:
         # One reader per writer (balanced). The async writes are the bottleneck, so extra

@@ -15,7 +15,7 @@ neighborhood (map_overlap + filters), reductions (min/max, streaming reduce to c
 from ._base import Transform, _is_int_index, _perm_on_surviving
 
 # submodules kept importable for grouped access: operations.neighborhood.gaussian_filter, ...
-from . import structural, pointwise, reductions, neighborhood, differences, creation
+from . import structural, pointwise, reductions, neighborhood, differences, creation, scan
 
 # ...and re-exported flat: operations.gaussian_filter, operations.add, ...
 from .structural import *      # noqa: F401,F403
@@ -24,14 +24,16 @@ from .reductions import *      # noqa: F401,F403
 from .neighborhood import *    # noqa: F401,F403
 from .differences import *     # noqa: F401,F403
 from .creation import *        # noqa: F401,F403
+from .scan import *            # noqa: F401,F403
 
 __all__ = (
     ["Transform", "structural", "pointwise", "reductions", "neighborhood",
-     "differences", "creation"]
+     "differences", "creation", "scan"]
     + structural.__all__
     + pointwise.__all__
     + reductions.__all__
     + neighborhood.__all__
     + differences.__all__
     + creation.__all__
+    + scan.__all__
 )

@@ -139,3 +139,15 @@ def test_write_projection(arr, tmp_path):
     out = str(tmp_path / "proj.zarr")
     io.write(ops.max(da, 0), out, zarr_format=2, chunks=(4, 5))
     np.testing.assert_allclose(zarr.open(out, mode="r")[:], arr.max(0), rtol=1e-5, atol=1e-5)
+
+
+def test_unique_matches_numpy(tmp_path):
+    """Streaming unique over the whole array, sorted, like numpy.unique (values only)."""
+    rng = np.random.default_rng(3)
+    lab = rng.integers(0, 12, size=(6, 20, 24)).astype("int32")
+    da = da_from(lab, (2, 7, 5))                       # awkward chunks -> multi-region stream
+    np.testing.assert_array_equal(ops.unique(da), np.unique(lab))
+    # float values + empty
+    f = rng.random((4, 8)).astype("float32")
+    np.testing.assert_array_equal(ops.unique(da_from(f, (1, 3))), np.unique(f))
+    assert ops.unique(da_from(np.zeros((0,), "int32"), (1,))).size == 0

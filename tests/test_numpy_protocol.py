@@ -97,3 +97,34 @@ def test_operators_and_chain(da_arr):
     np.testing.assert_allclose((-d).compute(), -arr)
     np.testing.assert_allclose(((d.astype("float32") + 5) / 2).clip(0, 4).compute(),
                                np.clip((arr + 5) / 2, 0, 4))
+
+
+# --- dask-compat methods used by the ome_zarr_pro backend ---
+
+def test_rechunk_persist_are_noops(da_arr):
+    d, arr = da_arr
+    np.testing.assert_array_equal(d.rechunk({0: d.shape[0]}).persist().compute(), arr)
+    np.testing.assert_array_equal(d.rechunk(-1).compute(), arr)
+
+
+def test_map_blocks_method_dask_style(da_arr):
+    d, arr = da_arr
+    # dask-style call: func, dtype, and a dask-only meta kwarg that must be ignored
+    got = d.map_blocks(lambda b: b * 2, dtype="float32", meta=np.array((), dtype="float32"))
+    np.testing.assert_allclose(got.compute(), arr * 2)
+    # a bound (non-dask) kwarg is forwarded to func
+    got2 = d.map_blocks(lambda b, k=1.0: b + k, dtype="float32", k=3.0)
+    np.testing.assert_allclose(got2.compute(), arr + 3.0)
+    with pytest.raises(NotImplementedError):
+        d.map_blocks(lambda b: b, dtype="float32", drop_axis=0)
+
+
+def test_map_overlap_method_dask_style(da_arr):
+    from scipy import ndimage as ndi
+    d, arr = da_arr
+    got = d.map_overlap(lambda b: ndi.uniform_filter(b, 3, mode="reflect"),
+                        depth=1, boundary="reflect", trim=True, dtype="float32",
+                        meta=np.array((), dtype="float32"))
+    np.testing.assert_allclose(got.compute(), ndi.uniform_filter(arr, 3, mode="reflect"), atol=1e-5)
+    with pytest.raises(NotImplementedError):
+        d.map_overlap(lambda b: b, depth=1, trim=False)
