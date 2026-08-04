@@ -113,7 +113,7 @@ io.write(log, "log.zarr", zarr_format=3)   # halo handled per region
 denoised = ops.median_filter(img, size=3)
 io.write(denoised, "denoised.zarr")
 
-# a custom per-plane kernel 
+# a custom per-plane kernel
 kernel   = np.ones((1, 3, 3), dtype="float32") / 9   # 3x3 mean within each z-plane
 blurred  = ops.convolve(img, kernel)
 io.write(blurred, "blurred.zarr")
@@ -140,7 +140,7 @@ from dyna_zarr import io, operations as ops
 
 arr = io.read("big_4d.zarr")                 # e.g. 5 GB, awkward chunks
 io.write(ops.flatten(arr), "flat.zarr", region_size_mb=128, max_workers=2)
-io.write(ops.reshape(arr, (a, b)), "reshaped.zarr")
+io.write(ops.reshape(arr, (a, b)), "reshaped.zarr")   # (a, b) is any target shape of the same size
 ```
 
 ## GPU (optional)
@@ -164,7 +164,7 @@ The tradeoff is that only operations that fit this slice-pushdown model belong i
 Two more differences worth knowing:
 
 - **Single machine, for now.** Parallelism today is threaded I/O within one process, plus the optional GPU path. There is no cluster or distributed execution yet; better and process-based parallelism is a possible future direction.
-- **Narrower surface.** About 90 operations today, extended where the slice pushdown model permits. Binary ops also need equal-shaped operands (no general broadcasting between differently shaped lazy arrays yet).
+- **Narrower surface.** About 90 operations today, extended where the slice-pushdown model permits. Binary ops also need equal-shaped operands (no general broadcasting between differently shaped lazy arrays yet).
 
 ## Core components
 
