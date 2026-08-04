@@ -69,6 +69,12 @@ OPS = {
                          lambda a: ndi.grey_erosion(a, size=3, mode="reflect")),
     "grey_dilation_3":  (lambda da: ops.grey_dilation(da, 3),
                          lambda a: ndi.grey_dilation(a, size=3, mode="reflect")),
+    "laplace":          (lambda da: ops.laplace(da),
+                         lambda a: ndi.laplace(a, mode="reflect")),
+    "gaussian_laplace": (lambda da: ops.gaussian_laplace(da, 2.0),
+                         lambda a: ndi.gaussian_laplace(a, 2.0, mode="reflect")),
+    "gauss_grad_mag":   (lambda da: ops.gaussian_gradient_magnitude(da, 2.0),
+                         lambda a: ndi.gaussian_gradient_magnitude(a, 2.0, mode="reflect")),
 }
 
 

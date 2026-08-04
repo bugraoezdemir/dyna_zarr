@@ -9,7 +9,7 @@ packages = ["dyna_zarr"]
 "" = "src"
 
 [project]
-name = "dyna_zarr"
+name = "dyna-zarr"
 version = "0.0.2"
 description = "A lightweight library for lazy operations on Zarr arrays without task graph overhead"
 readme = "README.md"
@@ -52,9 +52,9 @@ docs = [
 ]
 # GPU execution (optional). CuPy ships CUDA-version-specific wheels and pip CANNOT
 # auto-detect your CUDA, so pick the extra that matches `nvidia-smi` (CUDA Version):
-#   pip install dyna_zarr[gpu-cu11]   # CUDA 11.x
-#   pip install dyna_zarr[gpu-cu12]   # CUDA 12.x
-#   pip install dyna_zarr[gpu-cu13]   # CUDA 13.x (e.g. Blackwell)
+#   pip install dyna-zarr[gpu-cu11]   # CUDA 11.x
+#   pip install dyna-zarr[gpu-cu12]   # CUDA 12.x
+#   pip install dyna-zarr[gpu-cu13]   # CUDA 13.x (e.g. Blackwell)
 # `[gpu]` is a convenience alias for CUDA 12.x. The [ctk] extra ships the NVRTC headers
 # CuPy needs to JIT kernels (without it every kernel raises "Failed to find CUDA headers").
 # Auto-detect alternative (may lag new CUDA releases): pip install cupy-wheel

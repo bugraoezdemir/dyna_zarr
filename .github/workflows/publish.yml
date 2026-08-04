@@ -42,7 +42,7 @@ jobs:
     # The GitHub environment must match the one set on the PyPI trusted publisher.
     environment:
       name: pypi
-      url: https://pypi.org/project/dyna_zarr/
+      url: https://pypi.org/project/dyna-zarr/
     permissions:
       id-token: write        # OIDC token for Trusted Publishing
     steps:

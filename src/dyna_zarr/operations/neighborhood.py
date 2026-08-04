@@ -241,9 +241,39 @@ def correlate(array, weights, boundary="reflect", cval=0.0, device=None):
     return map_overlap(array, func, depth, boundary=boundary, name="correlate", device=device)
 
 
+def laplace(array, boundary="reflect", device=None, **kw):
+    """Laplace filter via the second-derivative [1, -2, 1] stencil (scipy.ndimage.laplace).
+    Fixed radius 1 on every axis."""
+    func = lambda b: ndimage_namespace(b).laplace(b, mode=boundary, **kw)
+    return map_overlap(array, func, (1,) * array.ndim, boundary=boundary,
+                       name="laplace", device=device)
+
+
+def gaussian_laplace(array, sigma, boundary="reflect", truncate=4.0, device=None, **kw):
+    """Laplace of Gaussian (scipy.ndimage.gaussian_laplace). Halo is the Gaussian radius
+    ``int(truncate * sigma + 0.5)`` per axis, as for ``gaussian_filter``."""
+    depth = _gaussian_depth(sigma, array.ndim, truncate)
+    func = lambda b: ndimage_namespace(b).gaussian_laplace(
+        b, sigma=sigma, mode=boundary, truncate=truncate, **kw)
+    return map_overlap(array, func, depth, boundary=boundary,
+                       name="gaussian_laplace", device=device)
+
+
+def gaussian_gradient_magnitude(array, sigma, boundary="reflect", truncate=4.0,
+                                device=None, **kw):
+    """Gradient magnitude using Gaussian derivatives (scipy.ndimage.
+    gaussian_gradient_magnitude). Halo is the Gaussian radius per axis."""
+    depth = _gaussian_depth(sigma, array.ndim, truncate)
+    func = lambda b: ndimage_namespace(b).gaussian_gradient_magnitude(
+        b, sigma=sigma, mode=boundary, truncate=truncate, **kw)
+    return map_overlap(array, func, depth, boundary=boundary,
+                       name="gaussian_gradient_magnitude", device=device)
+
+
 __all__ = [
     "MapOverlapTransform", "map_overlap",
     "gaussian_filter", "uniform_filter", "median_filter",
     "minimum_filter", "maximum_filter", "grey_erosion", "grey_dilation",
     "convolve", "correlate",
+    "laplace", "gaussian_laplace", "gaussian_gradient_magnitude",
 ]
