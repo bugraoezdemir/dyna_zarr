@@ -261,21 +261,112 @@ class DynamicArray:
         transform = SliceTransform(self, key)
         return self._with_transform(transform)
     
-    def compute(self):
+    def compute(self, device=None):
         """
         Execute all lazy transforms and return the result as a numpy array.
+
+        ``device`` sets the EXECUTION device for inherit-ops (device=None) in the chain:
+        None/'cpu' runs on the CPU (default), 'cuda' runs the pipeline on the GPU. The
+        result is always returned as a host numpy array.
         """
-        if self._transform is None:
-            # No transform - read entire array
-            if self._is_tensorstore:
-                return self._ts_array[:].read().result()
+        from .operations._backend import device_context, to_device
+        with device_context(device):
+            if self._transform is None:
+                # No transform - read entire array
+                if self._is_tensorstore:
+                    result = self._ts_array[:].read().result()
+                else:
+                    result = self._zarr_array[:]
             else:
-                return self._zarr_array[:]
-        else:
-            # Apply transformation to read all data
-            full_slice = tuple(slice(None) for _ in range(len(self.shape)))
-            return self._transform.read(full_slice)
-    
+                # Apply transformation to read all data
+                full_slice = tuple(slice(None) for _ in range(len(self.shape)))
+                result = self._transform.read(full_slice)
+        return to_device(result, "cpu")
+
+    # --- numpy/dask-like method surface (lazy; route to operations) ---
+    def astype(self, dtype):
+        """Lazily cast to ``dtype`` (like ``numpy``/``dask`` ``a.astype``)."""
+        from . import operations as o
+        return o.astype(self, dtype)
+
+    def clip(self, a_min=None, a_max=None, out=None):
+        """Lazily clip to ``[a_min, a_max]`` (either bound may be None). ``out`` accepted for
+        NumPy-method compatibility (``np.clip`` calls ``a.clip(min, max, out=...)``); a non-None
+        ``out`` isn't supported on a lazy array."""
+        if out is not None:
+            raise TypeError("clip(out=...) is not supported on a lazy DynamicArray")
+        from . import operations as o
+        return o.clip(self, a_min, a_max)
+
+    def round(self, decimals=0, out=None):
+        """Lazily round (like ``numpy``/``dask`` ``a.round``). ``out`` accepted for NumPy-method
+        compatibility; a non-None ``out`` isn't supported on a lazy array."""
+        if out is not None:
+            raise TypeError("round(out=...) is not supported on a lazy DynamicArray")
+        from . import operations as o
+        return o.round(self, decimals)
+
+    def rechunk(self, chunks=None, **kwargs):
+        """No-op for the pull model (accepts dask's signature for backend compatibility).
+
+        In dask, ``rechunk`` changes the chunk grid so cross-chunk ops behave. A DynamicArray
+        is chunk-invariant: every lazy read pulls exactly the region asked for, independent of
+        any chunk grid, and streaming reductions/scans already see whole axes. So a lazy
+        rechunk changes nothing about correctness and returns the array unchanged. Storage
+        chunking is a separate concern, set via ``io.write(chunks=...)`` or the rechunk engine.
+        """
+        return self
+
+    def persist(self, **kwargs):
+        """No-op (accepts dask's signature). dask ``persist`` materializes and caches an
+        intermediate; the pull model has no graph to cache, so this returns the array
+        unchanged. Use ``io.write`` to stage an intermediate to disk when needed."""
+        return self
+
+    def map_blocks(self, func, *args, dtype=None, **kwargs):
+        """dask-compatible ``map_blocks``: apply ``func`` blockwise (shape-preserving). Extra
+        array/scalar ``args`` become additional equally-shaped operands; dask-only kwargs
+        (``meta``/``chunks``/``name``/``block_info``/...) are ignored, and any remaining kwargs
+        are bound to ``func``. ``drop_axis``/``new_axis`` (shape-changing) are not supported."""
+        from . import operations as o
+        if kwargs.get("drop_axis") is not None or kwargs.get("new_axis") is not None:
+            raise NotImplementedError(
+                "map_blocks drop_axis/new_axis is not supported (shape-preserving only)")
+        for k in ("meta", "chunks", "name", "token", "drop_axis", "new_axis",
+                  "block_info", "block_id", "enforce_ndim"):
+            kwargs.pop(k, None)
+        f = (lambda *bs, _f=func, _kw=kwargs: _f(*bs, **_kw)) if kwargs else func
+        return o.map_blocks(f, self, *args, dtype=dtype)
+
+    def map_overlap(self, func, depth=0, boundary="reflect", trim=True, dtype=None, **kwargs):
+        """dask-compatible ``map_overlap``: apply a shape-preserving neighbourhood ``func``
+        with a ``depth`` halo. dask-only kwargs are ignored and any remaining kwargs are bound
+        to ``func``. ``trim=False`` (shrinking output) is not supported."""
+        from . import operations as o
+        if not trim:
+            raise NotImplementedError("map_overlap trim=False is not supported")
+        for k in ("meta", "chunks", "name"):
+            kwargs.pop(k, None)
+        f = (lambda b, _f=func, _kw=kwargs: _f(b, **_kw)) if kwargs else func
+        return o.map_overlap(self, f, depth, boundary=boundary, dtype=dtype)
+
+    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+        """NumPy ufunc protocol -> lazy ops, so ``np.sqrt(a)`` / ``np.add(a, 2)`` work on a
+        DynamicArray exactly as on a dask array. Only the plain ``__call__`` form (no ``out=``,
+        no reductions) is handled; anything else -- or a ufunc dyna_zarr doesn't implement --
+        returns ``NotImplemented`` so NumPy can fall back / raise clearly."""
+        from . import operations as o
+        if method != "__call__" or kwargs.get("out") is not None:
+            return NotImplemented
+        name = _UFUNC_ALIASES.get(ufunc.__name__, ufunc.__name__)
+        fn = getattr(o, name, None)
+        if fn is None:
+            return NotImplemented
+        try:
+            return fn(*inputs)
+        except (TypeError, ValueError):
+            return NotImplemented
+
     def _read_direct(self, key):
         """
         Internal method to read data directly without creating transforms.
@@ -304,44 +395,125 @@ class DynamicArray:
         result._dtype = transform.dtype
         # Keep zarr metadata from original
         return result
+
+    @classmethod
+    def _from_transform(cls, transform):
+        """Build a SOURCELESS DynamicArray whose data is synthesized by ``transform`` (a
+        generative source, e.g. the creation ops). There is no underlying zarr/tensorstore
+        array; every read goes through ``transform.read(key)``."""
+        self = cls.__new__(cls)
+        self._source = None
+        self._zarr_array = None
+        self._ts_array = None
+        self._is_tensorstore = False
+        self._shape = tuple(transform.shape)
+        self._chunks = transform.chunks
+        self._dtype = np.dtype(transform.dtype)
+        self._transform = transform
+        self._zarr_format = None
+        self._compressor = None
+        self._compressors = None
+        self._shards = None
+        self._codecs = None
+        return self
     
-    def min(self, axis: Optional[int] = None):
-        """Compute minimum along specified axis.
-        
-        Parameters
-        ----------
-        axis : int, optional
-            Axis along which to compute minimum. If None, reduces to scalar.
-        
-        Returns
-        -------
-        scalar or numpy.ndarray
-            Minimum value(s). Computed immediately.
-        """
+    # Eager reduction shortcuts. Each streams via operations.<reducer> (memory-bound)
+    # and computes immediately, returning a NumPy scalar/array. Use operations.<reducer>
+    # directly (e.g. operations.max(a, 0)) for a lazy, chainable/writable reduction.
+    def min(self, axis=None, keepdims=False):
+        """Minimum along ``axis`` (None = all). Computed immediately."""
         from . import operations
-        result = operations.min(self, axis=axis)
-        return result.compute()
-    
-    def max(self, axis: Optional[int] = None):
-        """Compute maximum along specified axis.
-        
-        Parameters
-        ----------
-        axis : int, optional
-            Axis along which to compute maximum. If None, reduces to scalar.
-        
-        Returns
-        -------
-        scalar or numpy.ndarray
-            Maximum value(s). Computed immediately.
-        """
+        return operations.min(self, axis=axis, keepdims=keepdims).compute()
+
+    def max(self, axis=None, keepdims=False):
+        """Maximum along ``axis`` (None = all). Computed immediately."""
         from . import operations
-        result = operations.max(self, axis=axis)
-        return result.compute()
+        return operations.max(self, axis=axis, keepdims=keepdims).compute()
+
+    def sum(self, axis=None, keepdims=False):
+        """Sum along ``axis`` (None = all). Computed immediately."""
+        from . import operations
+        return operations.sum(self, axis=axis, keepdims=keepdims).compute()
+
+    def mean(self, axis=None, keepdims=False):
+        """Mean along ``axis`` (None = all). Computed immediately."""
+        from . import operations
+        return operations.mean(self, axis=axis, keepdims=keepdims).compute()
+
+    def prod(self, axis=None, keepdims=False):
+        """Product along ``axis`` (None = all). Computed immediately."""
+        from . import operations
+        return operations.prod(self, axis=axis, keepdims=keepdims).compute()
+
+    def median(self, axis=None, keepdims=False):
+        """Median along ``axis`` (None = all). Computed immediately."""
+        from . import operations
+        return operations.median(self, axis=axis, keepdims=keepdims).compute()
+
+    def histogram(self, bins=256, range=None):
+        """Streaming histogram over the whole array. Returns ``(counts, bin_edges)`` like
+        numpy. Slice first for a per-channel/plane histogram: ``da[channel].histogram()``."""
+        from . import operations
+        return operations.histogram(self, bins=bins, range=range)
 
 
 # Import Transform subclasses
 from .operations import SliceTransform
+
+
+# --------------------------------------------------------------------------- #
+# Operator overloads -> lazy elementwise ops via operations.map_blocks.
+# Mirrors numpy / ome_zarr_pyramid.Pyramid: arithmetic and comparisons are
+# elementwise; &,|,^,~ are LOGICAL (for boolean masks), matching `~mask`. `a == b`
+# returns a lazy mask, but assigning __eq__ *after* the class body leaves the
+# inherited identity __hash__ intact, so a DynamicArray is still hashable.
+# --------------------------------------------------------------------------- #
+
+# numpy ufunc names that differ from the operations spelling (see __array_ufunc__).
+_UFUNC_ALIASES = {
+    "absolute": "abs",
+    "true_divide": "divide",
+    "bitwise_and": "logical_and",
+    "bitwise_or": "logical_or",
+    "bitwise_xor": "logical_xor",
+    "invert": "logical_not",
+}
+
+
+def _binop(opname, reflected=False):
+    def method(self, other):
+        from . import operations as o
+        fn = getattr(o, opname)
+        return fn(other, self) if reflected else fn(self, other)
+    method.__name__ = ("__r" if reflected else "__") + opname + "__"
+    return method
+
+
+def _unop(opname):
+    def method(self):
+        from . import operations as o
+        return getattr(o, opname)(self)
+    method.__name__ = "__" + opname + "__"
+    return method
+
+
+for _dunder, _op in {
+    "add": "add", "sub": "subtract", "mul": "multiply", "truediv": "divide",
+    "floordiv": "floor_divide", "mod": "mod", "pow": "power",
+    "and": "logical_and", "or": "logical_or", "xor": "logical_xor",
+}.items():
+    setattr(DynamicArray, f"__{_dunder}__", _binop(_op))
+    setattr(DynamicArray, f"__r{_dunder}__", _binop(_op, reflected=True))
+
+for _dunder, _op in {
+    "lt": "less", "le": "less_equal", "gt": "greater", "ge": "greater_equal",
+    "eq": "equal", "ne": "not_equal",
+}.items():
+    setattr(DynamicArray, f"__{_dunder}__", _binop(_op))
+
+DynamicArray.__neg__ = _unop("negative")
+DynamicArray.__abs__ = _unop("abs")
+DynamicArray.__invert__ = _unop("logical_not")
 
 
 def slice_array(array: DynamicArray, key) -> DynamicArray:

@@ -61,3 +61,7 @@ env/
 # Project-specific
 _archive/
 .coverage
+
+# Non-shipped / local-only (bench + perf report; tests ARE tracked and CI-run)
+benchmarks/
+reports/

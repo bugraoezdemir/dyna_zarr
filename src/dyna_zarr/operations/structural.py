@@ -1,11 +1,5 @@
-"""
-Array operations and transformations for DynamicArray.
-
-This module provides:
-- Transform classes for lazy operations
-- operations class with static methods for array manipulations
-- Support for all major numpy/dask.array operations
-"""
+"""Structural / coordinate transforms: concat, stack, slice, transpose, reshape,
+squeeze, flatten, pad, tile, roll, flip, expand_dims, swap_axes (+ slice_array)."""
 
 import numpy as np
 from typing import Tuple, Union, List, Optional, Any, TYPE_CHECKING
@@ -14,18 +8,70 @@ if TYPE_CHECKING:
     from dyna_zarr.dynamic_array import DynamicArray
 
 
-class Transform:
-    """
-    Base class for lazy transformations.
-    """
+from ._base import Transform, _is_int_index, _perm_on_surviving
+from ._backend import array_namespace
 
-    def __init__(self):
-        self.shape = None
-        self.chunks = None
-        self.dtype = None
 
-    def read(self, key):
-        raise NotImplementedError
+def _reshape_read(array, new_shape, key):
+    """Windowed read for reshape/flatten (a C-order flat re-index).
+
+    An output region's elements occupy flat indices [fmin, fmax] (same in input and output
+    C-order). We read only the covering rectangle of input rows spanning that flat range,
+    then gather the region's flat positions from it. Memory ~= region + one inner slab, so
+    contiguous reads (io.write / compute) are memory-bound; only scatter patterns (a stepped
+    output) can widen the flat span toward the whole array.
+    """
+    axinfo = _norm_key(key, new_shape)
+    nnd = len(new_shape)
+    nstride = [1] * nnd
+    for a in range(nnd - 2, -1, -1):
+        nstride[a] = nstride[a + 1] * new_shape[a + 1]
+
+    kept_axes = [a for a, (is_int, *_r) in enumerate(axinfo) if not is_int]
+    kept_shape = tuple(len(range(axinfo[a][1], axinfo[a][2], axinfo[a][3])) for a in kept_axes)
+    flat = np.zeros(kept_shape, dtype=np.int64)             # nd flat-index of each output elem
+    for a, (is_int, start, stop, step) in enumerate(axinfo):
+        st = int(nstride[a])
+        if is_int:
+            flat = flat + start * st
+        else:
+            coord = np.arange(start, stop, step, dtype=np.int64) * st
+            shp = [1] * len(kept_shape)
+            shp[kept_axes.index(a)] = coord.shape[0]
+            flat = flat + coord.reshape(shp)
+
+    in_shape = array.shape
+    in_stride0 = 1
+    for s in in_shape[1:]:
+        in_stride0 *= s
+    if flat.size == 0:
+        block = array._read_direct((slice(0, 0),) + (slice(None),) * (len(in_shape) - 1))
+        return array_namespace(block).reshape(block, kept_shape)
+    fmin, fmax = int(flat.min()), int(flat.max())
+    c0, c1 = fmin // in_stride0, fmax // in_stride0
+    box = array._read_direct((slice(c0, c1 + 1),) + (slice(None),) * (len(in_shape) - 1))
+    xp = array_namespace(box)
+    flatbox = box.reshape(-1)
+    idx = xp.asarray(flat - c0 * in_stride0)                # into flatbox, on the box's device
+    return flatbox[idx]
+
+
+def _norm_key(key, shape):
+    """Per output axis -> (is_int, start, stop, step) with concrete non-negative values.
+    Integer indices become (True, idx, idx+1, 1); the caller squeezes those axes."""
+    if not isinstance(key, tuple):
+        key = (key,)
+    key = key + (slice(None),) * (len(shape) - len(key))
+    out = []
+    for a, k in enumerate(key):
+        size = shape[a]
+        if _is_int_index(k):
+            idx = int(k) if k >= 0 else size + int(k)
+            out.append((True, idx, idx + 1, 1))
+        else:
+            start, stop, step = k.indices(size)
+            out.append((False, start, stop, step))
+    return out
 
 
 class ConcatenateTransform(Transform):
@@ -87,12 +133,12 @@ class ConcatenateTransform(Transform):
                 raise NotImplementedError(f"Indexing with {type(k)} not supported")
 
         axis_slice = normalized_key[self.axis]
-        start = axis_slice.start if axis_slice.start is not None else 0
-        stop = axis_slice.stop if axis_slice.stop is not None else self.shape[self.axis]
-        step = axis_slice.step if axis_slice.step is not None else 1
+        start, stop, step = axis_slice.indices(self.shape[self.axis])
 
-        if step != 1:
-            raise NotImplementedError("Step slicing not supported yet")
+        if step < 0:
+            raise NotImplementedError("Negative-step slicing on the concat axis not supported yet")
+        # Route the contiguous span [start, stop); the step is re-applied to the
+        # assembled result below so we read each source array only once.
 
         # Find which arrays we need to read from
         arrays_to_read = []
@@ -116,7 +162,12 @@ class ConcatenateTransform(Transform):
 
         # OPTIMIZATION: Handle based on number of arrays
         if len(arrays_to_read) == 0:
-            raise ValueError("No data to read")
+            # Empty selection on the concat axis: return a correctly-shaped empty array
+            # (reading the first source with a zero-length concat-axis slice fixes the
+            # other axis sizes and the dtype without materialising any data).
+            empty_key = list(normalized_key)
+            empty_key[self.axis] = slice(0, 0)
+            result = self.arrays[0]._read_direct(tuple(empty_key))
         elif len(arrays_to_read) == 1:
             # Single array - no concatenation needed
             result = arrays_to_read[0][0]._read_direct(arrays_to_read[0][1])
@@ -131,8 +182,13 @@ class ConcatenateTransform(Transform):
             
             result = np.concatenate(result_parts, axis=self.axis)
 
+        # Re-apply the step on the concat axis (routing above read the contiguous span).
+        if step != 1:
+            step_idx = (slice(None),) * self.axis + (slice(None, None, step),)
+            result = result[step_idx]
+
         # Remove dimensions that were indexed with int
-        squeeze_axes = [i for i, k in enumerate(key) if isinstance(k, int)]
+        squeeze_axes = [i for i, k in enumerate(key) if _is_int_index(k)]
         for ax in reversed(squeeze_axes):
             result = np.squeeze(result, axis=ax)
 
@@ -173,16 +229,23 @@ class StackTransform(Transform):
         source_key = key[:self.axis] + key[self.axis + 1:]
 
         # Determine which arrays to read
-        if isinstance(new_axis_key, int):
-            # Single array
+        if _is_int_index(new_axis_key):
+            # Single array - the new axis is dropped
             return self.arrays[new_axis_key]._read_direct(source_key)
-        elif isinstance(new_axis_key, slice):
-            start = new_axis_key.start if new_axis_key.start is not None else 0
-            stop = new_axis_key.stop if new_axis_key.stop is not None else len(self.arrays)
-            step = new_axis_key.step if new_axis_key.step is not None else 1
 
-            parts = [self.arrays[i]._read_direct(source_key) for i in range(start, stop, step)]
-            return np.stack(parts, axis=self.axis)
+        # Slice on the new axis. Insert the stacked axis at its position among the
+        # *surviving* source axes (earlier integer indices dropped their axes).
+        idxs = range(*new_axis_key.indices(len(self.arrays)))
+        insert_pos = sum(1 for j in range(self.axis) if not _is_int_index(key[j]))
+
+        if len(idxs) == 0:
+            # Empty selection: build an empty array of the correct per-part shape.
+            sample = self.arrays[0]._read_direct(source_key)
+            empty_shape = sample.shape[:insert_pos] + (0,) + sample.shape[insert_pos:]
+            return np.empty(empty_shape, dtype=sample.dtype)
+
+        parts = [self.arrays[i]._read_direct(source_key) for i in idxs]
+        return np.stack(parts, axis=insert_pos)
 
 
 class SliceTransform(Transform):
@@ -193,58 +256,51 @@ class SliceTransform(Transform):
     def __init__(self, array: 'DynamicArray', key):
         super().__init__()
         self.array = array
-        
+
         # Normalize key to tuple
         if not isinstance(key, tuple):
             key = (key,)
-        
-        self.key = key
 
-        # Compute output shape and track new axes
+        chunks = array.chunks if array.chunks is not None else (1,) * array.ndim
         new_shape = []
         new_chunks = []
-        original_dim = 0
-        chunks = array.chunks if array.chunks is not None else (1,) * array.ndim
-
-        # Track which original dimensions are being kept
-        kept_dims = []
+        normalized = []          # store CONCRETE, non-negative keys so shape/read math is
+        original_dim = 0         # simple (negatives + None resolved once, here)
 
         for k in key:
             if k is np.newaxis:
-                # Add new axis with chunk size 1
+                normalized.append(k)
                 new_shape.append(1)
                 new_chunks.append(1)
+                continue
+            if original_dim >= array.ndim:
+                raise IndexError("Too many indices for array")
+            size = array.shape[original_dim]
+            if isinstance(k, (int, np.integer)):
+                ki = int(k) if k >= 0 else size + int(k)     # normalize negative index
+                if not (0 <= ki < size):
+                    raise IndexError(
+                        f"index {k} out of bounds for axis {original_dim} of size {size}")
+                normalized.append(ki)                         # int removes this dimension
+            elif isinstance(k, slice):
+                s = slice(*k.indices(size))                   # resolves None + negatives
+                normalized.append(s)
+                new_shape.append(len(range(s.start, s.stop, s.step)))
+                new_chunks.append(chunks[original_dim])
             else:
-                if original_dim >= array.ndim:
-                    raise IndexError("Too many indices for array")
+                raise TypeError(f"Invalid index type: {type(k)}")
+            original_dim += 1
 
-                if isinstance(k, int):
-                    # This dimension will be removed
-                    pass
-                elif isinstance(k, slice):
-                    # Calculate size for this dimension
-                    size = array.shape[original_dim]
-                    start = k.start if k.start is not None else 0
-                    stop = k.stop if k.stop is not None else size
-                    step = k.step if k.step is not None else 1
-                    new_shape.append((stop - start + step - 1) // step)
-                    new_chunks.append(chunks[original_dim])
-                    kept_dims.append(original_dim)
-                else:
-                    raise TypeError(f"Invalid index type: {type(k)}")
-
-                original_dim += 1
-
-        # Add remaining dimensions
+        # Add remaining (untouched) dimensions
         for i in range(original_dim, array.ndim):
             new_shape.append(array.shape[i])
             new_chunks.append(chunks[i])
-            kept_dims.append(i)
 
+        self.key = tuple(normalized)
         self.shape = tuple(new_shape)
         self.chunks = tuple(new_chunks)
         self.dtype = array.dtype
-        self.new_axes = [i for i, k in enumerate(key) if k is np.newaxis]
+        self.new_axes = [i for i, k in enumerate(self.key) if k is np.newaxis]
 
     def read(self, read_key):
         """
@@ -279,11 +335,19 @@ class SliceTransform(Transform):
                 # Dimension was sliced in the stored slice
                 read_elem = read_key[output_dim]
 
-                # Get parameters of the stored slice
+                # Normalize the incoming read element (resolve None + negatives) against
+                # this output axis, so the composition below sees concrete non-negatives.
+                osize = self.shape[output_dim]
+                if isinstance(read_elem, (int, np.integer)):
+                    read_elem = int(read_elem) if read_elem >= 0 else osize + int(read_elem)
+                elif isinstance(read_elem, slice):
+                    read_elem = slice(*read_elem.indices(osize))
+
+                # Get parameters of the (already concrete) stored slice
                 orig_size = self.array.shape[input_dim]
-                stored_start = stored_key_elem.start if stored_key_elem.start is not None else 0
-                stored_stop = stored_key_elem.stop if stored_key_elem.stop is not None else orig_size
-                stored_step = stored_key_elem.step if stored_key_elem.step is not None else 1
+                stored_start = stored_key_elem.start
+                stored_stop = stored_key_elem.stop
+                stored_step = stored_key_elem.step
 
                 if isinstance(read_elem, (int, np.integer)):
                     # Compose integer index with slice
@@ -319,10 +383,17 @@ class SliceTransform(Transform):
             else:
                 raise TypeError(f"Invalid stored key type: {type(stored_key_elem)}")
 
-        # Add any remaining dimensions that weren't in the stored key
+        # Add any remaining dimensions that weren't in the stored key (normalize the
+        # read element against the underlying axis so no negatives reach the base array)
         while input_dim < self.array.ndim:
             if output_dim < len(read_key):
-                full_key.append(read_key[output_dim])
+                elem = read_key[output_dim]
+                isize = self.array.shape[input_dim]
+                if isinstance(elem, (int, np.integer)):
+                    elem = int(elem) if elem >= 0 else isize + int(elem)
+                elif isinstance(elem, slice):
+                    elem = slice(*elem.indices(isize))
+                full_key.append(elem)
                 output_dim += 1
             else:
                 full_key.append(slice(None))
@@ -371,18 +442,24 @@ class ExpandDimsTransform(Transform):
         
         # Pad key with full slices if needed
         key = key + (slice(None),) * (len(self.shape) - len(key))
-        
-        # Build the key for the underlying array by removing the element at self.axis
-        # since the underlying array doesn't have this dimension yet
+
+        # Element that applies to the inserted (singleton) axis, and the key for the
+        # underlying array (which lacks that axis).
+        key_ins = key[self.axis]
         underlying_key = key[:self.axis] + key[self.axis + 1:]
-        
+
         # Read from underlying array
         result = self.array._read_direct(underlying_key)
-        
-        # Add back the singleton dimension at the correct axis
-        result = np.expand_dims(result, axis=self.axis)
-        
-        return result
+
+        # Insert the singleton axis at its position among the *surviving* axes: earlier
+        # axes indexed by an integer were dropped by the read, shifting the position.
+        insert_pos = sum(1 for j in range(self.axis) if not _is_int_index(key[j]))
+        result = np.expand_dims(result, axis=insert_pos)
+
+        # Apply the key element to the inserted axis (int drops it, slice sizes it 0/1).
+        idx = (slice(None),) * insert_pos + (key_ins,) + \
+              (slice(None),) * (result.ndim - insert_pos - 1)
+        return result[idx]
 
 
 class SwapAxesTransform(Transform):
@@ -424,11 +501,12 @@ class SwapAxesTransform(Transform):
 
         # Read from underlying array with unswapped key
         result = self.array._read_direct(tuple(original_key))
-        
-        # Swap the axes in the result back
-        result = np.swapaxes(result, self.axis1, self.axis2)
-        
-        return result
+
+        # A swap is a permutation; apply it on the surviving axes so integer indices
+        # that dropped an axis don't leave np.swapaxes with a stale axis index.
+        axes = list(range(self.array.ndim))
+        axes[self.axis1], axes[self.axis2] = axes[self.axis2], axes[self.axis1]
+        return _perm_on_surviving(result, tuple(key), tuple(axes))
 
 
 class TransposeTransform(Transform):
@@ -475,10 +553,9 @@ class TransposeTransform(Transform):
         # Read from underlying array with reordered key
         result = self.array._read_direct(reordered_key)
 
-        # Now transpose the result to match the expected output order
-        result = np.transpose(result, self.axes)
-
-        return result
+        # Transpose to output order, honouring any integer indices that dropped an
+        # axis (a plain np.transpose(result, self.axes) would use stale axis indices).
+        return _perm_on_surviving(result, key, self.axes)
 
 
 # Extended operations from extended_operations.py
@@ -500,9 +577,7 @@ class ReshapeTransform(Transform):
         self.dtype = array.dtype
     
     def read(self, key):
-        # For reshape, we need to materialize and reshape
-        data = self.array._read_direct(slice(None))
-        return data.reshape(self.new_shape)[key]
+        return _reshape_read(self.array, self.new_shape, key)
 
 
 class SqueezeTransform(Transform):
@@ -562,17 +637,15 @@ class SqueezeTransform(Transform):
         if not isinstance(key, tuple):
             key = (key,)
         
-        # Build unsqueezed key by inserting slice(None) for squeezed axes
-        # Track which positions in unsqueezed_key correspond to squeezed axes
+        # Build unsqueezed key by inserting slice(None) for squeezed axes.
         unsqueezed_key = []
-        axes_to_squeeze_in_result = []
+        squeezed_input_axes = []
         output_idx = 0
         for input_idx in range(self.array.ndim):
             if input_idx in self.squeeze_axes:
-                # This axis was squeezed - insert full slice
+                # This axis was squeezed - insert full slice (it is size 1 upstream).
                 unsqueezed_key.append(slice(None))
-                # Mark this position for squeezing in the result
-                axes_to_squeeze_in_result.append(len(unsqueezed_key) - 1)
+                squeezed_input_axes.append(input_idx)
             else:
                 # This axis is preserved - use key from read operation
                 if output_idx < len(key):
@@ -580,17 +653,20 @@ class SqueezeTransform(Transform):
                 else:
                     unsqueezed_key.append(slice(None))
                 output_idx += 1
-        
+
         # Read only the required region from underlying array
         result = self.array._read_direct(tuple(unsqueezed_key))
-        
-        
-        # Squeeze the marked axes (in reverse order to avoid index shifting)
-        for ax in sorted(axes_to_squeeze_in_result, reverse=True):
-            if ax < len(result.shape) and result.shape[ax] == 1:
-                result = np.squeeze(result, axis=ax)
-        
-        
+
+        # A squeezed axis lands in the result at the position given by the number of
+        # *surviving* (non-integer-indexed) axes before it - integer indices earlier in
+        # the key drop their axes and shift everything left.
+        to_remove = [
+            sum(1 for j in range(input_idx) if not _is_int_index(unsqueezed_key[j]))
+            for input_idx in squeezed_input_axes
+        ]
+        for ax in sorted(to_remove, reverse=True):
+            result = np.squeeze(result, axis=ax)
+
         return result
 
 
@@ -606,7 +682,7 @@ class FlattenTransform(Transform):
         self.dtype = array.dtype
     
     def read(self, key):
-        return self.array._read_direct(slice(None)).flatten()[key]
+        return _reshape_read(self.array, self.shape, key)
 
 
 class PadTransform(Transform):
@@ -632,8 +708,28 @@ class PadTransform(Transform):
         self.dtype = array.dtype
     
     def read(self, key):
-        data = self.array._read_direct(slice(None))
-        return np.pad(data, self.pad_width)[key]
+        # Memory-bound: read only the core-overlapping input region, then pad just the
+        # border that this region includes (constant 0, like np.pad's default).
+        input_slices, pad_widths, crop, squeeze_axes = [], [], [], []
+        for a, (is_int, start, stop, step) in enumerate(_norm_key(key, self.shape)):
+            before, _after = self.pad_width[a]
+            in_size = self.array.shape[a]
+            core_lo, core_hi = max(start, before), min(stop, before + in_size)
+            input_slices.append(slice(core_lo - before, core_hi - before)
+                                if core_hi > core_lo else slice(0, 0))
+            pad_before = max(0, min(stop, before) - start)
+            pad_after = max(0, stop - max(start, before + in_size))
+            pad_widths.append((pad_before, pad_after))
+            crop.append(slice(0, stop - start, step))
+            if is_int:
+                squeeze_axes.append(a)
+        core = self.array._read_direct(tuple(input_slices))
+        xp = array_namespace(core)
+        out = xp.pad(core, pad_widths)                    # constant 0
+        out = out[tuple(crop)]
+        for a in sorted(squeeze_axes, reverse=True):
+            out = xp.squeeze(out, axis=a)
+        return out
 
 
 class TileTransform(Transform):
@@ -653,8 +749,20 @@ class TileTransform(Transform):
         self.dtype = array.dtype
     
     def read(self, key):
-        data = self.array._read_direct(slice(None))
-        return np.tile(data, self.reps)[key]
+        # Bounded by the INPUT (the tile), not the full tiled OUTPUT: read the tile once,
+        # then gather the region via modulo indexing (out[i] = in[i % N] per axis).
+        axinfo = _norm_key(key, self.shape)
+        data = self.array._read_direct(tuple(slice(None) for _ in range(self.array.ndim)))
+        xp = array_namespace(data)
+        idx, squeeze_axes = [], []
+        for a, (is_int, start, stop, step) in enumerate(axinfo):
+            idx.append(xp.arange(start, stop, step) % self.array.shape[a])
+            if is_int:
+                squeeze_axes.append(a)
+        result = data[xp.ix_(*idx)]
+        for a in sorted(squeeze_axes, reverse=True):
+            result = xp.squeeze(result, axis=a)
+        return result
 
 
 class RollTransform(Transform):
@@ -670,8 +778,36 @@ class RollTransform(Transform):
         self.dtype = array.dtype
     
     def read(self, key):
-        data = self.array._read_direct(slice(None))
-        return np.roll(data, self.shift, axis=self.axis)[key]
+        if self.axis is None:
+            # flatten-roll: genuinely global. Rare; keep the whole-input fallback.
+            data = self.array._read_direct(tuple(slice(None) for _ in range(self.array.ndim)))
+            return np.roll(data, self.shift)[key]
+        # Memory-bound: out[i] = in[(i-shift) % N] along the axis, so a contiguous output
+        # run maps to 1 or 2 wrapped input segments. Read those, other axes contiguous,
+        # then crop step + squeeze ints.
+        A = self.axis if self.axis >= 0 else self.array.ndim + self.axis
+        N = self.array.shape[A]
+        shift = (self.shift % N) if N else 0
+        axinfo = _norm_key(key, self.shape)
+        base = [slice(start, stop) for (_ii, start, stop, _st) in axinfo]
+        _iiA, startA, stopA, _stA = axinfo[A]
+        L = stopA - startA
+        s0 = (startA - shift) % N if N else 0
+        if N == 0 or s0 + L <= N:
+            base[A] = slice(s0, s0 + L)
+            block = self.array._read_direct(tuple(base))
+        else:
+            k1, k2 = list(base), list(base)
+            k1[A] = slice(s0, N)
+            k2[A] = slice(0, s0 + L - N)
+            b1 = self.array._read_direct(tuple(k1))
+            b2 = self.array._read_direct(tuple(k2))
+            block = array_namespace(b1).concatenate([b1, b2], axis=A)
+        xp = array_namespace(block)
+        block = block[tuple(slice(0, stop - start, step) for (_ii, start, stop, step) in axinfo)]
+        for a in sorted((i for i, (ii, *_r) in enumerate(axinfo) if ii), reverse=True):
+            block = xp.squeeze(block, axis=a)
+        return block
 
 
 class FlipTransform(Transform):
@@ -686,348 +822,138 @@ class FlipTransform(Transform):
         self.dtype = array.dtype
     
     def read(self, key):
-        data = self.array._read_direct(slice(None))
-        return np.flip(data, axis=self.axis)[key]
+        # Memory-bound: read only the mirrored input window (positive-step slice, since
+        # zarr/tensorstore reject negative steps), flip it in-memory, then crop step +
+        # squeeze ints. out[start:stop) along the axis mirrors input[N-stop:N-start).
+        A = self.axis if self.axis >= 0 else self.array.ndim + self.axis
+        axinfo = _norm_key(key, self.shape)
+        input_slices = []
+        for a, (_is_int, start, stop, step) in enumerate(axinfo):
+            if a == A:
+                N = self.array.shape[a]
+                input_slices.append(slice(N - stop, N - start))
+            else:
+                input_slices.append(slice(start, stop))
+        block = self.array._read_direct(tuple(input_slices))
+        xp = array_namespace(block)
+        block = xp.flip(block, axis=A)
+        block = block[tuple(slice(0, stop - start, step) for (_ii, start, stop, step) in axinfo)]
+        for a in sorted((i for i, (ii, *_r) in enumerate(axinfo) if ii), reverse=True):
+            block = xp.squeeze(block, axis=a)
+        return block
 
-
-class ClipTransform(Transform):
-    """Clip array values to a range."""
-    
-    def __init__(self, array: 'DynamicArray', a_min: Optional[float], a_max: Optional[float]):
-        super().__init__()
-        self.array = array
-        self.a_min = a_min
-        self.a_max = a_max
-        self.shape = array.shape
-        self.chunks = array.chunks
-        self.dtype = array.dtype
-    
-    def read(self, key):
-        data = self.array._read_direct(key)
-        return np.clip(data, self.a_min, self.a_max)
-
-
-class AbsTransform(Transform):
-    """Absolute value."""
-    
-    def __init__(self, array: 'DynamicArray'):
-        super().__init__()
-        self.array = array
-        self.shape = array.shape
-        self.chunks = array.chunks
-        self.dtype = array.dtype
-    
-    def read(self, key):
-        return np.abs(self.array._read_direct(key))
-
-
-class SignTransform(Transform):
-    """Sign of array elements."""
-    
-    def __init__(self, array: 'DynamicArray'):
-        super().__init__()
-        self.array = array
-        self.shape = array.shape
-        self.chunks = array.chunks
-        self.dtype = array.dtype
-    
-    def read(self, key):
-        return np.sign(self.array._read_direct(key))
-
-
-class RoundTransform(Transform):
-    """Round array elements."""
-    
-    def __init__(self, array: 'DynamicArray', decimals: int = 0):
-        super().__init__()
-        self.array = array
-        self.decimals = decimals
-        self.shape = array.shape
-        self.chunks = array.chunks
-        self.dtype = array.dtype
-    
-    def read(self, key):
-        return np.round(self.array._read_direct(key), decimals=self.decimals)
-
-
-class SqrtTransform(Transform):
-    """Square root."""
-    
-    def __init__(self, array: 'DynamicArray'):
-        super().__init__()
-        self.array = array
-        self.shape = array.shape
-        self.chunks = array.chunks
-        self.dtype = np.float64
-    
-    def read(self, key):
-        return np.sqrt(self.array._read_direct(key))
-
-
-class WhereTransform(Transform):
-    """Conditional element selection."""
-    
-    def __init__(self, condition: 'DynamicArray', x: 'DynamicArray', y: 'DynamicArray'):
-        super().__init__()
-        if not (condition.shape == x.shape == y.shape):
-            raise ValueError("All arrays must have the same shape")
-        
-        self.condition = condition
-        self.x = x
-        self.y = y
-        self.shape = x.shape
-        self.chunks = x.chunks
-        self.dtype = x.dtype
-    
-    def read(self, key):
-        cond = self.condition._read_direct(key)
-        x_data = self.x._read_direct(key)
-        y_data = self.y._read_direct(key)
-        return np.where(cond, x_data, y_data)
-
-
-class MultiplyTransform(Transform):
-    """Element-wise multiplication."""
-    
-    def __init__(self, array1: 'DynamicArray', array2: Union['DynamicArray', float]):
-        super().__init__()
-        self.array1 = array1
-        self.array2 = array2
-        self.shape = array1.shape
-        self.chunks = array1.chunks
-        self.dtype = array1.dtype
-    
-    def read(self, key):
-        # Import here to avoid circular dependency
-        from dyna_zarr.dynamic_array import DynamicArray
-        
-        data1 = self.array1._read_direct(key)
-        if isinstance(self.array2, DynamicArray):
-            data2 = self.array2._read_direct(key)
-        else:
-            data2 = self.array2
-        return data1 * data2
-
-
-class AddTransform(Transform):
-    """Element-wise addition."""
-    
-    def __init__(self, array1: 'DynamicArray', array2: Union['DynamicArray', float]):
-        super().__init__()
-        self.array1 = array1
-        self.array2 = array2
-        self.shape = array1.shape
-        self.chunks = array1.chunks
-        self.dtype = array1.dtype
-    
-    def read(self, key):
-        # Import here to avoid circular dependency
-        from dyna_zarr.dynamic_array import DynamicArray
-        
-        data1 = self.array1._read_direct(key)
-        if isinstance(self.array2, DynamicArray):
-            data2 = self.array2._read_direct(key)
-        else:
-            data2 = self.array2
-        return data1 + data2
-
-
-class MinTransform(Transform):
-    """Lazy minimum reduction along specified axes."""
-    def __init__(self, array: 'DynamicArray', axis: Optional[int] = None):
-        super().__init__()
-        self.array = array
-        self.axis = axis
-        
-        if axis is None:
-            self.shape = ()
-            self.chunks = None
-        else:
-            normalized_axis = axis if axis >= 0 else array.ndim + axis
-            if normalized_axis < 0 or normalized_axis >= array.ndim:
-                raise ValueError(f"axis {axis} out of bounds for dimension {array.ndim}")
-            self.shape = array.shape[:normalized_axis] + array.shape[normalized_axis + 1:]
-            self.chunks = array.chunks[:normalized_axis] + array.chunks[normalized_axis + 1:] if array.chunks else None
-        
-        self.dtype = array.dtype
-    
-    def read(self, key):
-        """Read entire array and compute minimum."""
-        full_data = self.array._read_direct(tuple(slice(None) for _ in range(self.array.ndim)))
-        return np.min(full_data, axis=self.axis)
-
-
-class MaxTransform(Transform):
-    """Lazy maximum reduction along specified axes."""
-    def __init__(self, array: 'DynamicArray', axis: Optional[int] = None):
-        super().__init__()
-        self.array = array
-        self.axis = axis
-        
-        if axis is None:
-            self.shape = ()
-            self.chunks = None
-        else:
-            normalized_axis = axis if axis >= 0 else array.ndim + axis
-            if normalized_axis < 0 or normalized_axis >= array.ndim:
-                raise ValueError(f"axis {axis} out of bounds for dimension {array.ndim}")
-            self.shape = array.shape[:normalized_axis] + array.shape[normalized_axis + 1:]
-            self.chunks = array.chunks[:normalized_axis] + array.chunks[normalized_axis + 1:] if array.chunks else None
-        
-        self.dtype = array.dtype
-    
-    def read(self, key):
-        """Read entire array and compute maximum."""
-        full_data = self.array._read_direct(tuple(slice(None) for _ in range(self.array.ndim)))
-        return np.max(full_data, axis=self.axis)
-
-
-# operations class with static methods for creating transforms
-
-class operations:
-    """
-    Array operations following numpy API conventions.
-    All methods return lazy DynamicArray objects with transforms applied.
-    """
-    
-    @staticmethod
-    def expand_dims(array: 'DynamicArray', axis: int) -> 'DynamicArray':
-        """Add a new axis of length 1."""
-        transform = ExpandDimsTransform(array, axis)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def concatenate(arrays: List['DynamicArray'], axis: int = 0) -> 'DynamicArray':
-        """Concatenate arrays along an existing axis."""
-        if not arrays:
-            raise ValueError("Need at least one array to concatenate")
-        transform = ConcatenateTransform(tuple(arrays), axis)
-        return arrays[0]._with_transform(transform)
-    
-    @staticmethod
-    def stack(arrays: List['DynamicArray'], axis: int = 0) -> 'DynamicArray':
-        """Stack arrays along a new axis."""
-        if not arrays:
-            raise ValueError("Need at least one array to stack")
-        transform = StackTransform(tuple(arrays), axis)
-        return arrays[0]._with_transform(transform)
-    
-    @staticmethod
-    def swap_axes(array: 'DynamicArray', axis1: int, axis2: int) -> 'DynamicArray':
-        """Swap two axes."""
-        transform = SwapAxesTransform(array, axis1, axis2)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def transpose(array: 'DynamicArray', axes: Tuple[int, ...]) -> 'DynamicArray':
-        """Permute array dimensions."""
-        transform = TransposeTransform(array, axes)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def reshape(array: 'DynamicArray', shape: Tuple[int, ...]) -> 'DynamicArray':
-        """Reshape array to new shape."""
-        transform = ReshapeTransform(array, shape)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def squeeze(array: 'DynamicArray', axis: Optional[int] = None) -> 'DynamicArray':
-        """Remove singleton dimensions."""
-        transform = SqueezeTransform(array, axis)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def flatten(array: 'DynamicArray') -> 'DynamicArray':
-        """Flatten array to 1D."""
-        transform = FlattenTransform(array)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def pad(array: 'DynamicArray', pad_width: Union[int, Tuple]) -> 'DynamicArray':
-        """Pad array."""
-        transform = PadTransform(array, pad_width)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def tile(array: 'DynamicArray', reps: Union[int, Tuple]) -> 'DynamicArray':
-        """Repeat array along dimensions."""
-        transform = TileTransform(array, reps)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def roll(array: 'DynamicArray', shift: int, axis: Optional[int] = None) -> 'DynamicArray':
-        """Roll array elements along an axis."""
-        transform = RollTransform(array, shift, axis)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def flip(array: 'DynamicArray', axis: int) -> 'DynamicArray':
-        """Flip array along an axis."""
-        transform = FlipTransform(array, axis)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def clip(array: 'DynamicArray', a_min: Optional[float], a_max: Optional[float]) -> 'DynamicArray':
-        """Clip array values to a range."""
-        transform = ClipTransform(array, a_min, a_max)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def abs(array: 'DynamicArray') -> 'DynamicArray':
-        """Absolute value."""
-        transform = AbsTransform(array)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def sign(array: 'DynamicArray') -> 'DynamicArray':
-        """Sign of array elements."""
-        transform = SignTransform(array)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def round(array: 'DynamicArray', decimals: int = 0) -> 'DynamicArray':
-        """Round array elements."""
-        transform = RoundTransform(array, decimals)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def sqrt(array: 'DynamicArray') -> 'DynamicArray':
-        """Square root."""
-        transform = SqrtTransform(array)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def where(condition: 'DynamicArray', x: 'DynamicArray', y: 'DynamicArray') -> 'DynamicArray':
-        """Conditional element selection."""
-        transform = WhereTransform(condition, x, y)
-        return x._with_transform(transform)
-    
-    @staticmethod
-    def multiply(array1: 'DynamicArray', array2: Union['DynamicArray', float]) -> 'DynamicArray':
-        """Element-wise multiplication."""
-        transform = MultiplyTransform(array1, array2)
-        return array1._with_transform(transform)
-    
-    @staticmethod
-    def add(array1: 'DynamicArray', array2: Union['DynamicArray', float]) -> 'DynamicArray':
-        """Element-wise addition."""
-        transform = AddTransform(array1, array2)
-        return array1._with_transform(transform)
-    
-    @staticmethod
-    def min(array: 'DynamicArray', axis: Optional[int] = None) -> 'DynamicArray':
-        """Compute minimum along axis (lazy reduction)."""
-        transform = MinTransform(array, axis)
-        return array._with_transform(transform)
-    
-    @staticmethod
-    def max(array: 'DynamicArray', axis: Optional[int] = None) -> 'DynamicArray':
-        """Compute maximum along axis (lazy reduction)."""
-        transform = MaxTransform(array, axis)
-        return array._with_transform(transform)
 
 
 def slice_array(array: 'DynamicArray', key) -> 'DynamicArray':
     """Create a lazy slice of an array."""
     transform = SliceTransform(array, key)
     return array._with_transform(transform)
+
+
+# --------------------------------------------------------------------------- #
+# Public ops -- structural / coordinate (this module owns both transforms + ops)
+# --------------------------------------------------------------------------- #
+
+def expand_dims(array, axis):
+    """Add a new axis of length 1."""
+    return array._with_transform(ExpandDimsTransform(array, axis))
+
+
+def concatenate(arrays, axis=0):
+    """Concatenate arrays along an existing axis."""
+    if not arrays:
+        raise ValueError("Need at least one array to concatenate")
+    return arrays[0]._with_transform(ConcatenateTransform(tuple(arrays), axis))
+
+
+def stack(arrays, axis=0):
+    """Stack arrays along a new axis."""
+    if not arrays:
+        raise ValueError("Need at least one array to stack")
+    return arrays[0]._with_transform(StackTransform(tuple(arrays), axis))
+
+
+def swap_axes(array, axis1, axis2):
+    """Swap two axes."""
+    return array._with_transform(SwapAxesTransform(array, axis1, axis2))
+
+
+def transpose(array, axes):
+    """Permute array dimensions."""
+    return array._with_transform(TransposeTransform(array, axes))
+
+
+def reshape(array, shape):
+    """Reshape array to a new shape (C-order).
+
+    Memory: ``io.write`` streams this via the reindex writer (per output chunk, one input
+    chunk at a time), so writing a reshape is hard-bounded to ~1 input chunk + 1 output
+    chunk regardless of array size. A lazy ``compute()`` / sub-slice still uses a covering
+    read (heavier, since a flat re-index conflicts with nd chunk layout).
+    """
+    return array._with_transform(ReshapeTransform(array, shape))
+
+
+def squeeze(array, axis=None):
+    """Remove singleton dimensions."""
+    return array._with_transform(SqueezeTransform(array, axis))
+
+
+def flatten(array):
+    """Flatten array to 1D (C-order).
+
+    Memory: ``io.write`` streams this via the reindex writer, hard-bounded to ~1 input
+    chunk + 1 output chunk regardless of array size (verified flat: 170MB->679MB arrays
+    all peak ~135MB). A lazy ``compute()`` still materializes.
+    """
+    return array._with_transform(FlattenTransform(array))
+
+
+def pad(array, pad_width):
+    """Pad array."""
+    return array._with_transform(PadTransform(array, pad_width))
+
+
+def tile(array, reps):
+    """Repeat array along dimensions."""
+    return array._with_transform(TileTransform(array, reps))
+
+
+def roll(array, shift, axis=None):
+    """Roll array elements along an axis."""
+    return array._with_transform(RollTransform(array, shift, axis))
+
+
+def flip(array, axis):
+    """Flip array along an axis."""
+    return array._with_transform(FlipTransform(array, axis))
+
+
+def rot90(array, k=1, axes=(0, 1)):
+    """Rotate array by 90 degrees ``k`` times in the plane of ``axes`` (like numpy.rot90).
+    Composed from the validated flip/transpose transforms, so it stays lazy + backend-agnostic."""
+    ndim = array.ndim
+    a0 = axes[0] if axes[0] >= 0 else ndim + axes[0]
+    a1 = axes[1] if axes[1] >= 0 else ndim + axes[1]
+    if a0 == a1 or not (0 <= a0 < ndim and 0 <= a1 < ndim):
+        raise ValueError(f"invalid rotation axes {axes} for ndim {ndim}")
+    k %= 4
+    if k == 0:
+        return array
+    if k == 2:
+        return flip(flip(array, a0), a1)
+    perm = list(range(ndim))
+    perm[a0], perm[a1] = perm[a1], perm[a0]
+    if k == 1:
+        return transpose(flip(array, a1), tuple(perm))
+    return flip(transpose(array, tuple(perm)), a1)   # k == 3
+
+
+__all__ = [
+    "ConcatenateTransform", "StackTransform", "SliceTransform", "ExpandDimsTransform",
+    "SwapAxesTransform", "TransposeTransform", "ReshapeTransform", "SqueezeTransform",
+    "FlattenTransform", "PadTransform", "TileTransform", "RollTransform", "FlipTransform",
+    "slice_array",
+    "expand_dims", "concatenate", "stack", "swap_axes", "transpose", "reshape",
+    "squeeze", "flatten", "pad", "tile", "roll", "flip", "rot90",
+]
