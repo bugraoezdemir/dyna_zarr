@@ -9,7 +9,7 @@ Includes efficient TIFF reading via tifffile's zarr bridge with concurrent acces
 """
 
 __version__ = "0.0.4"
-__author__ = "EuBI-Biohub"
+__author__ = "Bugra Oezdemir"
 
 # Import core classes
 from .dynamic_array import DynamicArray, slice_array

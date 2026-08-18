@@ -37,7 +37,7 @@ class Codecs:
             cname: Blosc compressor name ('lz4', 'zstd', 'zlib', 'snappy', 'blosclz')
             shuffle: Blosc shuffle mode (0=no shuffle, 1=byte shuffle, 2=bit shuffle)
             typesize: Blosc element width IN BYTES, for the (bit)shuffle stage. ``None``
-                (default) derives it from the array dtype at write time - which is what
+                (default) derives it from the array dtype at write time, which is what
                 you want; pass an explicit value only to override.
 
                 This matters, and only for Zarr v3. Both shuffle modes permute *within*
