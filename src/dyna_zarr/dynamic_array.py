@@ -306,6 +306,21 @@ class DynamicArray:
         from . import operations as o
         return o.round(self, decimals)
 
+    def reshape(self, *shape):
+        """Lazily reshape (C-order), like ``numpy``/``dask`` ``a.reshape``. Accepts either a
+        single shape tuple or separate int args. On ``io.write`` an outermost reshape is
+        streamed memory-bounded (disk-staged); see operations.reshape."""
+        from . import operations as o
+        if len(shape) == 1 and not np.isscalar(shape[0]):
+            shape = tuple(shape[0])
+        return o.reshape(self, shape)
+
+    def flatten(self):
+        """Lazily flatten to 1D (C-order), like ``numpy`` ``a.flatten``. Memory-bounded on
+        ``io.write`` (disk-staged); see operations.flatten."""
+        from . import operations as o
+        return o.flatten(self)
+
     def rechunk(self, chunks=None, **kwargs):
         """No-op for the pull model (accepts dask's signature for backend compatibility).
 
@@ -323,11 +338,13 @@ class DynamicArray:
         unchanged. Use ``io.write`` to stage an intermediate to disk when needed."""
         return self
 
-    def map_blocks(self, func, *args, dtype=None, **kwargs):
+    def map_blocks(self, func, *args, dtype=None, device=None, **kwargs):
         """dask-compatible ``map_blocks``: apply ``func`` blockwise (shape-preserving). Extra
         array/scalar ``args`` become additional equally-shaped operands; dask-only kwargs
         (``meta``/``chunks``/``name``/``block_info``/...) are ignored, and any remaining kwargs
-        are bound to ``func``. ``drop_axis``/``new_axis`` (shape-changing) are not supported."""
+        are bound to ``func``. ``drop_axis``/``new_axis`` (shape-changing) are not supported.
+        ``device`` (None=inherit the execution context, 'cpu', 'cuda') runs it on that device -
+        the block is moved there before ``func``, which dispatches on the block's array module."""
         from . import operations as o
         if kwargs.get("drop_axis") is not None or kwargs.get("new_axis") is not None:
             raise NotImplementedError(
@@ -336,19 +353,39 @@ class DynamicArray:
                   "block_info", "block_id", "enforce_ndim"):
             kwargs.pop(k, None)
         f = (lambda *bs, _f=func, _kw=kwargs: _f(*bs, **_kw)) if kwargs else func
-        return o.map_blocks(f, self, *args, dtype=dtype)
+        return o.map_blocks(f, self, *args, dtype=dtype, device=device)
 
-    def map_overlap(self, func, depth=0, boundary="reflect", trim=True, dtype=None, **kwargs):
+    def map_overlap(self, func, depth=0, boundary="reflect", trim=True, dtype=None,
+                    device=None, **kwargs):
         """dask-compatible ``map_overlap``: apply a shape-preserving neighbourhood ``func``
         with a ``depth`` halo. dask-only kwargs are ignored and any remaining kwargs are bound
-        to ``func``. ``trim=False`` (shrinking output) is not supported."""
+        to ``func``. dask's boundary names are translated to the scipy.ndimage names the
+        pull-model map_overlap uses. ``trim=False`` (shrinking output) is not supported.
+        ``device`` (None=inherit, 'cpu', 'cuda') runs it on that device - the haloed block is
+        moved there before ``func``, which dispatches ndimage on the block's array module."""
         from . import operations as o
         if not trim:
             raise NotImplementedError("map_overlap trim=False is not supported")
         for k in ("meta", "chunks", "name"):
             kwargs.pop(k, None)
+        if isinstance(boundary, (int, float)):          # dask allows a numeric fill boundary
+            boundary = "constant"                       # -> constant-pad the halo (fill 0)
+        boundary = _DASK_BOUNDARY_ALIASES.get(boundary, boundary)   # e.g. 'periodic' -> 'wrap'
         f = (lambda b, _f=func, _kw=kwargs: _f(b, **_kw)) if kwargs else func
-        return o.map_overlap(self, f, depth, boundary=boundary, dtype=dtype)
+        return o.map_overlap(self, f, depth, boundary=boundary, dtype=dtype, device=device)
+
+    def __array_function__(self, func, types, args, kwargs):
+        """NumPy high-level function protocol -> lazy ops, so ``np.stack``/``np.max``/
+        ``np.where``/``np.concatenate``/... work on DynamicArrays exactly as on dask arrays.
+        This is what lets pyrops call ``np.<func>`` uniformly across both backends.
+        A function dyna_zarr does not implement returns ``NotImplemented`` (NumPy then raises)."""
+        handler = _array_function_registry().get(func)
+        if handler is None:
+            return NotImplemented
+        try:
+            return handler(*args, **kwargs)
+        except (TypeError, ValueError, NotImplementedError):
+            return NotImplemented
 
     def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
         """NumPy ufunc protocol -> lazy ops, so ``np.sqrt(a)`` / ``np.add(a, 2)`` work on a
@@ -450,6 +487,36 @@ class DynamicArray:
         from . import operations
         return operations.median(self, axis=axis, keepdims=keepdims).compute()
 
+    def std(self, axis=None, keepdims=False, ddof=0):
+        """Standard deviation along ``axis`` (None = all). Computed immediately."""
+        from . import operations
+        return operations.std(self, axis=axis, keepdims=keepdims, ddof=ddof).compute()
+
+    def var(self, axis=None, keepdims=False, ddof=0):
+        """Variance along ``axis`` (None = all). Computed immediately."""
+        from . import operations
+        return operations.var(self, axis=axis, keepdims=keepdims, ddof=ddof).compute()
+
+    def any(self, axis=None, keepdims=False):
+        """Whether any element is true along ``axis`` (None = all). Computed immediately."""
+        from . import operations
+        return operations.any(self, axis=axis, keepdims=keepdims).compute()
+
+    def all(self, axis=None, keepdims=False):
+        """Whether all elements are true along ``axis`` (None = all). Computed immediately."""
+        from . import operations
+        return operations.all(self, axis=axis, keepdims=keepdims).compute()
+
+    def argmin(self, axis=None):
+        """Index of the minimum along ``axis`` (None = flattened). Computed immediately."""
+        from . import operations
+        return operations.argmin(self, axis=axis).compute()
+
+    def argmax(self, axis=None):
+        """Index of the maximum along ``axis`` (None = flattened). Computed immediately."""
+        from . import operations
+        return operations.argmax(self, axis=axis).compute()
+
     def histogram(self, bins=256, range=None):
         """Streaming histogram over the whole array. Returns ``(counts, bin_edges)`` like
         numpy. Slice first for a per-channel/plane histogram: ``da[channel].histogram()``."""
@@ -469,14 +536,94 @@ from .operations import SliceTransform
 # inherited identity __hash__ intact, so a DynamicArray is still hashable.
 # --------------------------------------------------------------------------- #
 
+# dask map_overlap boundary names -> scipy.ndimage names used by operations.map_overlap.
+_DASK_BOUNDARY_ALIASES = {"periodic": "wrap"}
+
+_ARRAY_FUNCTION_REGISTRY = None
+
+
+def _array_function_registry():
+    """Lazily build & cache {numpy_function: handler} for __array_function__. Handlers adapt
+    NumPy's call convention (extra out=/keepdims kwargs, tuple/None axis defaults) to the
+    dyna_zarr.operations signatures. Not covered here (kept explicit / backend-branched by the
+    caller): creation (nullary), np.pad with a mode dyna's pad lacks."""
+    global _ARRAY_FUNCTION_REGISTRY
+    if _ARRAY_FUNCTION_REGISTRY is not None:
+        return _ARRAY_FUNCTION_REGISTRY
+    import numpy as _np
+    from . import operations as o
+
+    def _red(fn):                       # reductions: tolerate out=/keepdims=_NoValue
+        def h(a, axis=None, out=None, keepdims=_np._NoValue, **k):
+            kd = False if keepdims is _np._NoValue else bool(keepdims)
+            return fn(a, axis=axis, keepdims=kd)
+        return h
+
+    def _red_ddof(fn):                  # std/var
+        def h(a, axis=None, out=None, keepdims=_np._NoValue, ddof=0, **k):
+            kd = False if keepdims is _np._NoValue else bool(keepdims)
+            return fn(a, axis=axis, keepdims=kd, ddof=ddof)
+        return h
+
+    def _flip(a, axis=None):            # dyna flip is per-int-axis; chain for tuple / all-axes
+        axes = range(a.ndim) if axis is None else ((axis,) if _np.isscalar(axis) else axis)
+        out = a
+        for ax in axes:
+            out = o.flip(out, ax)
+        return out
+
+    def _roll(a, shift, axis=None):     # dyna roll is single-axis; chain for a per-axis list
+        if axis is not None and not _np.isscalar(axis):
+            shifts = shift if not _np.isscalar(shift) else [shift] * len(axis)
+            out = a
+            for s, ax in zip(shifts, axis):
+                out = o.roll(out, int(s), int(ax))
+            return out
+        return o.roll(a, shift, axis)
+
+    reg = {
+        _np.stack: lambda arrays, axis=0, **k: o.stack(list(arrays), axis=axis),
+        _np.concatenate: lambda arrays, axis=0, **k: o.concatenate(list(arrays), axis=axis),
+        _np.where: lambda cond, x, y, **k: o.where(cond, x, y),
+        _np.expand_dims: lambda a, axis, **k: o.expand_dims(a, axis),
+        _np.squeeze: lambda a, axis=None, **k: o.squeeze(a, axis),
+        _np.transpose: lambda a, axes=None, **k: o.transpose(
+            a, tuple(reversed(range(a.ndim))) if axes is None else axes),
+        _np.flip: _flip,
+        _np.roll: _roll,
+        _np.pad: lambda a, pad_width, mode="constant", **k: o.pad(a, pad_width, mode=mode, **k),
+        _np.rot90: lambda a, k=1, axes=(0, 1), **kw: o.rot90(a, k, axes),
+        _np.diff: lambda a, n=1, axis=-1, **k: o.diff(a, n, axis),
+        _np.gradient: lambda a, *ar, axis=-1, **k: o.gradient(a, axis=axis),
+        _np.digitize: lambda a, bins, right=False, **k: o.digitize(a, bins, right),
+        _np.isin: lambda a, test, invert=False, **k: o.isin(a, test, invert),
+        _np.histogram: lambda a, bins=256, range=None, **k: o.histogram(a, bins=bins, range=range),
+        _np.cumsum: lambda a, axis=None, **k: o.cumsum(a, axis),
+        _np.cumprod: lambda a, axis=None, **k: o.cumprod(a, axis),
+        _np.round: lambda a, decimals=0, **k: o.round(a, decimals),
+        _np.around: lambda a, decimals=0, **k: o.round(a, decimals),
+        _np.clip: lambda a, a_min=None, a_max=None, **k: o.clip(a, a_min, a_max),
+        _np.unique: lambda a, **k: o.unique(a),
+        # complex-part extraction (pointwise; dispatched as array-functions, not ufuncs)
+        _np.real: lambda a, **k: o.map_blocks(_np.real, a, name="real"),
+        _np.imag: lambda a, **k: o.map_blocks(_np.imag, a, name="imag"),
+        _np.angle: lambda a, deg=False, **k: o.map_blocks(
+            lambda x: _np.angle(x, deg=deg), a, name="angle"),
+    }
+    for npf, ofn in [(_np.amax, o.max), (_np.max, o.max), (_np.amin, o.min), (_np.min, o.min),
+                     (_np.sum, o.sum), (_np.mean, o.mean), (_np.prod, o.prod),
+                     (_np.any, o.any), (_np.all, o.all),
+                     (_np.argmin, o.argmin), (_np.argmax, o.argmax), (_np.median, o.median)]:
+        reg[npf] = _red(ofn)
+    reg[_np.std] = _red_ddof(o.std)
+    reg[_np.var] = _red_ddof(o.var)
+    _ARRAY_FUNCTION_REGISTRY = reg
+    return reg
+
 # numpy ufunc names that differ from the operations spelling (see __array_ufunc__).
 _UFUNC_ALIASES = {
     "absolute": "abs",
     "true_divide": "divide",
-    "bitwise_and": "logical_and",
-    "bitwise_or": "logical_or",
-    "bitwise_xor": "logical_xor",
-    "invert": "logical_not",
 }
 
 
@@ -500,7 +647,8 @@ def _unop(opname):
 for _dunder, _op in {
     "add": "add", "sub": "subtract", "mul": "multiply", "truediv": "divide",
     "floordiv": "floor_divide", "mod": "mod", "pow": "power",
-    "and": "logical_and", "or": "logical_or", "xor": "logical_xor",
+    "and": "bitwise_and", "or": "bitwise_or", "xor": "bitwise_xor",
+    "lshift": "left_shift", "rshift": "right_shift",
 }.items():
     setattr(DynamicArray, f"__{_dunder}__", _binop(_op))
     setattr(DynamicArray, f"__r{_dunder}__", _binop(_op, reflected=True))
@@ -513,7 +661,7 @@ for _dunder, _op in {
 
 DynamicArray.__neg__ = _unop("negative")
 DynamicArray.__abs__ = _unop("abs")
-DynamicArray.__invert__ = _unop("logical_not")
+DynamicArray.__invert__ = _unop("invert")
 
 
 def slice_array(array: DynamicArray, key) -> DynamicArray:

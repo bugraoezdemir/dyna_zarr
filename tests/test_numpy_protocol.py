@@ -86,7 +86,7 @@ def test_unsupported_ufunc_errors_cleanly(da_arr):
     """A ufunc dyna_zarr doesn't implement must NOT silently return wrong data."""
     d, _ = da_arr
     with pytest.raises(TypeError):
-        np.sin(d).compute()
+        np.modf(d)          # multi-output ufunc: unsupported -> clean TypeError, not wrong data
 
 
 # --- operators (dunders) round-trip, incl. chaining ---
@@ -128,3 +128,32 @@ def test_map_overlap_method_dask_style(da_arr):
     np.testing.assert_allclose(got.compute(), ndi.uniform_filter(arr, 3, mode="reflect"), atol=1e-5)
     with pytest.raises(NotImplementedError):
         d.map_overlap(lambda b: b, depth=1, trim=False)
+
+
+# --- numpy high-level function protocol (__array_function__) ---
+
+def test_array_function_dispatch(da_arr):
+    """np.<func>(DynamicArray) dispatches to the lazy op (like dask), for the functions
+    ome_zarr_pro calls uniformly across backends."""
+    d, arr = da_arr
+    e = DynamicArray(zarr.array(arr[::-1].copy(), chunks=(1, 4, 4)))
+    er = arr[::-1]
+    np.testing.assert_array_equal(np.stack([d, e], 1).compute(), np.stack([arr, er], 1))
+    np.testing.assert_array_equal(np.concatenate([d, e], 0).compute(), np.concatenate([arr, er], 0))
+    np.testing.assert_allclose(np.where(d > 0, d, e).compute(), np.where(arr > 0, arr, er))
+    np.testing.assert_array_equal(np.transpose(d, (2, 0, 1)).compute(), np.transpose(arr, (2, 0, 1)))
+    np.testing.assert_array_equal(np.transpose(d).compute(), np.transpose(arr))
+    np.testing.assert_array_equal(np.flip(d).compute(), np.flip(arr))          # all axes (chained)
+    np.testing.assert_array_equal(np.flip(d, (0, 2)).compute(), np.flip(arr, (0, 2)))
+    np.testing.assert_array_equal(np.expand_dims(d, 1).compute(), np.expand_dims(arr, 1))
+    np.testing.assert_allclose(np.max(d, axis=0).compute(), np.max(arr, axis=0))
+    np.testing.assert_allclose(np.mean(d, axis=1, keepdims=True).compute(), np.mean(arr, axis=1, keepdims=True))
+    np.testing.assert_allclose(np.std(d, axis=0).compute(), np.std(arr, axis=0), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(np.cumsum(d, axis=0).compute(), np.cumsum(arr, axis=0))
+    np.testing.assert_allclose(np.diff(d, axis=2).compute(), np.diff(arr, axis=2))
+
+
+def test_array_function_unsupported_returns_notimplemented(da_arr):
+    d, _ = da_arr
+    with pytest.raises(TypeError):
+        np.linalg.norm(d)     # not in the registry -> NotImplemented -> numpy raises
