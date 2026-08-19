@@ -2,15 +2,22 @@
 requires = ["setuptools>=65", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["dyna_zarr"]
+# Auto-discover every subpackage under src/. The previous explicit
+# `packages = ["dyna_zarr"]` shipped ONLY the top-level modules: the
+# `dyna_zarr.operations` subpackage was left out of the wheel entirely, so an
+# installed copy raised `ModuleNotFoundError: No module named
+# 'dyna_zarr.operations'` on import (it worked locally only because the editable
+# install points at the source tree). Discovery keeps new subpackages included
+# automatically.
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-dir]
 "" = "src"
 
 [project]
 name = "dyna-zarr"
-version = "0.0.4"
+version = "0.0.5"
 description = "A lightweight library for lazy operations on Zarr arrays without task graph overhead"
 readme = "README.md"
 requires-python = ">=3.11"
