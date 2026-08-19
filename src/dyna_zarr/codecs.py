@@ -26,20 +26,46 @@ class Codecs:
         codecs = Codecs(None)
     """
     
-    def __init__(self, compressor='blosc', clevel=5, cname='lz4', shuffle=1):
+    def __init__(self, compressor='blosc', clevel=5, cname='lz4', shuffle=1,
+                 typesize=None):
         """
         Initialize compression configuration.
-        
+
         Args:
             compressor: Compression algorithm ('blosc', 'zstd', 'gzip', 'lz4', 'bz2', None)
             clevel: Compression level (1-9, higher = more compression but slower)
             cname: Blosc compressor name ('lz4', 'zstd', 'zlib', 'snappy', 'blosclz')
             shuffle: Blosc shuffle mode (0=no shuffle, 1=byte shuffle, 2=bit shuffle)
+            typesize: Blosc element width IN BYTES, for the (bit)shuffle stage. ``None``
+                (default) derives it from the array dtype at write time, which is what
+                you want; pass an explicit value only to override.
+
+                This matters, and only for Zarr v3. Both shuffle modes permute *within*
+                elements (byte shuffle groups the Nth byte of every element; bitshuffle
+                does the same per bit), so the element width IS the transform. Zarr v2
+                does not store it - blosc infers it from the buffer's itemsize at encode
+                time - but v3 serializes ``typesize`` into the array metadata, so it must
+                be set explicitly or it defaults to 1 and the shuffle degenerates to a
+                byte-wise permutation of the raw stream.
+
+                Measured on int32 labels, zstd-5 bitshuffle, one 64^3 chunk:
+                typesize=1 -> 25.6 KiB, typesize=4 -> 20.8 KiB (and faster to encode).
         """
         self.compressor = compressor
         self.clevel = clevel
         self.cname = cname
         self.shuffle = shuffle
+        self.typesize = typesize
+
+    @staticmethod
+    def _typesize_for(dtype):
+        """Element width in bytes for `dtype`, clamped to what blosc accepts (1..255)."""
+        import numpy as np
+        try:
+            size = int(np.dtype(dtype).itemsize)
+        except Exception:
+            return 1
+        return size if 1 <= size <= 255 else 1
     
     def to_v2_config(self):
         """
@@ -106,30 +132,42 @@ class Codecs:
         else:
             raise ValueError(f"Unsupported compressor: {self.compressor}")
     
-    def to_v3_config(self):
+    def to_v3_config(self, dtype=None):
         """
         Generate codec pipeline for Zarr v3 using proper zarr.codecs API.
-        
+
+        Args:
+            dtype: Array dtype, used to derive the blosc ``typesize`` when this Codecs was
+                built without an explicit one. Zarr v3 SERIALIZES typesize into the array
+                metadata (v2 does not - blosc infers it there), so leaving it unset writes
+                ``typesize: 1`` and the (bit)shuffle silently degrades to a byte-wise
+                permutation. Always pass the dtype you are writing.
+
         Returns:
             List of codec configurations (from .to_dict() calls)
         """
         from zarr import codecs
-        
+
         codecs_list = [
             codecs.BytesCodec(endian=codecs.Endian.little).to_dict()
         ]
-        
+
         if self.compressor == 'blosc':
             # Use BloscCodec with proper BloscShuffle enum
-            shuffle_map = {0: codecs.BloscShuffle.noshuffle, 
-                          1: codecs.BloscShuffle.shuffle, 
+            shuffle_map = {0: codecs.BloscShuffle.noshuffle,
+                          1: codecs.BloscShuffle.shuffle,
                           2: codecs.BloscShuffle.bitshuffle}
             shuffle_enum = shuffle_map.get(self.shuffle, codecs.BloscShuffle.shuffle)
-            
+
+            typesize = self.typesize
+            if typesize is None:
+                typesize = self._typesize_for(dtype) if dtype is not None else 1
+
             blosc_codec = codecs.BloscCodec(
                 cname=self.cname,
                 clevel=self.clevel,
-                shuffle=shuffle_enum
+                shuffle=shuffle_enum,
+                typesize=typesize,
             )
             codecs_list.append(blosc_codec.to_dict())
             

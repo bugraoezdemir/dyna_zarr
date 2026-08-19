@@ -104,6 +104,40 @@ def log10(array): return map_blocks(np.log10, array, name="log10")
 def floor(array): return map_blocks(np.floor, array, name="floor")
 def ceil(array): return map_blocks(np.ceil, array, name="ceil")
 def reciprocal(array): return map_blocks(np.reciprocal, array, name="reciprocal")
+def exp2(array): return map_blocks(np.exp2, array, name="exp2")
+def expm1(array): return map_blocks(np.expm1, array, name="expm1")
+def log1p(array): return map_blocks(np.log1p, array, name="log1p")
+def cbrt(array): return map_blocks(np.cbrt, array, name="cbrt")
+def fabs(array): return map_blocks(np.fabs, array, name="fabs")
+def positive(array): return map_blocks(np.positive, array, name="positive")
+def conjugate(array): return map_blocks(np.conjugate, array, name="conjugate")
+def rint(array): return map_blocks(np.rint, array, name="rint")
+def trunc(array): return map_blocks(np.trunc, array, name="trunc")
+def spacing(array): return map_blocks(np.spacing, array, name="spacing")
+
+# trigonometric / hyperbolic / angle conversion (all pointwise ufuncs)
+def sin(array): return map_blocks(np.sin, array, name="sin")
+def cos(array): return map_blocks(np.cos, array, name="cos")
+def tan(array): return map_blocks(np.tan, array, name="tan")
+def arcsin(array): return map_blocks(np.arcsin, array, name="arcsin")
+def arccos(array): return map_blocks(np.arccos, array, name="arccos")
+def arctan(array): return map_blocks(np.arctan, array, name="arctan")
+def sinh(array): return map_blocks(np.sinh, array, name="sinh")
+def cosh(array): return map_blocks(np.cosh, array, name="cosh")
+def tanh(array): return map_blocks(np.tanh, array, name="tanh")
+def arcsinh(array): return map_blocks(np.arcsinh, array, name="arcsinh")
+def arccosh(array): return map_blocks(np.arccosh, array, name="arccosh")
+def arctanh(array): return map_blocks(np.arctanh, array, name="arctanh")
+def deg2rad(array): return map_blocks(np.deg2rad, array, name="deg2rad")
+def rad2deg(array): return map_blocks(np.rad2deg, array, name="rad2deg")
+def degrees(array): return map_blocks(np.degrees, array, name="degrees")
+def radians(array): return map_blocks(np.radians, array, name="radians")
+
+# predicates (bool out)
+def signbit(array): return map_blocks(np.signbit, array, name="signbit")
+def isfinite(array): return map_blocks(np.isfinite, array, name="isfinite")
+def isinf(array): return map_blocks(np.isinf, array, name="isinf")
+def isnan(array): return map_blocks(np.isnan, array, name="isnan")
 
 
 def round(array, decimals=0):
@@ -128,6 +162,31 @@ def mod(a, b): return map_blocks(np.mod, a, b, name="mod")
 def power(a, b): return map_blocks(np.power, a, b, name="power")
 def maximum(a, b): return map_blocks(np.maximum, a, b, name="maximum")
 def minimum(a, b): return map_blocks(np.minimum, a, b, name="minimum")
+def remainder(a, b): return map_blocks(np.remainder, a, b, name="remainder")
+def fmod(a, b): return map_blocks(np.fmod, a, b, name="fmod")
+def fmax(a, b): return map_blocks(np.fmax, a, b, name="fmax")
+def fmin(a, b): return map_blocks(np.fmin, a, b, name="fmin")
+def float_power(a, b): return map_blocks(np.float_power, a, b, name="float_power")
+def hypot(a, b): return map_blocks(np.hypot, a, b, name="hypot")
+def arctan2(a, b): return map_blocks(np.arctan2, a, b, name="arctan2")
+def copysign(a, b): return map_blocks(np.copysign, a, b, name="copysign")
+def nextafter(a, b): return map_blocks(np.nextafter, a, b, name="nextafter")
+def logaddexp(a, b): return map_blocks(np.logaddexp, a, b, name="logaddexp")
+def logaddexp2(a, b): return map_blocks(np.logaddexp2, a, b, name="logaddexp2")
+def heaviside(a, b): return map_blocks(np.heaviside, a, b, name="heaviside")
+
+
+# bitwise / shift (integer inputs; on bool these coincide with the logical ops, so
+# they also back the &/|/^/~ dunders -- matching numpy/dask exactly)
+def bitwise_and(a, b): return map_blocks(np.bitwise_and, a, b, name="bitwise_and")
+def bitwise_or(a, b): return map_blocks(np.bitwise_or, a, b, name="bitwise_or")
+def bitwise_xor(a, b): return map_blocks(np.bitwise_xor, a, b, name="bitwise_xor")
+def invert(array): return map_blocks(np.invert, array, name="invert")
+def left_shift(a, b): return map_blocks(np.left_shift, a, b, name="left_shift")
+def right_shift(a, b): return map_blocks(np.right_shift, a, b, name="right_shift")
+def gcd(a, b): return map_blocks(np.gcd, a, b, name="gcd")
+def lcm(a, b): return map_blocks(np.lcm, a, b, name="lcm")
+def ldexp(a, b): return map_blocks(np.ldexp, a, b, name="ldexp")
 
 
 # comparisons & logical (bool out)
@@ -165,8 +224,18 @@ __all__ = [
     "MapBlocksTransform", "map_blocks",
     "abs", "negative", "sign", "sqrt", "square", "exp", "log", "log2", "log10",
     "floor", "ceil", "reciprocal", "round", "clip", "astype",
+    "exp2", "expm1", "log1p", "cbrt", "fabs", "positive", "conjugate",
+    "rint", "trunc", "spacing",
+    "sin", "cos", "tan", "arcsin", "arccos", "arctan",
+    "sinh", "cosh", "tanh", "arcsinh", "arccosh", "arctanh",
+    "deg2rad", "rad2deg", "degrees", "radians",
+    "signbit", "isfinite", "isinf", "isnan",
     "add", "subtract", "multiply", "divide", "floor_divide", "mod", "power",
     "maximum", "minimum",
+    "remainder", "fmod", "fmax", "fmin", "float_power", "hypot", "arctan2",
+    "copysign", "nextafter", "logaddexp", "logaddexp2", "heaviside",
+    "bitwise_and", "bitwise_or", "bitwise_xor", "invert", "left_shift", "right_shift",
+    "gcd", "lcm", "ldexp",
     "greater", "greater_equal", "less", "less_equal", "equal", "not_equal",
     "logical_and", "logical_or", "logical_xor", "logical_not", "where",
     "isin", "digitize",

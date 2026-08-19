@@ -1,4 +1,4 @@
-"""operations: lazy array ops for DynamicArray, decentralized by the ome_zarr_pro
+"""operations: lazy array ops for DynamicArray, decentralized by the pyrops
 taxonomy locality axis. Each category module owns BOTH its transforms and its public op
 functions; this package is a thin flat re-export hub. Adding an op touches exactly one
 module.

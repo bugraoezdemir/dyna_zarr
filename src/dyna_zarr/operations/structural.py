@@ -686,46 +686,48 @@ class FlattenTransform(Transform):
 
 
 class PadTransform(Transform):
-    """Lazy padding (materializes on read)."""
-    
-    def __init__(self, array: 'DynamicArray', pad_width: Union[int, Tuple]):
+    """Lazy padding (materializes on read). Supports numpy.pad ``mode`` (constant/reflect/
+    edge/symmetric/wrap/...). Memory model: an axis whose read window lies entirely inside the
+    core is read as just that sub-slice (bounded); an axis whose window touches a padded border
+    reads that whole INPUT axis then pads it fully and crops -- so non-constant modes (reflect/
+    wrap/... need the array's own edge/interior) stay exact, bounded by the axis size when
+    bordered (like a scan/median floor)."""
+
+    def __init__(self, array: 'DynamicArray', pad_width: Union[int, Tuple],
+                 mode: str = "constant", **pad_kwargs):
         super().__init__()
         self.array = array
-        
-        # Normalize pad_width
         if isinstance(pad_width, int):
             self.pad_width = [(pad_width, pad_width)] * array.ndim
         else:
-            self.pad_width = pad_width
-        
-        # Calculate output shape
-        new_shape = []
-        for s, (pad_before, pad_after) in zip(array.shape, self.pad_width):
-            new_shape.append(s + pad_before + pad_after)
-        
-        self.shape = tuple(new_shape)
+            self.pad_width = [(int(b), int(a)) for (b, a) in pad_width]
+        self.mode = mode
+        self.pad_kwargs = pad_kwargs      # e.g. constant_values=, reflect_type=
+        self.shape = tuple(s + b + a for s, (b, a) in zip(array.shape, self.pad_width))
         self.chunks = None
         self.dtype = array.dtype
-    
+
     def read(self, key):
-        # Memory-bound: read only the core-overlapping input region, then pad just the
-        # border that this region includes (constant 0, like np.pad's default).
         input_slices, pad_widths, crop, squeeze_axes = [], [], [], []
         for a, (is_int, start, stop, step) in enumerate(_norm_key(key, self.shape)):
-            before, _after = self.pad_width[a]
+            before, after = self.pad_width[a]
             in_size = self.array.shape[a]
-            core_lo, core_hi = max(start, before), min(stop, before + in_size)
-            input_slices.append(slice(core_lo - before, core_hi - before)
-                                if core_hi > core_lo else slice(0, 0))
-            pad_before = max(0, min(stop, before) - start)
-            pad_after = max(0, stop - max(start, before + in_size))
-            pad_widths.append((pad_before, pad_after))
-            crop.append(slice(0, stop - start, step))
+            if start >= before and stop <= before + in_size:
+                # window entirely in the core: read just this sub-slice, no padding this axis
+                input_slices.append(slice(start - before, stop - before))
+                pad_widths.append((0, 0))
+                crop.append(slice(0, stop - start, step))
+            else:
+                # window touches a padded border: read the whole input axis, pad it fully
+                # (so the mode sees the real edge/interior), then crop the requested window
+                input_slices.append(slice(0, in_size))
+                pad_widths.append((before, after))
+                crop.append(slice(start, stop, step))
             if is_int:
                 squeeze_axes.append(a)
         core = self.array._read_direct(tuple(input_slices))
         xp = array_namespace(core)
-        out = xp.pad(core, pad_widths)                    # constant 0
+        out = xp.pad(core, pad_widths, mode=self.mode, **self.pad_kwargs)
         out = out[tuple(crop)]
         for a in sorted(squeeze_axes, reverse=True):
             out = xp.squeeze(out, axis=a)
@@ -909,9 +911,11 @@ def flatten(array):
     return array._with_transform(FlattenTransform(array))
 
 
-def pad(array, pad_width):
-    """Pad array."""
-    return array._with_transform(PadTransform(array, pad_width))
+def pad(array, pad_width, mode="constant", **kwargs):
+    """Pad ``array`` (like numpy.pad). ``mode`` is any numpy.pad mode (constant/reflect/edge/
+    symmetric/wrap/...); extra kwargs (e.g. ``constant_values=``) pass through. Memory-bounded:
+    interior reads touch only the core; border reads read the whole bordered axis."""
+    return array._with_transform(PadTransform(array, pad_width, mode=mode, **kwargs))
 
 
 def tile(array, reps):

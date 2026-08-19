@@ -68,7 +68,7 @@ class MapOverlapTransform(Transform):
     """
 
     def __init__(self, array, func, depth, boundary="reflect", dtype=None, name=None,
-                 device=None):
+                 device=None, block_info=False, align=None):
         super().__init__()
         if boundary not in _BOUNDARY_TO_NPPAD:
             raise ValueError(f"unknown boundary {boundary!r}; expected one of "
@@ -76,6 +76,22 @@ class MapOverlapTransform(Transform):
         self.array = array
         self.func = func
         self.device = device
+        #: when True, ``func`` is called ``func(block, location)`` where ``location`` is the
+        #: per-axis ``(start, stop)`` of the CORE region this block covers (the requested
+        #: key, halo excluded) - the pull-model analogue of dask's ``block_info``
+        #: ``array-location``. Lets a position-aware func map a global coordinate ``g`` to a
+        #: block index as ``depth + (g - start)`` (uniform, edges included), e.g. to apply a
+        #: per-tile lookup by global position. Off by default (the scipy filters are
+        #: position-agnostic).
+        self.block_info = block_info
+        #: optional per-axis read-alignment grid. When set, every read EXPANDS its core to
+        #: whole `align`-sized cells (floor start / ceil stop) before adding the halo, so the
+        #: func always receives whole cells - then the result is cropped back to the requested
+        #: region. Lets a position-aware func that needs whole tiles (e.g. tilewise-ccl Phase B's
+        #: per-tile relabel) stay CORRECT for any requested region size, independent of the
+        #: consumer's chunking (a region smaller than a cell just re-reads its cell). None =
+        #: off (exact region reads).
+        self.align = _normalize_depth(align, array.ndim) if align is not None else None
         self.name = name or getattr(func, "__name__", "map_overlap")
         self.depth = _normalize_depth(depth, array.ndim)
         self.boundary = boundary
@@ -93,6 +109,7 @@ class MapOverlapTransform(Transform):
         pad_widths = []       # (before, after) padding that restores the halo at true edges
         crop_slices = []      # crop the func output back to the core region + apply step
         squeeze_axes = []
+        location = []         # per-axis (start, stop) of the CORE region (for block_info)
         for a in range(ndim):
             k = key[a]
             size = self.array.shape[a]
@@ -100,17 +117,25 @@ class MapOverlapTransform(Transform):
             if _is_int_index(k):
                 idx = int(k) if k >= 0 else size + int(k)
                 start, stop, step = idx, idx + 1, 1
+                astart, astop = start, stop           # never align a squeezed axis
                 squeeze_axes.append(a)
             else:
                 start, stop, step = k.indices(size)
                 if step < 0:
                     raise NotImplementedError("map_overlap: negative-step reads not supported")
+                al = self.align[a] if self.align is not None else 1
+                # expand the CORE to whole `al`-cells (floor start / ceil stop, clamped); the
+                # func then sees whole cells and we crop back to the requested [start, stop).
+                astart = (start // al) * al
+                astop = min(size, -(-stop // al) * al)
 
-            # desired expanded span [start-d, stop+d), clamped to [0, size)
-            read_slices.append(slice(max(0, start - d), min(size, stop + d)))
-            pad_widths.append((max(0, d - start), max(0, (stop + d) - size)))
-            # after padding, the block has the core at [d : d+core_len]; then apply the step
-            crop_slices.append(slice(d, d + (stop - start), step))
+            # read the ALIGNED core +/- halo, clamped to [0, size)
+            read_slices.append(slice(max(0, astart - d), min(size, astop + d)))
+            pad_widths.append((max(0, d - astart), max(0, (astop + d) - size)))
+            # aligned core sits at block[d : d+(astop-astart)]; the requested region is the
+            # sub-window [start, stop) inside it -> crop at d + (start - astart).
+            crop_slices.append(slice(d + (start - astart), d + (stop - astart), step))
+            location.append((astart, astop))
 
         block = to_device(self.array._read_direct(tuple(read_slices)),
                           resolve_device(self.device))
@@ -119,7 +144,9 @@ class MapOverlapTransform(Transform):
             mode, pad_kw = _BOUNDARY_TO_NPPAD[self.boundary]
             block = xp.pad(block, pad_widths, mode=mode, **pad_kw)
 
-        out = self.func(block)                 # func dispatches ndimage on block's device
+        # func gets the padded block (dispatching ndimage on its device); with block_info it
+        # also gets the core (start, stop) per axis so it can act by global position.
+        out = self.func(block, tuple(location)) if self.block_info else self.func(block)
         out = out[tuple(crop_slices)]
         for a in sorted(squeeze_axes, reverse=True):
             out = xp.squeeze(out, axis=a)
@@ -155,15 +182,30 @@ def _size_depth(size, ndim):
 # Public ops -- map_overlap primitive + scipy-backed neighbourhood filters
 # --------------------------------------------------------------------------- #
 
-def map_overlap(array, func, depth, boundary="reflect", dtype=None, name=None, device=None):
+def map_overlap(array, func, depth, boundary="reflect", dtype=None, name=None, device=None,
+                block_info=False, align=None):
     """Apply a shape-preserving neighbourhood ``func`` with a ``depth`` halo, lazily and
     chunk-invariantly. Every read pulls its own halo, so the result is independent of the
     region size and exact vs applying ``func`` to the whole array (given depth >= radius and
     matching ``boundary``). The filters below wrap this. ``device`` (None=inherit, 'cpu',
-    'cuda') runs it on that device."""
+    'cuda') runs it on that device.
+
+    ``block_info=True`` makes the call ``func(block, location)``, where ``location`` is the
+    per-axis ``(start, stop)`` of the CORE region the block covers (halo excluded) - the
+    pull-model analogue of dask's ``block_info`` ``array-location``. A position-aware func
+    can then map a global coordinate ``g`` to a block index via ``depth + (g - start)``
+    (uniform across the array, edges included), e.g. to apply a per-tile lookup keyed by
+    global position (as in tilewise-ccl's Phase-B label application).
+
+    ``align`` (int or per-axis) expands every read's core to whole ``align``-sized cells
+    before adding the halo, so a position-aware func that must see WHOLE cells (e.g. a
+    per-tile relabel) stays correct for ANY requested region size - independent of the
+    consumer's chunking. A requested region smaller than a cell just re-reads its cell
+    (correct but with read amplification), so for speed drive it with regions that are
+    whole aligned cells (e.g. write with ``chunks == align``)."""
     return array._with_transform(
         MapOverlapTransform(array, func, depth, boundary=boundary, dtype=dtype,
-                            name=name, device=device)
+                            name=name, device=device, block_info=block_info, align=align)
     )
 
 

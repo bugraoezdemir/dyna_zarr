@@ -8,8 +8,8 @@ large-scale (terabyte+) Zarr datasets.
 Includes efficient TIFF reading via tifffile's zarr bridge with concurrent access support.
 """
 
-__version__ = "0.0.2"
-__author__ = "EuBI-Biohub"
+__version__ = "0.0.4"
+__author__ = "Bugra Oezdemir"
 
 # Import core classes
 from .dynamic_array import DynamicArray, slice_array

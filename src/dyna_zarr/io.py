@@ -17,6 +17,8 @@ import itertools
 import time
 import threading
 import gc
+import shutil
+import warnings
 from queue import Queue
 
 from .tiff_reader import open_tiff_zarr, read_tiff_lazy
@@ -28,6 +30,18 @@ from .operations._backend import (
     asnumpy_pinned as _asnumpy_pinned,
     new_stream as _new_stream, use_stream as _use_stream,
 )
+
+
+#: Smallest workable pipeline: 1 reader + 1 queued region + 1 in-flight write. `max_workers`
+#: (the total live-region budget) is never taken below this, even by `memory_budget_mb` -
+#: a budget that cannot fit 3 regions warns instead of deadlocking on a zero-capacity stage.
+_MIN_LIVE_REGIONS = 3
+
+#: Writer THREADS (not the in-flight write cap). `.write()` is async - it returns a future
+#: and TensorStore's C++ pool performs the I/O - so extra writer threads only submit futures
+#: faster. Measured under CPU-heavy zstd: 1/2/4/8 writers all land at 3.44-3.58s while RSS
+#: climbs 998->1400 MiB. Two gives a little submission headroom without paying for more.
+_WRITER_THREADS = 2
 
 
 def _parse_storage_location(file_path):
@@ -457,12 +471,41 @@ def _compute_region_shape(input_shape, final_chunks, region_size_mb, dtype=None,
     
     return tuple(region_arr.tolist())
 
+def _aligned_region_shape(array, final_chunks, input_shape):
+    """The op chain's read-alignment grid, if it has one and it can be used as-is.
+
+    A ``map_overlap(..., align=cell)`` transform expands every read to whole ``cell``-sized
+    cells, so it can only produce output a whole cell at a time. Writing it in regions
+    smaller than a cell therefore recomputes the cell once per region - 8x the work for
+    half-sized regions in 3-D, 64x for quarter-sized. Returning the alignment here makes the
+    default region match the producer, so each cell is computed exactly once.
+
+    Returns ``None`` when there is no alignment, or when it cannot be honoured: the region
+    must be a whole multiple of the output chunks per axis (otherwise a region would write
+    partial chunks and the parallel writes would race).
+    """
+    transform = getattr(array, "_transform", None)
+    align = getattr(transform, "align", None)
+    if align is None:
+        return None
+    try:
+        align = tuple(int(a) for a in align)
+    except TypeError:
+        return None
+    if len(align) != len(input_shape):
+        return None
+    if any(a <= 0 for a in align):
+        return None
+    if any(a % c for a, c in zip(align, final_chunks)):
+        return None      # would write partial chunks -> unsafe for parallel region writes
+    return tuple(min(a, s) for a, s in zip(align, input_shape))
+
+
 def write_array(
     array: 'DynamicArray',
     output_path: str,
     max_workers: int = 4,
-    num_readers: int = None,
-    queue_size: Optional[int] = None,
+    num_readers: Optional[int] = None,
     chunks: Optional[Tuple[int, ...]] = None,
     shard_coefficients: Optional[Tuple[int, ...]] = None,
     dtype: Optional[Any] = None,
@@ -472,9 +515,10 @@ def write_array(
     gc_interval: float = 15.0,
     early_quarter_timeout: Optional[float] = None,
     early_tenth_timeout: Optional[float] = None,
-    max_inflight_writes: Optional[int] = None,
     device: Optional[str] = None,
-    **kwargs
+    region_shape: Optional[Tuple[int, ...]] = None,
+    memory_budget_mb: Optional[float] = None,
+    overwrite: bool = False,
 ):
     """
     ASYNC VECTORIZED TensorStore write with queue-based pipeline:
@@ -482,17 +526,51 @@ def write_array(
     - Readers: Fast, simple reads into queue
     - Writers: Async writes via TensorStore .write() (non-blocking)
     - TensorStore handles actual write parallelism in C++ backend
-    
+
     Key insight: Queue is good for buffering. Async writes prevent blocking.
     Writers call .write() which returns futures immediately, then TensorStore
     does the actual parallel I/O internally.
-    
+
+    MEMORY MODEL
+    ------------
+    The pipeline has three stages that each pin whole region buffers: readers in
+    flight, the hand-off queue, and submitted-but-uncommitted TensorStore writes.
+    `max_workers` is the TOTAL number of regions allowed live across all three, so
+
+        peak RAM ~= max_workers * region_bytes
+
+    is computable from two numbers the caller already controls (`max_workers` and
+    `region_shape`/`region_size_mb`). The internal split between the three stages is
+    derived from `max_workers` and `num_readers`; the queue depth and the in-flight
+    write cap are NOT separately settable (they were, and being independent multiples
+    of the worker count they made peak memory scale with worker count while ignoring
+    region SIZE entirely - 32 live regions at the defaults, which is ~256MB at an 8MB
+    region but ~36GB at a 672^3 int32 one).
+
+    Writer threads are deliberately NOT scaled with `max_workers`: `.write()` is async
+    (it returns a future and TensorStore's C++ pool does the real I/O), so writer count
+    is measurably irrelevant to throughput (1 vs 8 writers: same wall time) while each
+    extra writer costs a live buffer. Readers are the real driver and stay tunable via
+    `num_readers`.
+
     Parameters:
     -----------
     array : DynamicArray
         Input array to write
     output_path : str
         Path to output Zarr array
+    max_workers : int
+        TOTAL regions that may be live at once, across readers + queue + in-flight
+        writes. Peak RAM ~= max_workers * region_bytes.
+    num_readers : int, optional
+        How much of `max_workers` goes to reader threads (the reader/writer balance).
+        Default: about half of `max_workers`, at least 1. More readers hide read
+        latency on slow/remote stores; they also raise peak memory one region each.
+    memory_budget_mb : float, optional
+        Ceiling on pipeline memory. When given, `max_workers` is clamped to
+        `memory_budget_mb / region_bytes` (never raised above the requested value - the
+        budget is a ceiling, not a target). If even a minimal pipeline cannot fit, a
+        warning naming the culprit is emitted and the pipeline runs at its floor.
     chunks : tuple of int, optional
         Chunk shape. For v3 with sharding, this is the inner chunk shape.
         Default: (256, 256, ...) for all dimensions
@@ -508,7 +586,17 @@ def write_array(
     zarr_format : int
         Zarr format version (2 or 3, default: 3)
     region_size_mb : float
-        Target size of read regions in MB (default: 8.0)
+        Target size of read regions in MB (default: 8.0). Ignored if `region_shape` is given.
+    region_shape : tuple of int, optional
+        Explicit read-region shape, OVERRIDING `region_size_mb`. Must be a per-axis multiple
+        of `chunks` (clamped to the array shape). Use it to align the read regions to a
+        producer's processing grid - e.g. pass a tilewise-ccl `tile_shape` so its position-aware
+        Phase-B `map_overlap` reads each whole tile exactly once (no re-read / re-label
+        amplification) while still storing small `chunks`.
+    overwrite : bool
+        Replace an existing array at `output_path`. Default False (today's behaviour:
+        write into/over whatever is there). Only a path that already looks like a zarr
+        store is removed, so a mistyped `output_path` cannot delete an unrelated tree.
     gc_interval : float
         Seconds between GC runs (default: 15.0)
     """
@@ -543,14 +631,7 @@ def write_array(
                           max_mem=int(region_size_mb * 1024 * 1024),
                           dtype=dtype, zarr_format=zarr_format or 2)
     import tensorstore as ts
-    if num_readers is None:
-        # One reader per writer (balanced). The async writes are the bottleneck, so extra
-        # readers just race ahead and pin more region buffers (peak RAM scales with reader
-        # count) without improving throughput -- measured 2x readers was both heavier AND
-        # slower than 1x. Raise num_readers explicitly to hide read latency on slow/remote
-        # stores. Peak RAM ~= 2 * (num_readers + queue_size + max_inflight_writes) * region_size_mb.
-        num_readers = max(1, max_workers)
-    
+
     # Aggressive memory cleanup before starting
     gc.collect()
     gc_was_enabled = gc.isenabled()
@@ -597,8 +678,24 @@ def write_array(
             final_shards = array.shards
         # If still None, no sharding will be used
     
+    if overwrite:
+        # Only remove something that already IS a zarr store: a mistyped output_path must
+        # never delete an unrelated tree. _detect_zarr_format_local checks for
+        # .zarray/.zgroup/zarr.json.
+        _out = Path(output_path)
+        if _out.exists():
+            if not _out.is_dir():
+                raise ValueError(
+                    f"overwrite=True: {output_path} exists and is not a directory")
+            if _detect_zarr_format_local(_out) is None and any(_out.iterdir()):
+                raise ValueError(
+                    f"overwrite=True refused: {output_path} is a non-empty directory that "
+                    f"does not look like a zarr store (no .zarray/.zgroup/zarr.json). "
+                    f"Delete it yourself if you really mean to replace it.")
+            shutil.rmtree(_out)
+
     Path(output_path).mkdir(parents=True, exist_ok=True)
-    
+
     driver = 'zarr3' if final_format == 3 else 'zarr'
     
     ts_spec = {
@@ -628,7 +725,7 @@ def write_array(
                         'name': 'sharding_indexed',
                         'configuration': {
                             'chunk_shape': list(final_chunks),
-                            'codecs': final_codecs.to_v3_config(),
+                            'codecs': final_codecs.to_v3_config(final_dtype_obj),
                             'index_codecs': [
                                 {'name': 'bytes', 'configuration': {'endian': 'little'}},
                                 {'name': 'crc32c'}
@@ -650,7 +747,7 @@ def write_array(
                     'name': 'default',
                     'configuration': {'separator': '/'}
                 },
-                'codecs': final_codecs.to_v3_config(),
+                'codecs': final_codecs.to_v3_config(final_dtype_obj),
                 'data_type': final_dtype_v3_name,
             }
     else:
@@ -672,12 +769,42 @@ def write_array(
     if input_chunks is None:
         input_chunks = final_chunks
 
-    region_shape = _compute_region_shape(
-        input_shape, final_chunks, region_size_mb, 
-        dtype=final_dtype, input_chunks=input_chunks
-    )
-    
-    print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape}, Size: ~{region_size_mb}MB")
+    if region_shape is not None:
+        # Explicit read-region shape OVERRIDES the region_size_mb heuristic. Used to make the
+        # read regions match a producer's tile grid (e.g. tilewise-ccl's tile_shape), so a
+        # position-aware pull op sees whole tiles and doesn't re-read/re-compute them. Must be
+        # a multiple of the storage chunks per axis (each region then writes whole chunks, so
+        # the parallel region writes stay race-free), and is clamped to the array shape.
+        region_shape = tuple(int(r) for r in region_shape)
+        if len(region_shape) != len(input_shape):
+            raise ValueError(
+                f"region_shape {region_shape} has {len(region_shape)} dims but array is "
+                f"{len(input_shape)}-D")
+        for r, c in zip(region_shape, final_chunks):
+            if r % c != 0:
+                raise ValueError(
+                    f"region_shape {region_shape} must be a per-axis multiple of the output "
+                    f"chunks {final_chunks} (so each region writes whole chunks)")
+        region_shape = tuple(min(r, s) for r, s in zip(region_shape, input_shape))
+        print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape} (explicit region_shape)")
+    else:
+        # No explicit region_shape. If the op chain carries a read-ALIGNMENT grid (a
+        # map_overlap built with align=..., as tilewise-ccl's Phase B is), the producer can
+        # only emit whole cells of that grid: a smaller region still costs a full cell, and
+        # the cell is recomputed once per region landing in it. Adopt the alignment as the
+        # region so each cell is read and computed exactly once - the caller no longer has
+        # to know the producer's tiling and restate it here.
+        aligned = _aligned_region_shape(array, final_chunks, input_shape)
+        if aligned is not None:
+            region_shape = aligned
+            print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape} "
+                  f"(from the op chain's alignment)")
+        else:
+            region_shape = _compute_region_shape(
+                input_shape, final_chunks, region_size_mb,
+                dtype=final_dtype, input_chunks=input_chunks
+            )
+            print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape}, Size: ~{region_size_mb}MB")
     
     # Generate chunk indices
     chunk_indices = list(itertools.product(
@@ -690,24 +817,54 @@ def write_array(
     
     print(f"[Optimized] Total regions to process: {total_chunks}, Shape: {input_shape}, Region: {region_shape}", flush=True)
     
-    # Queue for work distribution (good for pipeline buffering).
-    # Peak RAM ~= 2 * (num_readers + queue_size + max_inflight_writes) * region_size_mb.
-    # The floor of 4 gives read-ahead/write-behind headroom so readers and writers
-    # overlap even at low worker counts. (Measured: dropping the floor to scale purely
-    # with max_workers trimmed RAM only at 1 worker, at a throughput cost, and was
-    # same-or-worse at >=2 workers -- the floor is NOT the memory driver; the staged
-    # read->queue->async-write pipeline structurally holds more live blocks than dask's
-    # single-stage model, which is also why it is faster.) Old default was
-    # min(128, max(32, num_readers)) = 32 -> a ~256MB queue ceiling regardless of size.
-    if queue_size is None:
-        queue_size = max(4, max_workers)
+    # --- Pipeline sizing: ONE budget (max_workers = total live regions) split across the
+    # three stages that actually pin buffers (readers / queue / in-flight writes).
+    # Peak RAM ~= max_workers * region_bytes, so the caller can compute it from the two
+    # knobs they set. Previously each stage was an independent multiple of max_workers
+    # (8 + 8 + 16 = 32 live regions) with region SIZE never entering the formula: fine at
+    # the 8MB default (~256MB), ~36GB at a 672^3 int32 region.
+    region_bytes = int(np.prod(region_shape)) * int(np.dtype(final_dtype_obj).itemsize)
 
-    # Cap concurrent async writes: each pending tensorstore write future pins its
-    # ~region_size data buffer until it commits, so without this fast submission keeps
-    # the whole array's buffers alive at once (RSS ~= array size). See writer_thread.
-    if max_inflight_writes is None:
-        max_inflight_writes = max(4, 2 * max_workers)
-    
+    requested_workers = max(1, int(max_workers))
+    if memory_budget_mb is not None:
+        # Ceiling, never a target: a generous budget must not RAISE concurrency above what
+        # was asked for (at an 8MB region a 2GB budget would allow ~256 live regions).
+        affordable = int((float(memory_budget_mb) * 1024 * 1024) // max(1, region_bytes))
+        if affordable < _MIN_LIVE_REGIONS:
+            warnings.warn(
+                f"memory_budget_mb={memory_budget_mb:g} cannot fit even a minimal write "
+                f"pipeline: one region is {region_bytes / 1024**2:.0f} MiB and at least "
+                f"{_MIN_LIVE_REGIONS} must be live (~"
+                f"{_MIN_LIVE_REGIONS * region_bytes / 1024**2:.0f} MiB). Running at the "
+                f"floor; reduce region_shape/region_size_mb or raise the budget.",
+                RuntimeWarning, stacklevel=2)
+        max_workers = max(_MIN_LIVE_REGIONS, min(requested_workers, affordable))
+    else:
+        max_workers = max(_MIN_LIVE_REGIONS, requested_workers)
+
+    # Split the live-region budget. Readers are the measured memory driver (1->8 readers:
+    # 507->1089 MiB, no time change), so they stay caller-tunable via num_readers; the rest
+    # goes to the queue and the in-flight write cap.
+    if num_readers is None:
+        num_readers = max(1, max_workers // 2)
+    num_readers = max(1, min(int(num_readers), max_workers - 2))  # leave >=1 queue, >=1 write
+
+    remaining = max_workers - num_readers
+    queue_size = max(1, remaining // 2)
+    max_inflight_writes = max(1, remaining - queue_size)
+
+    # Writer THREADS are not part of the memory budget knob: .write() is async (returns a
+    # future; TensorStore's C++ pool does the I/O), so writer count is measurably irrelevant
+    # to throughput (1 vs 8 writers = same wall time under zstd) while each extra writer
+    # holds a buffer. Keep a small constant, bounded by the in-flight cap.
+    n_writer_threads = max(1, min(_WRITER_THREADS, max_inflight_writes))
+
+    print(f"[Optimized] Live-region budget: {max_workers} "
+          f"(~{max_workers * region_bytes / 1024**2:.0f} MiB at "
+          f"{region_bytes / 1024**2:.0f} MiB/region) -> readers={num_readers}, "
+          f"queue={queue_size}, inflight={max_inflight_writes}, "
+          f"writer threads={n_writer_threads}", flush=True)
+
     chunk_queue = Queue(maxsize=queue_size)
     sentinel_lock = threading.Lock()
     
@@ -794,7 +951,7 @@ def write_array(
                 print(f"[Reader] Normal exit - completed_readers now {state['completed_readers']}/{num_readers}", flush=True)
             
             if should_send_sentinels:
-                for _ in range(max_workers):
+                for _ in range(n_writer_threads):
                     chunk_queue.put(None)
                     
         except Exception as e:
@@ -803,6 +960,18 @@ def write_array(
             traceback.print_exc()
             state['error'] = e
     
+    def _reap_futures():
+        """Drop every completed write future (freeing its pinned region buffer) and return
+        how many are still in flight. Surfaces write errors as soon as they complete."""
+        with futures_lock:
+            done = [f for f in write_futures if f.done()]
+            for f in done:
+                write_futures.remove(f)
+            n_inflight = len(write_futures)
+        for f in done:
+            f.result()  # surface any write error early (already complete)
+        return n_inflight
+
     def writer_thread():
         """Async writer - uses TensorStore futures for parallelism."""
         try:
@@ -833,25 +1002,18 @@ def write_array(
 
                     chunk_queue.task_done()
 
-                    # Backpressure + release. Each pending write future pins its
-                    # ~region_size data buffer until it commits, and a *done* future keeps
-                    # pinning it until the future object itself is dropped. So we must both
-                    # (a) prune completed futures here to free their buffers, and (b) block
-                    # while too many writes are still in flight. Without this, buffers for
-                    # the whole array stay alive at once (RSS grows with array size); with
-                    # it, peak RAM stays ~ max_inflight_writes * region_size, array-independent.
-                    while not shutdown_flag.is_set() and not state.get('error'):
-                        with futures_lock:
-                            done = [f for f in write_futures if f.done()]
-                            for f in done:
-                                write_futures.remove(f)
-                            n_inflight = len(write_futures)
-                        for f in done:
-                            f.result()  # surface any write error early (already complete)
-                        del done
-                        if n_inflight < max_inflight_writes:
-                            break
+                    # Release, THEN backpressure - two separate jobs that used to share one
+                    # loop. Each pending write future pins its ~region_size data buffer until
+                    # it commits, and a *done* future keeps pinning it until the future object
+                    # itself is dropped. So reclamation (pruning finished futures) must happen
+                    # on EVERY pass regardless of the cap; only the blocking wait is governed
+                    # by max_inflight_writes. Folding the two together meant a lower cap could
+                    # not be reasoned about independently of when buffers were freed.
+                    n_inflight = _reap_futures()
+                    while (n_inflight >= max_inflight_writes
+                           and not shutdown_flag.is_set() and not state.get('error')):
                         time.sleep(0.001)
+                        n_inflight = _reap_futures()
                     
                 except Exception as e:
                     print(f"[Writer] ERROR: {e}", flush=True)
@@ -867,7 +1029,7 @@ def write_array(
             if 'error' in state:  # Only set if state dict still exists
                 state['error'] = e
 
-    print(f"[Optimized] Starting: {num_readers} readers, {max_workers} writers (async), queue={queue_size}")
+    print(f"[Optimized] Starting: {num_readers} readers, {n_writer_threads} writers (async), queue={queue_size}")
     
     readers = [
         threading.Thread(target=reader_thread, daemon=True, name=f"Reader-{i}")
@@ -878,7 +1040,7 @@ def write_array(
     
     writers = [
         threading.Thread(target=writer_thread, daemon=True, name=f"Writer-{i}")
-        for i in range(max_workers)
+        for i in range(n_writer_threads)
     ]
     for w in writers:
         w.start()
@@ -1073,8 +1235,7 @@ class io:
         array: 'DynamicArray',
         output_path: str,
         max_workers: int = 4,
-        num_readers: int = None,
-        queue_size: Optional[int] = None,
+        num_readers: Optional[int] = None,
         chunks: Optional[Tuple[int, ...]] = None,
         shard_coefficients: Optional[Tuple[int, ...]] = None,
         dtype: Optional[Any] = None,
@@ -1084,15 +1245,36 @@ class io:
         gc_interval: float = 15.0,
         early_quarter_timeout: Optional[float] = None,
         early_tenth_timeout: Optional[float] = None,
-        max_inflight_writes: Optional[int] = None,
         device: Optional[str] = None,
-        **kwargs
+        region_shape: Optional[Tuple[int, ...]] = None,
+        memory_budget_mb: Optional[float] = None,
+        overwrite: bool = False,
     ):
         """Write array to Zarr. See write_array() for details. ``device`` ('cpu'|'cuda')
-        runs each region's op chain on that device (results are written from host)."""
+        runs each region's op chain on that device (results are written from host).
+
+        This wrapper mirrors ``write_array``'s signature EXACTLY and forwards BY KEYWORD.
+        It used to forward positionally with a trailing ``**kwargs``, which meant a
+        parameter it did not name (``region_shape``) still reached ``write_array`` - by
+        accident of argument order - while ``inspect.signature`` reported it unsupported,
+        and a genuine typo was swallowed in silence. ``test_write_signature_parity`` keeps
+        the two in lockstep."""
         return write_array(
-            array, output_path, max_workers, num_readers, queue_size,
-            chunks, shard_coefficients, dtype, compressor, zarr_format,
-            region_size_mb, gc_interval, early_quarter_timeout,
-            early_tenth_timeout, max_inflight_writes, device, **kwargs
+            array,
+            output_path,
+            max_workers=max_workers,
+            num_readers=num_readers,
+            chunks=chunks,
+            shard_coefficients=shard_coefficients,
+            dtype=dtype,
+            compressor=compressor,
+            zarr_format=zarr_format,
+            region_size_mb=region_size_mb,
+            gc_interval=gc_interval,
+            early_quarter_timeout=early_quarter_timeout,
+            early_tenth_timeout=early_tenth_timeout,
+            device=device,
+            region_shape=region_shape,
+            memory_budget_mb=memory_budget_mb,
+            overwrite=overwrite,
         )
