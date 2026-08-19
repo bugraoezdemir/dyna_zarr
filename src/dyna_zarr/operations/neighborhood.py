@@ -117,17 +117,23 @@ class MapOverlapTransform(Transform):
             if _is_int_index(k):
                 idx = int(k) if k >= 0 else size + int(k)
                 start, stop, step = idx, idx + 1, 1
-                astart, astop = start, stop           # never align a squeezed axis
                 squeeze_axes.append(a)
             else:
                 start, stop, step = k.indices(size)
                 if step < 0:
                     raise NotImplementedError("map_overlap: negative-step reads not supported")
-                al = self.align[a] if self.align is not None else 1
-                # expand the CORE to whole `al`-cells (floor start / ceil stop, clamped); the
-                # func then sees whole cells and we crop back to the requested [start, stop).
-                astart = (start // al) * al
-                astop = min(size, -(-stop // al) * al)
+
+            # expand the CORE to whole `al`-cells (floor start / ceil stop, clamped); the
+            # func then sees whole cells and we crop back to the requested [start, stop).
+            # This applies to an INTEGER index too: the axis is squeezed only AFTER the crop,
+            # so alignment and squeezing are independent. Skipping it here (as an earlier
+            # version did, "never align a squeezed axis") handed a position-aware func a
+            # 1-voxel slab instead of a whole cell - e.g. tilewise-ccl's Phase B then
+            # re-labelled that slab, produced local ids that did not match the tile's LUT,
+            # and raised IndexError or silently returned wrong labels for `labels[z]`.
+            al = self.align[a] if self.align is not None else 1
+            astart = (start // al) * al
+            astop = min(size, -(-stop // al) * al)
 
             # read the ALIGNED core +/- halo, clamped to [0, size)
             read_slices.append(slice(max(0, astart - d), min(size, astop + d)))

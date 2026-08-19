@@ -95,3 +95,49 @@ def test_inferred_region_round_trips(tmp_path):
     with contextlib.redirect_stdout(_io.StringIO()):
         io.write(aligned, str(out), chunks=(16, 16, 16), overwrite=True)
     np.testing.assert_array_equal(zarr.open_array(str(out), mode="r")[...], expected)
+
+
+def test_integer_index_is_aligned(tmp_path):
+    """An INTEGER index must honour the alignment grid too.
+
+    The axis is squeezed only after the crop, so alignment and squeezing are independent.
+    An earlier version skipped alignment for integer-indexed axes ("never align a squeezed
+    axis"), which handed a position-aware func a 1-voxel slab instead of a whole cell.
+    """
+    a = _src(tmp_path)
+    seen = []
+
+    def record(block, location):
+        seen.append(tuple(location))
+        return block
+
+    aligned = ops.map_overlap(a, record, depth=0, boundary="constant",
+                              dtype="uint8", block_info=True, align=(64, 64, 64))
+    aligned[70].compute()
+    # axis 0 was indexed with the integer 70 -> its CORE must be the whole 64-cell [64, 128)
+    assert seen[0][0] == (64, 128), seen[0]
+
+
+def test_integer_index_matches_full_read(tmp_path):
+    """`arr[i]` must equal row i of the fully materialized array."""
+    a = _src(tmp_path)
+    aligned = ops.map_overlap(a, lambda b: b + 1, depth=0, boundary="constant",
+                              dtype="uint8", align=(64, 64, 64))
+    full = np.asarray(aligned)
+    for i in (0, 1, 63, 64, 65, 127):
+        np.testing.assert_array_equal(np.asarray(aligned[i]), full[i])
+
+
+def test_integer_index_without_alignment_is_unchanged(tmp_path):
+    """With align=None an integer index must still read a 1-voxel slab, not a padded cell."""
+    a = _src(tmp_path)
+    seen = []
+
+    def record(block, location):
+        seen.append(tuple(location))
+        return block
+
+    plain = ops.map_overlap(a, record, depth=0, boundary="constant",
+                            dtype="uint8", block_info=True)
+    plain[70].compute()
+    assert seen[0][0] == (70, 71), seen[0]
