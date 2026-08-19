@@ -31,6 +31,56 @@ def _maybe_collect(state, interval=5):
         state['_last_gc_time'] = now
 
 
+def _ndarray_to_memory_zarr(arr: np.ndarray, chunks=None) -> zarr.Array:
+    """Stage a numpy array as an in-memory zarr array, so it has a real chunk grid.
+
+    `chunks=None` picks a ~32 MiB chunk over the trailing (fastest-varying) axes, clamped to
+    the array - big enough not to fragment a small array, small enough that a region read is
+    still a partial read. Everything downstream then sees the same interface a file-backed
+    zarr presents.
+    """
+    if chunks is None:
+        target = 32 * 1024 * 1024 // max(1, arr.dtype.itemsize)
+        chunks = list(arr.shape)
+        for axis in range(arr.ndim):                      # shrink leading axes first
+            if int(np.prod(chunks)) <= target:
+                break
+            others = int(np.prod(chunks[axis + 1:])) or 1
+            chunks[axis] = max(1, min(chunks[axis], target // others))
+        chunks = tuple(int(c) for c in chunks)
+    else:
+        chunks = tuple(int(c) for c in chunks)
+    z = zarr.create_array(store={}, shape=arr.shape, chunks=chunks, dtype=arr.dtype)
+    z[...] = arr
+    return z
+
+
+def _reject_dask(source) -> None:
+    """Refuse a dask array as a DynamicArray source, loudly.
+
+    Wrapping one half-works, which is worse than not working: `_read_direct` hands back a
+    dask array instead of materialized data, so most ops still succeed (scipy calls
+    `np.asarray` on the block internally) while two things break in confusing ways -
+    `np.asarray(arr[1:3])` raises "object __array__ method not producing an array", and
+    `.chunks` reports dask's tuple-of-tuples `((2,2),(4,4))` where every consumer here
+    expects a per-axis shape `(2,4)`, silently misfeeding the region/tile machinery.
+
+    Supporting it properly would mean materializing dask blocks on read and normalizing
+    `.chunks` - i.e. making dyna a consumer of dask graphs, against its dask-free premise.
+    There is already a clean route: compute or write the dask array first, or just use the
+    dask backend directly. TODO: revisit if a dask->dyna bridge is ever wanted.
+    """
+    mod = type(source).__module__.split(".")[0]
+    if mod == "dask":
+        raise TypeError(
+            f"DynamicArray cannot wrap a {type(source).__module__}.{type(source).__name__}. "
+            "dyna_zarr is a pull-model backend and does not consume dask graphs: wrapping "
+            "one silently breaks sliced np.asarray() and reports dask-style .chunks. "
+            "Materialize it (np.asarray(arr) / arr.compute()), write it to zarr and read "
+            "that back, or use the dask backend instead."
+        )
+
+
 class DynamicArray:
     """
     Wrapper around Zarr arrays or TensorStore arrays that enables lazy operations.
@@ -43,7 +93,17 @@ class DynamicArray:
     To read from files, use operations.read(path) instead.
     """
 
-    def __init__(self, source: Union[zarr.Array, 'DynamicArray']):
+    def __init__(self, source: Union[zarr.Array, np.ndarray, 'DynamicArray'],
+                 chunks: Optional[Tuple[int, ...]] = None):
+        _reject_dask(source)
+        if isinstance(source, np.ndarray):
+            # Route numpy through an in-memory zarr array rather than wrapping it raw.
+            # Wrapping raw "works" but leaves `.chunks` as None, and chunks are load-bearing
+            # here: they drive the tile/region defaults (tilewise-ccl's default_tile_shape
+            # snaps to them) and the writer's alignment inference. Going through zarr gives
+            # a real chunk grid and makes the numpy case behave like every other source -
+            # one code path instead of a special case. Costs one copy into the MemoryStore.
+            source = _ndarray_to_memory_zarr(source, chunks)
         if isinstance(source, DynamicArray):
             # Copy constructor
             self._source = source._source
