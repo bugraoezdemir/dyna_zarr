@@ -471,6 +471,36 @@ def _compute_region_shape(input_shape, final_chunks, region_size_mb, dtype=None,
     
     return tuple(region_arr.tolist())
 
+def _aligned_region_shape(array, final_chunks, input_shape):
+    """The op chain's read-alignment grid, if it has one and it can be used as-is.
+
+    A ``map_overlap(..., align=cell)`` transform expands every read to whole ``cell``-sized
+    cells, so it can only produce output a whole cell at a time. Writing it in regions
+    smaller than a cell therefore recomputes the cell once per region - 8x the work for
+    half-sized regions in 3-D, 64x for quarter-sized. Returning the alignment here makes the
+    default region match the producer, so each cell is computed exactly once.
+
+    Returns ``None`` when there is no alignment, or when it cannot be honoured: the region
+    must be a whole multiple of the output chunks per axis (otherwise a region would write
+    partial chunks and the parallel writes would race).
+    """
+    transform = getattr(array, "_transform", None)
+    align = getattr(transform, "align", None)
+    if align is None:
+        return None
+    try:
+        align = tuple(int(a) for a in align)
+    except TypeError:
+        return None
+    if len(align) != len(input_shape):
+        return None
+    if any(a <= 0 for a in align):
+        return None
+    if any(a % c for a, c in zip(align, final_chunks)):
+        return None      # would write partial chunks -> unsafe for parallel region writes
+    return tuple(min(a, s) for a, s in zip(align, input_shape))
+
+
 def write_array(
     array: 'DynamicArray',
     output_path: str,
@@ -560,7 +590,7 @@ def write_array(
     region_shape : tuple of int, optional
         Explicit read-region shape, OVERRIDING `region_size_mb`. Must be a per-axis multiple
         of `chunks` (clamped to the array shape). Use it to align the read regions to a
-        producer's processing grid - e.g. pass a tilabel `tile_shape` so its position-aware
+        producer's processing grid - e.g. pass a tilewise-ccl `tile_shape` so its position-aware
         Phase-B `map_overlap` reads each whole tile exactly once (no re-read / re-label
         amplification) while still storing small `chunks`.
     overwrite : bool
@@ -741,7 +771,7 @@ def write_array(
 
     if region_shape is not None:
         # Explicit read-region shape OVERRIDES the region_size_mb heuristic. Used to make the
-        # read regions match a producer's tile grid (e.g. tilabel's tile_shape), so a
+        # read regions match a producer's tile grid (e.g. tilewise-ccl's tile_shape), so a
         # position-aware pull op sees whole tiles and doesn't re-read/re-compute them. Must be
         # a multiple of the storage chunks per axis (each region then writes whole chunks, so
         # the parallel region writes stay race-free), and is clamped to the array shape.
@@ -758,11 +788,23 @@ def write_array(
         region_shape = tuple(min(r, s) for r, s in zip(region_shape, input_shape))
         print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape} (explicit region_shape)")
     else:
-        region_shape = _compute_region_shape(
-            input_shape, final_chunks, region_size_mb,
-            dtype=final_dtype, input_chunks=input_chunks
-        )
-        print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape}, Size: ~{region_size_mb}MB")
+        # No explicit region_shape. If the op chain carries a read-ALIGNMENT grid (a
+        # map_overlap built with align=..., as tilewise-ccl's Phase B is), the producer can
+        # only emit whole cells of that grid: a smaller region still costs a full cell, and
+        # the cell is recomputed once per region landing in it. Adopt the alignment as the
+        # region so each cell is read and computed exactly once - the caller no longer has
+        # to know the producer's tiling and restate it here.
+        aligned = _aligned_region_shape(array, final_chunks, input_shape)
+        if aligned is not None:
+            region_shape = aligned
+            print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape} "
+                  f"(from the op chain's alignment)")
+        else:
+            region_shape = _compute_region_shape(
+                input_shape, final_chunks, region_size_mb,
+                dtype=final_dtype, input_chunks=input_chunks
+            )
+            print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape}, Size: ~{region_size_mb}MB")
     
     # Generate chunk indices
     chunk_indices = list(itertools.product(

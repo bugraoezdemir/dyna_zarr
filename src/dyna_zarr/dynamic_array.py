@@ -374,6 +374,28 @@ class DynamicArray:
         f = (lambda b, _f=func, _kw=kwargs: _f(b, **_kw)) if kwargs else func
         return o.map_overlap(self, f, depth, boundary=boundary, dtype=dtype, device=device)
 
+    def __array__(self, dtype=None, copy=None):
+        """Materialize to a real numpy array - what ``np.asarray(a)`` / ``np.array(a)`` call.
+
+        Without this, NumPy falls back to treating a DynamicArray as an opaque object and
+        produces a **0-d object array** rather than the data: ``np.asarray(a[10:20])`` came
+        back with ``shape == ()`` and silently wrong results downstream, instead of raising.
+        Materializing here is the same work as ``.compute()``, so it is deliberately EAGER
+        and unbounded - the whole (possibly sliced) array is read into memory. Slice first,
+        then convert, exactly as with a zarr array.
+
+        ``dtype``/``copy`` follow the NumPy protocol: ``copy=False`` cannot be honoured,
+        since the data does not exist until it is read, and NumPy 2 requires that to raise.
+        """
+        if copy is False:
+            raise ValueError(
+                "cannot return a view of a DynamicArray without copying: the data is "
+                "produced lazily on read. Use np.asarray(a) or a.compute() instead.")
+        result = self.compute()
+        if dtype is not None:
+            result = result.astype(dtype, copy=False)
+        return result
+
     def __array_function__(self, func, types, args, kwargs):
         """NumPy high-level function protocol -> lazy ops, so ``np.stack``/``np.max``/
         ``np.where``/``np.concatenate``/... work on DynamicArrays exactly as on dask arrays.

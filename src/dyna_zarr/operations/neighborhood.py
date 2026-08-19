@@ -87,7 +87,7 @@ class MapOverlapTransform(Transform):
         #: optional per-axis read-alignment grid. When set, every read EXPANDS its core to
         #: whole `align`-sized cells (floor start / ceil stop) before adding the halo, so the
         #: func always receives whole cells - then the result is cropped back to the requested
-        #: region. Lets a position-aware func that needs whole tiles (e.g. tilabel Phase B's
+        #: region. Lets a position-aware func that needs whole tiles (e.g. tilewise-ccl Phase B's
         #: per-tile relabel) stay CORRECT for any requested region size, independent of the
         #: consumer's chunking (a region smaller than a cell just re-reads its cell). None =
         #: off (exact region reads).
@@ -195,7 +195,7 @@ def map_overlap(array, func, depth, boundary="reflect", dtype=None, name=None, d
     pull-model analogue of dask's ``block_info`` ``array-location``. A position-aware func
     can then map a global coordinate ``g`` to a block index via ``depth + (g - start)``
     (uniform across the array, edges included), e.g. to apply a per-tile lookup keyed by
-    global position (as in tilabel's Phase-B label application).
+    global position (as in tilewise-ccl's Phase-B label application).
 
     ``align`` (int or per-axis) expands every read's core to whole ``align``-sized cells
     before adding the halo, so a position-aware func that must see WHOLE cells (e.g. a
