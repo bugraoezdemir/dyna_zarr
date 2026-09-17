@@ -1,13 +1,19 @@
 name: Tests
 
-# Runs the test suite on every push and pull request to the main branches, and
-# can be kicked off by hand from the Actions tab.
+# Runs the test suite on every push and pull request to the main branches. It can also
+# be started by hand from the Actions tab ("Run workflow"), which is how you check a
+# feature branch such as `dev` BEFORE opening the merge - pick the branch in the dropdown.
 on:
   push:
     branches: [main, master]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
+    inputs:
+      full:
+        description: "Run the wheel install-check and metadata jobs too (slower)"
+        type: boolean
+        default: true
 
 concurrency:
   # A new push to the same branch cancels an in-flight run for it.
@@ -74,6 +80,8 @@ jobs:
           fail_ci_if_error: false
 
   install-check:
+    # Hand-started runs can skip this via the `full` input; scheduled/PR runs always run it.
+    if: github.event_name != 'workflow_dispatch' || inputs.full
     # Builds the wheel, installs it into a CLEAN venv from OUTSIDE the repo, and runs the
     # suite against the RESOLVED PyPI dependencies. The jobs above use `-e .`, which tests
     # the SOURCE TREE: a module missing from the wheel is invisible there. dyna-zarr 0.0.4
@@ -111,6 +119,8 @@ jobs:
           cd /tmp && /tmp/fresh/bin/python -m pytest /tmp/wheel_tests -v -o addopts=""
 
   lint:
+    # Hand-started runs can skip this via the `full` input; scheduled/PR runs always run it.
+    if: github.event_name != 'workflow_dispatch' || inputs.full
     name: Package metadata
     runs-on: ubuntu-latest
     steps:
