@@ -298,9 +298,43 @@ class SliceTransform(Transform):
 
         self.key = tuple(normalized)
         self.shape = tuple(new_shape)
+        # If the source carries a read-alignment grid (a map_overlap(align=cell)), it stays
+        # valid under this slice - just shifted. Expose the cell together with the OFFSET of
+        # our first element inside it, so a consumer (io.write) can cut regions on the
+        # underlying cell boundaries instead of a 0-based grid of its own. Without this the
+        # consumer sees no alignment and falls back to small regions, and the producer
+        # recomputes each cell once per region that touches it.
+        self.align, self.align_offset = self._derive_align()
         self.chunks = tuple(new_chunks)
         self.dtype = array.dtype
         self.new_axes = [i for i, k in enumerate(self.key) if k is np.newaxis]
+
+
+    def _derive_align(self):
+        """(cell, offset) inherited from the source's alignment, or (None, None).
+
+        Only unit-step, rank-preserving slices inherit: a step or an added/dropped axis
+        breaks the correspondence between our coordinates and the source's cells.
+        """
+        src = getattr(self.array, "_transform", None)
+        cell = getattr(src, "align", None)
+        if cell is None:
+            return None, None
+        off = getattr(src, "align_offset", None)
+        ndim = self.array.ndim
+        try:
+            cell = tuple(int(c) for c in cell)
+        except TypeError:
+            return None, None
+        if len(cell) != ndim or any(c <= 0 for c in cell):
+            return None, None
+        if len(self.key) != ndim or any(not isinstance(k, slice) for k in self.key):
+            return None, None            # int index drops an axis, newaxis adds one
+        if any((k.step or 1) != 1 for k in self.key):
+            return None, None
+        base = off if off is not None else (0,) * ndim
+        # our element i maps to source element k.start + i; its phase in the source grid
+        return cell, tuple((k.start + b) % c for k, b, c in zip(self.key, base, cell))
 
     def read(self, read_key):
         """
