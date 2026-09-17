@@ -807,8 +807,42 @@ def write_array(
             print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape}, Size: ~{region_size_mb}MB")
     
     # Generate chunk indices
+    align_offset = getattr(getattr(array, "_transform", None), "align_offset", None)
+    if align_offset is None:
+        align_offset = (0,) * len(input_shape)
+
+    def _bands(size, rs, off, chunk):
+        """Per-axis (start, stop) read bands.
+
+        Bands are cut on the PRODUCER's cell grid, so each cell is read and computed
+        exactly once. With a cell offset those cuts generally do not land on the output
+        chunk grid, so two neighbouring bands write into the same boundary chunk - that is
+        safe here because the writes go through TensorStore, which serialises the
+        read-modify-write of a chunk internally (verified: 8 threads, compressed chunks,
+        bands cut mid-chunk, byte-exact results). Cutting on the chunk grid instead would
+        make every band straddle a cell border and the producer would recompute those
+        cells once per band (measured 2.4x extra labeling).
+        """
+        if not off % rs:
+            return [(x, min(x + rs, size)) for x in range(0, size, rs)]
+        if size <= rs:
+            # The whole axis fits inside one cell-span. Splitting it can only ADD cells:
+            # a crop of 71 voxels straddling one cell border becomes 2 bands that together
+            # touch the same 2 cells, but each band re-reads whichever cells it overlaps.
+            # One band touches each cell exactly once, so never split here.
+            return [(0, size)]
+        cuts = [0]
+        c = (rs - off % rs) % rs
+        while c < size:
+            if c > cuts[-1]:
+                cuts.append(c)
+            c += rs
+        cuts.append(size)
+        return [(a, b) for a, b in zip(cuts, cuts[1:]) if a < b]
+
     chunk_indices = list(itertools.product(
-        *[range(0, s, rs) for s, rs in zip(input_shape, region_shape)]
+        *[_bands(s, rs, o, c) for s, rs, o, c in
+          zip(input_shape, region_shape, align_offset, final_chunks)]
     ))
     
     total_chunks = len(chunk_indices)
@@ -823,7 +857,13 @@ def write_array(
     # knobs they set. Previously each stage was an independent multiple of max_workers
     # (8 + 8 + 16 = 32 live regions) with region SIZE never entering the formula: fine at
     # the 8MB default (~256MB), ~36GB at a 672^3 int32 region.
-    region_bytes = int(np.prod(region_shape)) * int(np.dtype(final_dtype_obj).itemsize)
+    # Bands are cell-cut and chunk-rounded, so the widest one can exceed `region_shape`.
+    # Size the pipeline from what will ACTUALLY be read, or the budget under-counts.
+    _max_extent = [0] * len(input_shape)
+    for _band in chunk_indices:
+        for _a, (_lo, _hi) in enumerate(_band):
+            _max_extent[_a] = max(_max_extent[_a], min(_hi, input_shape[_a]) - _lo)
+    region_bytes = int(np.prod(_max_extent)) * int(np.dtype(final_dtype_obj).itemsize)
 
     requested_workers = max(1, int(max_workers))
     if memory_budget_mb is not None:
@@ -913,8 +953,8 @@ def write_array(
                 
                 try:
                     chunk_slice = tuple(
-                        slice(start, min(start + rs, dim_size))
-                        for start, rs, dim_size in zip(chunk_start, region_shape, input_shape)
+                        slice(lo, min(hi, dim_size))
+                        for (lo, hi), dim_size in zip(chunk_start, input_shape)
                     )
                     
                     # Read actual data using _read_direct to avoid creating SliceTransform.
