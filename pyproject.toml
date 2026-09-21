@@ -17,7 +17,7 @@ where = ["src"]
 
 [project]
 name = "dyna-zarr"
-version = "0.0.7"
+version = "0.0.8"
 description = "A lightweight library for lazy operations on Zarr arrays without task graph overhead"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -57,6 +57,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Development TOOLING only - deliberately not the optional features. Installing a
+# backend is a separate choice (`[zarrista]`, `[gpu-cuXX]`), and their tests carry
+# markers so it is always visible which of them ran: see `markers` in pytest.ini
+# and the `-m` selections in .github/workflows/tests.yml.
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
@@ -69,6 +73,16 @@ docs = [
     "sphinx>=5.0",
     "sphinx-rtd-theme>=1.0",
 ]
+# Alternative storage backend (optional): Rust-backed zarr via zarrs.
+# Faster than the default tensorstore path in every configuration benchmarked
+# (see benchmarks/ and reports/zarrista_bugs/), but PINNED to an exact version:
+# 0.1.0 is beta, its zarr-v2 support rides on the undocumented
+# `Array.from_metadata` path, and it has two silent failure modes the backend
+# guards against. Re-run tests/test_zarrista_backend.py before moving the pin.
+# obstore is what reaches object stores: zarrista exposes s3://, gs://, az:// and
+# http:// only through its async API over an obstore ObjectStore. Local paths work
+# without it, so a read of a remote URL raises a targeted ImportError if it is absent.
+zarrista = ["zarrista==0.1.0", "obstore>=0.11"]
 # GPU execution (optional). CuPy ships CUDA-version-specific wheels and pip CANNOT
 # auto-detect your CUDA, so pick the extra that matches `nvidia-smi` (CUDA Version):
 #   pip install dyna-zarr[gpu-cu11]   # CUDA 11.x
