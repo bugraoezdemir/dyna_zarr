@@ -23,7 +23,7 @@ Every operation is memory-bounded on the `io.write` path except `median`, `argmi
 - **Memory-bounded streaming.** Region-wise `io.write` with per-worker memory and worker-count knobs. Even reshape, flatten, and rechunk of incompatibly-chunked data stay bounded, by staging through disk.
 - **NumPy-like.** Operator overloads, array methods (`.astype`, `.clip`, `.round`), and the NumPy ufunc protocol (`np.sqrt(a)`, `np.add(a, 2)`) all work on a `DynamicArray`.
 - **Rich op set.** About 90 operations: pointwise ufuncs, streaming reductions, neighborhood (halo) filters, structural reshaping, differences, and array creation.
-- **Multi-format I/O.** Read TIFF, Zarr v2, and Zarr v3 (local, S3/GCS, HTTP); write Zarr v2/v3 with optional sharding.
+- **Multi-format I/O.** Read TIFF, Zarr v2, and Zarr v3 (local, S3/GCS, HTTP); write Zarr v2/v3 with optional sharding. An optional Rust-backed storage backend can serve reads and writes in place of the default.
 - **Optional GPU.** Run an op chain on CUDA via CuPy, with a single host-to-device transfer per region.
 
 ## Installation
@@ -38,6 +38,12 @@ Optional GPU support (pick the extra matching your CUDA toolkit from `nvidia-smi
 pip install "dyna-zarr[gpu-cu12]"   # CUDA 12.x  ([gpu] is an alias for this)
 pip install "dyna-zarr[gpu-cu11]"   # CUDA 11.x
 pip install "dyna-zarr[gpu-cu13]"   # CUDA 13.x (e.g. Blackwell)
+```
+
+Optional faster storage backend (see [zarrista backend](#zarrista-backend-optional)):
+
+```bash
+pip install "dyna-zarr[zarrista]"
 ```
 
 ## Quick start
@@ -57,6 +63,13 @@ data   = arr.compute()                           # materialize the whole array
 region = arr[10:20, 50:150, 100:200].compute()   # pull just this region
 ```
 
+With the optional `[zarrista]` extra, the same call can read through the faster
+Rust-backed backend instead. Everything downstream is unchanged:
+
+```python
+arr = io.read("array.zarr", backend="zarrista")   # default is "tensorstore"
+```
+
 ### Write (memory-bounded streaming)
 
 ```python
@@ -69,6 +82,20 @@ io.write(arr, "out.zarr", compressor=Codecs(compressor="zstd", clevel=5), zarr_f
 
 # memory and parallelism controls (peak RAM is roughly region_size_mb * max_workers)
 io.write(arr, "out.zarr", region_size_mb=64, max_workers=4)
+```
+
+The optional backend writes through the same call, with the streaming pipeline,
+chunking, sharding, and compression options all unchanged:
+
+```python
+io.write(arr, "out.zarr", zarr_format=3, backend="zarrista")
+```
+
+Read and write backends are independent, so they can differ:
+
+```python
+arr = io.read("s3://bucket/image.zarr", backend="zarrista")   # zarrista
+io.write(arr, "out.zarr")                                     # tensorstore
 ```
 
 ### Lazy operation chains
@@ -154,6 +181,42 @@ out = result.compute(device="cuda")          # whole chain on the GPU
 io.write(result, "out.zarr", device="cuda")  # per-region GPU compute, streamed write
 ```
 
+## zarrista backend (optional)
+
+[zarrista](https://github.com/zarrs/zarrista) is a Rust-backed Zarr implementation (built on [zarrs](https://zarrs.dev/)). Installed via the `[zarrista]` extra, it can serve reads and writes in place of the default TensorStore path.
+
+Measured against that default on the same machine, with matched codecs, matched concurrency, and byte-identical output verified in both directions:
+
+| layout | write | read |
+|---|---|---|
+| Zarr v3, unsharded | 2.4x | 2.0x |
+| Zarr v3, sharded | 1.6x | 2.2x |
+| Zarr v2 | 1.6x | 1.5x |
+
+Single machine, local filesystem, float32 — treat these as an indication, not a guarantee, and measure on your own data and hardware. The scripts are in `benchmarks/`.
+
+The backend is opt-in rather than the default, for reasons worth knowing before you enable it:
+
+- zarrista 0.1.0 is beta by its own description, and its Python API may change. The extra pins an exact version, and the backend warns if it is used against a different one.
+- Zarr v2 works (both directions, verified against zarr-python across dtypes and compressors) but rides on an API that upstream does not document.
+- Two upstream behaviors are contained by this backend rather than fixed upstream: concurrent writes to misaligned regions silently lose data, and integer indexing does not drop the indexed axis. The wrapper restores NumPy indexing semantics, and `io.write` grows its regions to whole write units so concurrent writes never share one.
+
+Remote stores (`s3://`, `gs://`, `az://`, `http://`) are read **and** written through zarrista's async API over [obstore](https://github.com/developmentseed/obstore), which the `[zarrista]` extra installs. Credentials come from obstore's usual environment variables; anything else is passed with `storage_options`, which goes straight to `obstore.store.from_url`:
+
+```python
+opts = {"endpoint": "https://s3.example.org",       # any non-AWS S3: MinIO, Ceph, ...
+        "region": "us-east-1",
+        "virtual_hosted_style_request": False,
+        "skip_signature": True}                     # public bucket, no credentials
+
+arr = io.read("s3://bucket/image.zarr", backend="zarrista", storage_options=opts)
+io.write(arr, "s3://bucket/out.zarr", backend="zarrista", storage_options=opts)
+```
+
+Give an S3 endpoint as `s3://bucket/key` plus `endpoint=`, not as an `https://` URL: obstore dispatches on the scheme, so `https://host/bucket/key` builds a plain HTTP store rather than an S3 client.
+
+Arrays written by either backend are ordinary Zarr and are readable by the other, and by zarr-python, so enabling it does not lock data in.
+
 ## Relationship to dask
 
 dyna-zarr is not a general replacement for `dask.array`. It targets one job: memory-bounded read, transform, and write of large Zarr/TIFF arrays.
@@ -169,14 +232,38 @@ Two more differences worth knowing:
 
 ## Core components
 
-- `io.read(source)` reads TIFF, Zarr v2, or Zarr v3 (local or remote) into a `DynamicArray`.
-- `io.write(array, path, ...)` streams a `DynamicArray` to Zarr v2/v3 (chunks, sharding, compression, dtype cast, `region_size_mb`, `max_workers`, `device`).
+- `io.read(source, backend=..., storage_options=...)` reads TIFF, Zarr v2, or Zarr v3 (local or remote) into a `DynamicArray`; `backend` is `"tensorstore"` (default) or the optional `"zarrista"`.
+- `io.write(array, path, ...)` streams a `DynamicArray` to Zarr v2/v3 (chunks, sharding, compression, dtype cast, `region_size_mb`, `max_workers`, `device`, `backend`, `storage_options`).
 - `operations` is the lazy op set above.
 - `DynamicArray` is the pull-based lazy array (slicing, `.compute()`, operators, `.astype`/`.clip`/`.round`, ufunc protocol).
 - `Codecs` is the compression configuration for Zarr v2 and v3.
+- `backends.zarrista_backend` implements the optional `backend="zarrista"` path used by `io.read` and `io.write`.
+
+## Running the tests
+
+`[dev]` installs the tooling only. Tests for the optional backends are marked, so
+they are selected explicitly rather than skipped silently:
+
+```bash
+pip install -e ".[dev]"
+pytest -m "not zarrista and not gpu"    # core suite
+
+pip install -e ".[dev,zarrista]"
+pytest -m zarrista                      # the optional storage backend
+
+pip install -e ".[dev,gpu-cu12]"
+pytest -m gpu                           # needs a CUDA device
+```
+
+CI runs the core suite on Linux, Windows, and macOS across Python 3.11-3.13, the
+zarrista suite on all three OSes as a separate job, and a wheel install-check on each
+OS. The GPU tests are **not** run by CI — GitHub's standard runners have no CUDA
+device — so run `-m gpu` locally on each platform you support before releasing a
+change to the device path.
 
 ## Requirements
 
 - Python 3.11 or newer
 - zarr 3.0.0+, numpy 1.20+, scipy 1.6+, tensorstore, tifffile
 - Optional: CuPy (via the `gpu-cuXX` extras) for the GPU path
+- Optional: zarrista + obstore (via the `zarrista` extra) for the faster storage backend

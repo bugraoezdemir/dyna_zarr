@@ -278,32 +278,58 @@ def read_file(file_path):
 # I/O operations for reading and writing arrays
 
 
-def read_array(source: Union[str, Path]) -> 'DynamicArray':
+def read_array(source: Union[str, Path], backend: str = "tensorstore",
+               storage_options: Optional[dict] = None) -> 'DynamicArray':
     """
     Read array from file path (TIFF or Zarr).
-    
+
     Supports both local and remote storage:
     - Local: /path/to/file.tif, /path/to/array.zarr
     - GCS: gs://bucket/path/to/file
     - S3: s3://bucket/path/to/file
     - HTTP: http://example.com/path/to/file
-    
+
     Args:
         source: Path or URL to a TIFF file or Zarr array
-        
+        backend: Storage backend for Zarr sources. ``'tensorstore'`` (default) or
+            ``'zarrista'``, the optional Rust-backed reader
+            (``pip install "dyna-zarr[zarrista]"``). Remote URLs additionally need
+            ``obstore``. Ignored for TIFF, which always goes through tifffile.
+        storage_options: Options for the remote store, forwarded to
+            ``obstore.store.from_url`` (``backend='zarrista'`` only). Needed for any
+            non-AWS S3: e.g. ``{'endpoint': 'https://s3.example.org', 'region': ...,
+            'virtual_hosted_style_request': False}``, plus ``skip_signature=True``
+            for a public bucket.
+
     Returns:
         DynamicArray wrapping the opened array
     """
     from dyna_zarr.io import read_file
-    
+
+    if backend not in ("tensorstore", "zarrista"):
+        raise ValueError(
+            f"unknown backend {backend!r}; expected 'tensorstore' (default) or 'zarrista'"
+        )
+
     source_path = Path(source) if not isinstance(source, Path) else source
     
     # TIFF -> lazy zarr array via tifffile's bridge, wrapped as a normal zarr-backed
     # DynamicArray (laziness/slicing/memory-bounded reads all come from DynamicArray).
     if str(source_path).lower().endswith(('.tif', '.tiff')):
         return read_tiff_lazy(source)
-    
-    elif (isinstance(source_path, Path) and source_path.is_dir() and 
+
+    # Optional zarrista backend: a Zarr-only, local-only reader, so it is dispatched
+    # here and everything else keeps the default path. It raises rather than silently
+    # falling back to tensorstore - an explicit backend= that quietly did something
+    # else would make a benchmark or a bug report meaningless.
+    if backend == "zarrista":
+        # Local paths use zarrista's sync API; object stores (s3://, gs://, az://,
+        # http://) go through its async API over obstore, which open_array handles.
+        from .backends.zarrista_backend import open_array as _zarrista_open
+
+        return DynamicArray(_zarrista_open(source, storage_options=storage_options))
+
+    if (isinstance(source_path, Path) and source_path.is_dir() and
           ((source_path / ".zarray").exists() or 
            (source_path / ".zgroup").exists() or 
            (source_path / "zarr.json").exists())):
@@ -501,6 +527,88 @@ def _aligned_region_shape(array, final_chunks, input_shape):
     return tuple(min(a, s) for a, s in zip(align, input_shape))
 
 
+class _ZarristaRegion:
+    """One ``output[region]`` handle. ``.write(data)`` returns a future-like object so
+    the writer thread's ``future.done()`` / ``.result()`` protocol is unchanged.
+
+    zarrista's ``store_array_subset`` is synchronous, so the write has already happened
+    by the time this is constructed; ``done()`` is therefore always True. The pipeline's
+    backpressure is driven by the queue and the reader threads, which still applies.
+    """
+
+    __slots__ = ("_exc",)
+
+    def __init__(self, array, region, data):
+        from .backends.zarrista_backend import _call
+
+        self._exc = None
+        try:
+            # via _call: on a remote (object-store) array the write is async and
+            # needs an event loop, which _call supplies; local writes are direct.
+            _call(array.store_array_subset, region, data)
+        except BaseException as exc:      # surfaced by .result(), like a TS future
+            self._exc = exc
+
+    def done(self):
+        return True
+
+    def result(self, timeout=None):
+        if self._exc is not None:
+            raise self._exc
+        return None
+
+
+class _ZarristaOutput:
+    """Minimal ``output[region].write(data)`` facade over a zarrista array."""
+
+    __slots__ = ("_array", "_write_unit")
+
+    def __init__(self, array):
+        self._array = array
+        self._write_unit = array.write_unit
+
+    @property
+    def write_unit(self):
+        """Shard when sharded, else chunk - the unit concurrent writers must not share."""
+        return self._write_unit
+
+    def __getitem__(self, region):
+        outer = self
+
+        class _Slot:
+            __slots__ = ()
+
+            def write(self, data):
+                import numpy as _np
+                # zarrista requires C-contiguous input; a region sliced out of a
+                # larger buffer usually is not.
+                return _ZarristaRegion(
+                    outer._array._array, region, _np.ascontiguousarray(data)
+                )
+
+        return _Slot()
+
+
+def _open_zarrista_output(output_path, shape, chunks, dtype, codecs,
+                          zarr_format, shards, storage_options=None):
+    """Create the output array through the optional zarrista backend.
+
+    ``shards`` is the resolved shard SHAPE (already coefficients x chunks), or None.
+    """
+    from .backends.zarrista_backend import create_v2, create_v3
+
+    if zarr_format == 2:
+        if shards:
+            raise ValueError("sharding requires zarr_format=3")
+        array = create_v2(output_path, shape, chunks, dtype, codecs=codecs,
+                          storage_options=storage_options)
+    else:
+        array = create_v3(output_path, shape, chunks, dtype,
+                          shard=tuple(shards) if shards else None, codecs=codecs,
+                          storage_options=storage_options)
+    return _ZarristaOutput(array)
+
+
 def write_array(
     array: 'DynamicArray',
     output_path: str,
@@ -519,6 +627,8 @@ def write_array(
     region_shape: Optional[Tuple[int, ...]] = None,
     memory_budget_mb: Optional[float] = None,
     overwrite: bool = False,
+    backend: str = "tensorstore",
+    storage_options: Optional[dict] = None,
 ):
     """
     ASYNC VECTORIZED TensorStore write with queue-based pipeline:
@@ -677,7 +787,11 @@ def write_array(
         if hasattr(array, 'shards') and array.shards is not None:
             final_shards = array.shards
         # If still None, no sharding will be used
-    
+
+    if backend not in ("tensorstore", "zarrista"):
+        raise ValueError(
+            f"unknown backend {backend!r}; expected 'tensorstore' (default) or 'zarrista'"
+        )
     if overwrite:
         # Only remove something that already IS a zarr store: a mistyped output_path must
         # never delete an unrelated tree. _detect_zarr_format_local checks for
@@ -694,7 +808,10 @@ def write_array(
                     f"Delete it yourself if you really mean to replace it.")
             shutil.rmtree(_out)
 
-    Path(output_path).mkdir(parents=True, exist_ok=True)
+    _remote_output = '://' in str(output_path)
+    if not _remote_output:
+        # A URL is not a directory to create; the object store makes keys on write.
+        Path(output_path).mkdir(parents=True, exist_ok=True)
 
     driver = 'zarr3' if final_format == 3 else 'zarr'
     
@@ -760,8 +877,18 @@ def write_array(
             'compressor': final_codecs.to_v2_config(),
         }
     
-    output = ts.open(ts_spec, create=True).result()
-    
+    if backend == "zarrista":
+        # The writer pipeline below only ever does `output[region].write(data)` and
+        # waits on the returned future, so the optional backend is swapped in behind
+        # that one interface (_ZarristaOutput) and the reader/queue/backpressure
+        # machinery stays exactly as it is.
+        output = _open_zarrista_output(
+            output_path, input_shape_temp, final_chunks, final_dtype_obj,
+            final_codecs, final_format, final_shards, storage_options,
+        )
+    else:
+        output = ts.open(ts_spec, create=True).result()
+
     # Set up input array - use DynamicArray directly
     input_array = array
     input_shape = array.shape
@@ -805,7 +932,25 @@ def write_array(
                 dtype=final_dtype, input_chunks=input_chunks
             )
             print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape}, Size: ~{region_size_mb}MB")
-    
+
+    if backend == "zarrista":
+        # Regions are written CONCURRENTLY, and every region above tiles the output
+        # CHUNK - but on a sharded array the unit two writers must not share is the
+        # SHARD. A region smaller than a shard would have concurrent writers meeting
+        # inside one shard file, which zarrista 0.1.0 does not survive: it drops the
+        # overlapping data silently, with no error (see reports/zarrista_bugs/). Grow
+        # the region to whole shards rather than fail, since the region is an internal
+        # tuning choice here, not something the caller asked for.
+        unit = output.write_unit
+        if any(r % u for r, u in zip(region_shape, unit)):
+            grown = tuple(
+                min(-(-r // u) * u, s)
+                for r, u, s in zip(region_shape, unit, input_shape)
+            )
+            print(f"[Optimized] Region {region_shape} would split a zarrista write unit "
+                  f"{unit}; grown to {grown} to keep concurrent writes safe")
+            region_shape = grown
+
     # Generate chunk indices
     align_offset = getattr(getattr(array, "_transform", None), "align_offset", None)
     if align_offset is None:
@@ -1266,9 +1411,15 @@ class io:
     """I/O operations for reading and writing arrays."""
     
     @staticmethod
-    def read(source: Union[str, Path]) -> 'DynamicArray':
-        """Read array from file path. See read_array() for details."""
-        return read_array(source)
+    def read(source: Union[str, Path], backend: str = "tensorstore",
+             storage_options: Optional[dict] = None) -> 'DynamicArray':
+        """Read array from file path. See read_array() for details.
+
+        ``backend`` selects the Zarr reader: ``'tensorstore'`` (default) or the
+        optional ``'zarrista'``. Mirrors ``read_array``'s signature and forwards by
+        keyword, for the same reason ``write`` does.
+        """
+        return read_array(source, backend=backend, storage_options=storage_options)
     
     @staticmethod
     def write(
@@ -1289,6 +1440,8 @@ class io:
         region_shape: Optional[Tuple[int, ...]] = None,
         memory_budget_mb: Optional[float] = None,
         overwrite: bool = False,
+        backend: str = "tensorstore",
+        storage_options: Optional[dict] = None,
     ):
         """Write array to Zarr. See write_array() for details. ``device`` ('cpu'|'cuda')
         runs each region's op chain on that device (results are written from host).
@@ -1317,4 +1470,6 @@ class io:
             region_shape=region_shape,
             memory_budget_mb=memory_budget_mb,
             overwrite=overwrite,
+            backend=backend,
+            storage_options=storage_options,
         )
