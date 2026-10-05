@@ -60,9 +60,12 @@ except ImportError:  # pragma: no cover - exercised by the import-guard test
 TESTED_VERSION = "0.1.0"
 
 __all__ = [
+    "SUPPORTED_COMPRESSORS",
     "TESTED_VERSION",
     "ZARRISTA_AVAILABLE",
     "AlignmentError",
+    "UnsupportedByBackend",
+    "check_supported",
     "ZarristaArray",
     "check_write_alignment",
     "create_v2",
@@ -322,7 +325,10 @@ class ZarristaArray:
 # --------------------------------------------------------------------------- #
 
 def _store(path):
-    return _FilesystemStore(str(Path(path).resolve()))
+    # A file:// URL passed straight to Path() resolves to a DRIVE-RELATIVE path on
+    # Windows ('file:///C:/x' -> 'C:x'), i.e. somewhere under the working directory.
+    from ..io import _local_path_from_file_url
+    return _FilesystemStore(str(Path(_local_path_from_file_url(path)).resolve()))
 
 
 def create_v3(path, shape, chunks, dtype, shard=None, codecs=None,
@@ -406,7 +412,9 @@ def _compressor_chain(codecs, dtype):
         return [_codec.zstd(clevel, False)]
     if name == "gzip":
         return [_codec.gzip(clevel)]
-    raise ValueError(
+    # check_supported() rejects these at the entry point; this is the backstop for
+    # anyone calling create_v2/create_v3 directly.
+    raise UnsupportedByBackend(
         f"compressor {name!r} has no zarrista equivalent; "
         f"use blosc, zstd, gzip, or None"
     )
@@ -414,6 +422,113 @@ def _compressor_chain(codecs, dtype):
 
 def _is_remote(path):
     return "://" in str(path) and not str(path).startswith("file://")
+
+
+# --------------------------------------------------------------------------- #
+# Capability guard
+# --------------------------------------------------------------------------- #
+
+class UnsupportedByBackend(ValueError):
+    """``backend='zarrista'`` was asked for something this backend cannot do.
+
+    Its own class so callers can distinguish "this backend can't" from an ordinary
+    bad argument, and fall back to the default backend deliberately if they want to.
+    """
+
+
+#: Compressors with a zarrista equivalent. Anything else must be refused up front
+#: rather than at codec-build time, half way through opening the output.
+SUPPORTED_COMPRESSORS = frozenset({None, "blosc", "zstd", "gzip"})
+
+
+def check_supported(*, source=None, output=None, zarr_format=None, codecs=None,
+                    storage_options=None, path_in_store="/"):
+    """Refuse, before any work happens, anything this backend cannot honour.
+
+    ``backend='zarrista'`` is an explicit request, so every unsupported combination
+    has to fail loudly and say why: silently doing something else would make a
+    benchmark, a bug report, or a correctness claim meaningless. This is the ONE
+    place that knows the backend's limits - add new ones here, not at the call site.
+
+    **Scope: only what ZARRISTA specifically cannot do.** A request that is wrong on
+    every backend belongs to whichever layer owns it, so that the default path gets
+    the same error - putting it here would leave the common case unguarded. Hence
+    ``zarr_format``, a TIFF output path and a TIFF source with an explicit backend
+    are all checked in ``io.py``, not here; what stays is the group-vs-array
+    distinction, the codec set, remote-store construction, and misplaced
+    ``storage_options``.
+
+    Raises:
+        UnsupportedByBackend: with a message naming the limitation and the way out.
+        ImportError: when a remote path is used without obstore installed.
+    """
+    require_zarrista()
+
+    for role, path in (("source", source), ("output", output)):
+        if path is None:
+            continue
+        text = str(path)
+
+        # NB the TIFF cases are NOT handled here. A TIFF *source* is rejected in
+        # read_array for ANY explicit backend (tifffile reads it under all of them,
+        # so the argument simply does not apply), and a TIFF *output* is not a
+        # backend question at all -- dyna only ever writes Zarr, so a `.tif` output
+        # path is a misleading filename on every backend and is refused in
+        # write_array. Both live where they apply to both backends, not here.
+
+        if _is_remote(text):
+            # Fail here, not at the first byte of I/O, and say which package.
+            _obstore(text, storage_options)
+        elif storage_options:
+            raise UnsupportedByBackend(
+                f"storage_options are for remote stores, but the {role} {text!r} is "
+                f"a local path. Drop storage_options, or pass a remote URL."
+            )
+
+    # NB zarr_format is NOT validated here: dyna writes v2/v3 on every backend, so
+    # write_array owns that check. This guard answers only "can ZARRISTA do it".
+
+    name = getattr(codecs, "compressor", None) if codecs is not None else None
+    if codecs is not None and name not in SUPPORTED_COMPRESSORS:
+        # v2 accepts numcodecs ids that zarrista's codec set has no mapping for
+        # (bz2, for instance, writes fine on the default v2 path), so this refusal
+        # is real and specific to zarrista - name the alternative rather than
+        # implying the codec itself is invalid.
+        raise UnsupportedByBackend(
+            f"backend='zarrista' has no equivalent for compressor {name!r} "
+            f"(it supports blosc, zstd, gzip, or None), though the default backend "
+            f"may accept it for this format. Use backend='tensorstore', or pick one "
+            f"of those codecs."
+        )
+
+    # Local source: say what is actually wrong with the path before zarrista does it
+    # with a bare "array metadata is missing", which names neither the path nor the
+    # reason. Remote paths are left to the store, which cannot be probed cheaply.
+    if source is not None and path_in_store == "/" and not _is_remote(str(source)):
+        local = Path(source)
+        if not local.exists():
+            # Not backend-specific (every backend needs the path to exist), but
+            # zarrista would otherwise report it as "array metadata is missing",
+            # which names neither the path nor the real problem.
+            raise FileNotFoundError(f"{source} does not exist")
+        if local.is_dir():
+            is_array = (local / ".zarray").exists() or (local / "zarr.json").exists()
+            if not is_array:
+                members = sorted(
+                    c.name for c in local.iterdir()
+                    if c.is_dir()
+                    and ((c / ".zarray").exists() or (c / "zarr.json").exists())
+                )
+                if (local / ".zgroup").exists() or members:
+                    hint = f" (try one of: {', '.join(members)})" if members else ""
+                    raise UnsupportedByBackend(
+                        f"backend='zarrista' opens a zarr ARRAY, but {source} is a "
+                        f"group{hint}. Point at the array itself, or use the default "
+                        f"backend, which picks a group's first array for you."
+                    )
+                raise UnsupportedByBackend(
+                    f"{source} is not a zarr array (no .zarray or zarr.json)."
+                )
 
 
 def _obstore(url, storage_options=None):
@@ -523,6 +638,12 @@ def open_array(path, path_in_store="/", storage_options=None):
     require_zarrista()
     if _is_remote(path):
         return ZarristaArray(_open_remote(path, path_in_store, storage_options))
+
+    # Path validation (group vs array, missing, TIFF, ...) lives in
+    # check_supported(), which io.read calls before any work; calling it here too
+    # keeps direct open_array() users on the same guard.
+    check_supported(source=path, storage_options=storage_options,
+                    path_in_store=path_in_store)
     return ZarristaArray(_zarrista.Array.open(_store(path), path_in_store))
 
 

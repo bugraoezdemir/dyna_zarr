@@ -403,6 +403,119 @@ def test_remote_read_goes_through_the_async_obstore_path(tmp_path, data):
     assert arr[3].shape == data[3].shape      # numpy semantics hold here too
 
 
+@pytest.mark.parametrize("backend", ["zarrista", "tensorstore"])
+def test_explicit_backend_on_tiff_is_rejected_not_ignored(tmp_path, backend):
+    """`backend=` selects a ZARR backend, so NEITHER value applies to TIFF.
+
+    tifffile reads TIFF under both, so accepting the argument would misreport
+    which reader ran. This is symmetric on purpose: rejecting only 'zarrista'
+    would imply 'tensorstore' is honoured here, and it is not.
+    """
+    tifffile = pytest.importorskip("tifffile")
+    from dyna_zarr import io
+
+    d = np.arange(4 * 32 * 32, dtype="uint16").reshape(4, 32, 32)
+    src = tmp_path / "img.tif"
+    tifffile.imwrite(str(src), d)
+
+    # the default backend still reads it
+    assert np.array_equal(io.read(src).compute(), d)
+
+    with pytest.raises(ValueError, match="does not apply to the TIFF"):
+        io.read(src, backend=backend)
+
+
+@pytest.mark.parametrize("backend", [None, "tensorstore", "zarrista"])
+def test_bad_zarr_format_is_refused_on_every_backend(tmp_path, data, backend):
+    """dyna writes v2/v3 on every backend, so this is NOT a backend limitation.
+
+    Regression: zarr_format=4 used to fall through to the v3 branch and write
+    SILENTLY on the default path, while only the zarrista guard caught it.
+    """
+    from dyna_zarr import io
+
+    src = tmp_path / "fsrc"
+    seed = create_v3(src, SHAPE, CHUNKS, "float32")
+    seed[:] = data
+
+    kwargs = {} if backend is None else {"backend": backend}
+    with pytest.raises(ValueError, match="zarr_format must be 2 or 3"):
+        io.write(io.read(src), tmp_path / "of.zarr", zarr_format=4, **kwargs)
+
+
+@pytest.mark.parametrize("backend", [None, "zarrista"])
+def test_missing_path_raises_the_same_error_on_every_backend(tmp_path, backend):
+    """A missing path is not backend-specific; both must say the same thing."""
+    from dyna_zarr import io
+
+    kwargs = {} if backend is None else {"backend": backend}
+    with pytest.raises(FileNotFoundError):
+        io.read(tmp_path / "nope.zarr", **kwargs)
+
+
+@pytest.mark.parametrize("backend", [None, "tensorstore", "zarrista"])
+def test_tiff_output_is_refused_on_every_backend(tmp_path, data, backend):
+    """io.write only ever writes Zarr, so a .tif OUTPUT is a misleading filename
+    on every backend - including the default. Not a backend limitation, so it is
+    refused in write_array rather than in the zarrista guard."""
+    from dyna_zarr import io
+
+    src = tmp_path / "tsrc"
+    seed = create_v3(src, SHAPE, CHUNKS, "float32")
+    seed[:] = data
+
+    kwargs = {} if backend is None else {"backend": backend}
+    with pytest.raises(ValueError, match="writes Zarr, not TIFF"):
+        io.write(io.read(src), tmp_path / "out.tif", zarr_format=3, **kwargs)
+
+
+def test_tiff_converted_to_zarr_is_readable_by_zarrista(tmp_path):
+    """The workaround the error message recommends has to actually work."""
+    tifffile = pytest.importorskip("tifffile")
+    from dyna_zarr import io
+
+    d = np.arange(4 * 32 * 32, dtype="uint16").reshape(4, 32, 32)
+    src = tmp_path / "img.tif"
+    tifffile.imwrite(str(src), d)
+
+    converted = tmp_path / "converted.zarr"
+    io.write(io.read(src), converted, zarr_format=3)
+    assert np.array_equal(io.read(converted, backend="zarrista").compute(), d)
+
+
+def test_zarr_group_source_is_rejected_with_a_useful_message(tmp_path, data):
+    """zarrista opens an ARRAY; a group must not surface as 'metadata is missing'.
+
+    The default backend walks a group and picks its first array, so a user moving
+    to backend='zarrista' hits this immediately.
+    """
+    from dyna_zarr import io
+
+    grp = tmp_path / "grp.zarr"
+    g = zarr.open_group(str(grp), mode="w", zarr_format=2)
+    g.create_array("0", shape=SHAPE, chunks=CHUNKS, dtype="float32")[:] = data
+
+    with pytest.raises(ValueError, match="is a group"):
+        io.read(grp, backend="zarrista")
+
+    # and the sub-path the message points at does work
+    assert np.array_equal(io.read(grp / "0", backend="zarrista").compute(), data)
+
+
+@pytest.mark.parametrize("backend", ["tensorstore", "zarrista"])
+def test_sharding_on_v2_is_rejected_on_both_backends(tmp_path, data, backend):
+    """Sharding is v3-only. Both paths used to drop shard_coefficients in silence."""
+    from dyna_zarr import io
+
+    src = tmp_path / "shsrc"
+    seed = create_v3(src, SHAPE, CHUNKS, "float32")
+    seed[:] = data
+
+    with pytest.raises(ValueError, match="requires zarr_format=3"):
+        io.write(io.read(src), tmp_path / f"o_{backend}", zarr_format=2,
+                 shard_coefficients=(2, 2, 2), backend=backend)
+
+
 def test_storage_options_reach_obstore(monkeypatch, tmp_path, data):
     """storage_options must arrive at obstore.store.from_url unchanged.
 

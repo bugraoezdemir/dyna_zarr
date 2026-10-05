@@ -74,6 +74,21 @@ def _norm_key(key, shape):
     return out
 
 
+def _common_grid(arrays):
+    """The chunk grid ALL ``arrays`` share, or None.
+
+    A combined array has one grid only when its inputs agree; with differing grids, or
+    any grid-less input, there is no single source grid to carry forward, and picking one
+    input's (it used to be ``arrays[0]``'s) made the result depend on argument order.
+    None lets io.write choose its default instead.
+    """
+    grids = [a.chunks for a in arrays]
+    first = grids[0]
+    if first is None or any(g is None or tuple(g) != tuple(first) for g in grids[1:]):
+        return None
+    return tuple(first)
+
+
 class ConcatenateTransform(Transform):
     """
     Lazy concatenation of multiple arrays along an axis.
@@ -97,8 +112,8 @@ class ConcatenateTransform(Transform):
             for i in range(len(ref_shape))
         )
 
-        # Use chunks from first array
-        self.chunks = arrays[0].chunks
+        # A grid only if every input shares it (order-independent; see _common_grid).
+        self.chunks = _common_grid(arrays)
         self.dtype = arrays[0].dtype
 
         # Precompute cumulative sizes for fast lookup
@@ -213,7 +228,10 @@ class StackTransform(Transform):
 
         # Compute output shape (insert new dimension)
         self.shape = ref_shape[:axis] + (len(arrays),) + ref_shape[axis:]
-        self.chunks = arrays[0].chunks[:axis] + (1,) + arrays[0].chunks[axis:]
+        # No grid in, no grid out (a grid-less input used to crash here); a grid only if
+        # every input shares it (order-independent; see _common_grid).
+        src = _common_grid(arrays)
+        self.chunks = (src[:axis] + (1,) + src[axis:]) if src is not None else None
         self.dtype = arrays[0].dtype
 
     def read(self, key):
@@ -248,6 +266,35 @@ class StackTransform(Transform):
         return np.stack(parts, axis=insert_pos)
 
 
+def _positive_steps(key):
+    """Rewrite every negative-step slice in ``key`` as the positive-step slice over the
+    same elements; return ``(key, axes_to_flip)``, axes counted in the READ RESULT
+    (integer indices drop theirs).
+
+    Upstream reads never see a negative step. zarr refuses one outright
+    (NegativeStepError) and TensorStore/zarrista are not asked to support one. It also
+    removes an ambiguity: a composed/normalised negative slice marks "before index 0" as
+    ``stop=-1``, which is right as a ``range()`` bound but means "the LAST element" in
+    Python slice syntax - so passing it on could read the wrong data, not just fail.
+    ``key`` elements here are concrete ints/slices (range semantics for the bounds).
+    """
+    out, flip, res_axis = [], set(), 0
+    for k in key:
+        if isinstance(k, slice) and k.step is not None and k.step < 0:
+            n = len(range(k.start, k.stop, k.step))
+            if n == 0:
+                out.append(slice(0, 0, 1))
+            else:
+                last = k.start + (n - 1) * k.step            # the smallest index read
+                out.append(slice(last, k.start + 1, -k.step))
+                flip.add(res_axis)
+        else:
+            out.append(k)
+        if not isinstance(k, (int, np.integer)):
+            res_axis += 1
+    return out, flip
+
+
 class SliceTransform(Transform):
     """
     Lazy slicing of an array with support for np.newaxis.
@@ -261,9 +308,10 @@ class SliceTransform(Transform):
         if not isinstance(key, tuple):
             key = (key,)
 
-        chunks = array.chunks if array.chunks is not None else (1,) * array.ndim
+        # The grid is derived only when the source has one (no grid in, no grid out).
+        chunks = array.chunks
         new_shape = []
-        new_chunks = []
+        new_chunks = [] if chunks is not None else None
         normalized = []          # store CONCRETE, non-negative keys so shape/read math is
         original_dim = 0         # simple (negatives + None resolved once, here)
 
@@ -271,7 +319,8 @@ class SliceTransform(Transform):
             if k is np.newaxis:
                 normalized.append(k)
                 new_shape.append(1)
-                new_chunks.append(1)
+                if new_chunks is not None:
+                    new_chunks.append(1)
                 continue
             if original_dim >= array.ndim:
                 raise IndexError("Too many indices for array")
@@ -286,7 +335,8 @@ class SliceTransform(Transform):
                 s = slice(*k.indices(size))                   # resolves None + negatives
                 normalized.append(s)
                 new_shape.append(len(range(s.start, s.stop, s.step)))
-                new_chunks.append(chunks[original_dim])
+                if new_chunks is not None:
+                    new_chunks.append(chunks[original_dim])
             else:
                 raise TypeError(f"Invalid index type: {type(k)}")
             original_dim += 1
@@ -294,7 +344,8 @@ class SliceTransform(Transform):
         # Add remaining (untouched) dimensions
         for i in range(original_dim, array.ndim):
             new_shape.append(array.shape[i])
-            new_chunks.append(chunks[i])
+            if new_chunks is not None:
+                new_chunks.append(chunks[i])
 
         self.key = tuple(normalized)
         self.shape = tuple(new_shape)
@@ -305,7 +356,10 @@ class SliceTransform(Transform):
         # consumer sees no alignment and falls back to small regions, and the producer
         # recomputes each cell once per region that touches it.
         self.align, self.align_offset = self._derive_align()
-        self.chunks = tuple(new_chunks)
+        # No grid in, no grid out. A grid-less source used to get a made-up (1, ..., 1)
+        # grid here, which io.write then PRESERVED - one-voxel chunks on disk. With None,
+        # the writer chooses its default chunk instead.
+        self.chunks = tuple(new_chunks) if new_chunks is not None else None
         self.dtype = array.dtype
         self.new_axes = [i for i, k in enumerate(self.key) if k is np.newaxis]
 
@@ -433,8 +487,12 @@ class SliceTransform(Transform):
                 full_key.append(slice(None))
             input_dim += 1
 
-        # Read from underlying array
+        # Read from underlying array - with positive steps only (see _positive_steps).
+        full_key, flip_axes = _positive_steps(full_key)
         result = self.array._read_direct(tuple(full_key))
+        if flip_axes:
+            result = result[tuple(slice(None, None, -1) if ax in flip_axes else slice(None)
+                                  for ax in range(result.ndim))]
 
         # Add back any newaxis dimensions at the correct positions
         for i, stored_key_elem in enumerate(self.key):
@@ -511,14 +569,16 @@ class SwapAxesTransform(Transform):
         if self.axis1 >= array.ndim or self.axis2 >= array.ndim:
             raise ValueError(f"Axis out of bounds for {array.ndim}-D array")
 
-        # Compute new shape and chunks
+        # Compute new shape and chunks (no grid in, no grid out - this used to crash)
         shape = list(array.shape)
-        chunks = list(array.chunks)
         shape[self.axis1], shape[self.axis2] = shape[self.axis2], shape[self.axis1]
-        chunks[self.axis1], chunks[self.axis2] = chunks[self.axis2], chunks[self.axis1]
-
         self.shape = tuple(shape)
-        self.chunks = tuple(chunks)
+        if array.chunks is not None:
+            chunks = list(array.chunks)
+            chunks[self.axis1], chunks[self.axis2] = chunks[self.axis2], chunks[self.axis1]
+            self.chunks = tuple(chunks)
+        else:
+            self.chunks = None
         self.dtype = array.dtype
 
     def read(self, key):
@@ -656,8 +716,10 @@ class SqueezeTransform(Transform):
         
         # Handle chunks
         if array.chunks:
-            new_chunks = [c for i, c in enumerate(array.chunks) if i not in self.squeeze_axes]
-            self.chunks = tuple(new_chunks) if new_chunks else (1,)
+            # Squeezing every axis leaves a 0-d array, whose grid is (); it used to be
+            # reported as (1,) - a grid of the wrong rank.
+            self.chunks = tuple(c for i, c in enumerate(array.chunks)
+                                if i not in self.squeeze_axes)
         else:
             self.chunks = None
         
@@ -711,7 +773,10 @@ class FlattenTransform(Transform):
         super().__init__()
         self.array = array
         self.original_shape = array.shape
-        self.shape = (np.prod(array.shape),)
+        # int(), not the np.int64 np.prod returns: the shape tuple is compared and
+        # formatted all over the writer, and a numpy scalar there prints as
+        # "np.int64(1048576)".
+        self.shape = (int(np.prod(array.shape)),)
         self.chunks = None
         self.dtype = array.dtype
     
@@ -719,13 +784,26 @@ class FlattenTransform(Transform):
         return _reshape_read(self.array, self.shape, key)
 
 
+#: numpy.pad modes whose padded values are COPIES of input values (or one scalar
+#: constant): every output position maps to one input index, so a window's input is
+#: computable exactly. The statistic modes (mean/median/maximum/minimum/linear_ramp)
+#: depend on whole axes and are read that way.
+_PAD_REMAP_MODES = frozenset({"constant", "empty", "edge", "reflect", "symmetric", "wrap"})
+
+
 class PadTransform(Transform):
     """Lazy padding (materializes on read). Supports numpy.pad ``mode`` (constant/reflect/
-    edge/symmetric/wrap/...). Memory model: an axis whose read window lies entirely inside the
-    core is read as just that sub-slice (bounded); an axis whose window touches a padded border
-    reads that whole INPUT axis then pads it fully and crops -- so non-constant modes (reflect/
-    wrap/... need the array's own edge/interior) stay exact, bounded by the axis size when
-    bordered (like a scan/median floor)."""
+    edge/symmetric/wrap/...).
+
+    Memory model. An axis whose read window lies entirely inside the core reads just that
+    sub-slice. For the copy modes (see _PAD_REMAP_MODES; ``constant`` with a scalar value,
+    ``reflect``/``symmetric`` with the default ``reflect_type='even'``) a window touching a
+    padded border reads exactly the span of input indices it maps to - found by padding an
+    INDEX array with the same mode - so an edge region costs about its own size. (Only a
+    ``wrap`` window reaching both ends of an axis spans that whole axis.) The statistic
+    modes, ``reflect_type='odd'`` and per-axis constants depend on whole axes: a bordered
+    window reads the whole input axis, pads it and crops, as before.
+    """
 
     def __init__(self, array: 'DynamicArray', pad_width: Union[int, Tuple],
                  mode: str = "constant", **pad_kwargs):
@@ -741,7 +819,83 @@ class PadTransform(Transform):
         self.chunks = None
         self.dtype = array.dtype
 
+        # Exact bounded reads need a pure index remap (see the class docstring).
+        fill = pad_kwargs.get("constant_values", 0)
+        self._remap = (
+            mode in _PAD_REMAP_MODES
+            and pad_kwargs.get("reflect_type", "even") == "even"
+            and np.ndim(fill) == 0
+            and 0 not in tuple(array.shape)
+        )
+        self._fill = fill if np.ndim(fill) == 0 else None
+        self._index_maps = {}
+
+    def _index_map(self, axis):
+        """Padded position -> input index along ``axis`` (-1 = constant fill)."""
+        imap = self._index_maps.get(axis)
+        if imap is None:
+            n = self.array.shape[axis]
+            idx = np.arange(n, dtype=np.int64)
+            if self.mode in ("constant", "empty"):
+                imap = np.pad(idx, self.pad_width[axis], mode="constant", constant_values=-1)
+            else:
+                imap = np.pad(idx, self.pad_width[axis], mode=self.mode)
+            self._index_maps[axis] = imap
+        return imap
+
     def read(self, key):
+        if self._remap:
+            return self._read_remap(key)
+        return self._read_whole_axis(key)
+
+    def _read_remap(self, key):
+        """Bounded read for the copy modes: per bordered axis, read only the span of input
+        indices the window maps to, then gather (and fill constants) along that axis."""
+        input_slices, gathers, fills, squeeze_axes = [], [], [], []
+        for a, (is_int, start, stop, step) in enumerate(_norm_key(key, self.shape)):
+            before, _after = self.pad_width[a]
+            in_size = self.array.shape[a]
+            if start >= before and stop <= before + in_size:
+                input_slices.append(slice(start - before, stop - before))
+                gathers.append(slice(0, stop - start, step))
+                fills.append(None)
+            else:
+                # range semantics for the positions (never a slice: stop=-1 would mean
+                # "the last element" there)
+                window = self._index_map(a)[np.arange(start, stop, step, dtype=np.int64)]
+                real = window[window >= 0]
+                lo = int(real.min()) if real.size else 0
+                hi = int(real.max()) + 1 if real.size else 1     # >=1 element so take() works
+                input_slices.append(slice(lo, hi))
+                gathers.append(np.where(window >= 0, window - lo, 0))
+                fills.append(window < 0 if (window < 0).any() else None)
+            if is_int:
+                squeeze_axes.append(a)
+
+        out = self.array._read_direct(tuple(input_slices))
+        xp = array_namespace(out)
+        for a, g in enumerate(gathers):
+            if isinstance(g, slice):
+                out = out[(slice(None),) * a + (g,)]
+            else:
+                out = xp.take(out, xp.asarray(g), axis=a)
+        if any(f is not None for f in fills):
+            mask = None
+            for a, f in enumerate(fills):
+                if f is None:
+                    continue
+                shape = [1] * out.ndim
+                shape[a] = f.shape[0]
+                m = xp.asarray(f).reshape(shape)
+                mask = m if mask is None else (mask | m)
+            fill = 0 if self._fill is None else self._fill
+            out = xp.where(mask, xp.asarray(fill, dtype=out.dtype), out)
+        for a in sorted(squeeze_axes, reverse=True):
+            out = xp.squeeze(out, axis=a)
+        return out
+
+    def _read_whole_axis(self, key):
+        """Statistic modes: a bordered window needs the whole input axis."""
         input_slices, pad_widths, crop, squeeze_axes = [], [], [], []
         for a, (is_int, start, stop, step) in enumerate(_norm_key(key, self.shape)):
             before, after = self.pad_width[a]
@@ -781,7 +935,11 @@ class TileTransform(Transform):
         
         # Calculate output shape
         self.shape = tuple(s * r for s, r in zip(array.shape, reps))
-        self.chunks = None
+        # Tiling repeats the whole array, so a source chunk still tiles the output
+        # exactly whenever it tiled the input: the grid carries over unchanged.
+        src = array.chunks
+        self.chunks = (tuple(int(c) for c in src)
+                       if src is not None and len(src) == len(self.shape) else None)
         self.dtype = array.dtype
     
     def read(self, key):

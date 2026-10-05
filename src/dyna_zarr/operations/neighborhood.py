@@ -135,12 +135,37 @@ class MapOverlapTransform(Transform):
             astart = (start // al) * al
             astop = min(size, -(-stop // al) * al)
 
-            # read the ALIGNED core +/- halo, clamped to [0, size)
-            read_slices.append(slice(max(0, astart - d), min(size, astop + d)))
-            pad_widths.append((max(0, d - astart), max(0, (astop + d) - size)))
-            # aligned core sits at block[d : d+(astop-astart)]; the requested region is the
-            # sub-window [start, stop) inside it -> crop at d + (start - astart).
-            crop_slices.append(slice(d + (start - astart), d + (stop - astart), step))
+            # The halo is capped PER SIDE at the real data that side can supply.
+            # Past that the read clamps to the axis anyway and only the `boundary`
+            # padding grows, which adds no information: pre-padding a block and
+            # letting the func apply the same mode itself agree EXACTLY (0.0,
+            # float64) once the halo is at least the kernel's own reach, which is
+            # the halo any correct caller already asks for. Below that they differ,
+            # but by kernel truncation, which the uncapped path suffers too.
+            #
+            # Per SIDE, not one shared depth. A single
+            # `d = min(d, max(astart, size - astop))` collapses to 0 on a core that
+            # spans the whole axis, dropping the boundary border entirely, and the
+            # crop below then reads from the wrong offset: gaussian_s2,
+            # gaussian_aniso, gaussian_laplace and gauss_grad_mag all came out
+            # wrong at every edge.
+            #
+            # The win is on short axes. A scalar sigma on a 5D
+            # (2, 3, 48, 384, 384) volume gives depth 4 on every axis, so uncapped
+            # the length-2 axis pads to 10 and the length-3 to 11 -- a ~19x block
+            # inflation that scipy's separable passes then multiply again
+            # (17.7 GB peak measured on a 162 MB array).
+            d_lo = min(d, astart)
+            d_hi = min(d, size - astop)
+
+            # read the ALIGNED core +/- halo (already within [0, size) by the cap)
+            read_slices.append(slice(astart - d_lo, astop + d_hi))
+            pad_widths.append((0, 0))
+            # The aligned core sits at block[d_lo : d_lo+(astop-astart)] -- d_lo, the
+            # halo actually present on the leading side, NOT the requested depth.
+            # The requested region is the sub-window [start, stop) inside it.
+            crop_slices.append(
+                slice(d_lo + (start - astart), d_lo + (stop - astart), step))
             location.append((astart, astop))
 
         block = to_device(self.array._read_direct(tuple(read_slices)),

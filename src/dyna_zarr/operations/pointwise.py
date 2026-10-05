@@ -26,9 +26,50 @@ def _infer_mapblocks_dtype(func, operands):
     return np.asarray(func(*samples)).dtype
 
 
+def _as_operands(operands):
+    """Operands as map_blocks holds them: a non-0-d NumPy array becomes a DynamicArray.
+
+    A raw ndarray used to be passed to ``func`` whole, next to operand BLOCKS, so any
+    read smaller than the full array paired a region with the entire ndarray and either
+    raised or broadcast it against the wrong elements. Wrapping it gives it the same
+    blockwise read as every other array operand. Scalars and 0-d arrays pass through.
+    """
+    from dyna_zarr.dynamic_array import DynamicArray
+    out = []
+    for o in operands:
+        if isinstance(o, np.ndarray) and o.ndim > 0:
+            o = DynamicArray(o)
+        out.append(o)
+    return out
+
+
+def _operand_key(key, out_shape, op_shape):
+    """Map an output read ``key`` onto an operand that BROADCASTS to ``out_shape``.
+
+    NumPy broadcasting aligns shapes from the right. An operand axis of the output's
+    size takes the key element unchanged; a size-1 (broadcast) axis reads its single
+    element - ``0`` where the key drops that axis, ``slice(0, 1)`` where it keeps it (or
+    ``slice(0, 0)`` for an empty selection); output axes the operand lacks are skipped.
+    Integer keys drop the same axes from every block, so the blocks stay right-aligned
+    and ``func`` broadcasts them exactly as it would the full arrays.
+    """
+    offset = len(out_shape) - len(op_shape)
+    mapped = []
+    for j, osz in enumerate(op_shape):
+        k = key[offset + j]
+        if osz == out_shape[offset + j]:
+            mapped.append(k)
+        elif isinstance(k, slice):
+            empty = len(range(*k.indices(out_shape[offset + j]))) == 0
+            mapped.append(slice(0, 0) if empty else slice(0, 1))
+        else:
+            mapped.append(0)
+    return tuple(mapped)
+
+
 class MapBlocksTransform(Transform):
     """Pull-model ``map_blocks``: apply an ELEMENTWISE (chunk-independent) function to
-    one or more equally-shaped DynamicArray operands (plus scalars).
+    one or more DynamicArray operands (plus scalars) that broadcast together.
 
     Because the function is pointwise, ``func(a[key], b[key]) == func(a, b)[key]``, so
     reading an arbitrary output slice just reads that slice from each operand and applies
@@ -36,35 +77,64 @@ class MapBlocksTransform(Transform):
     ``conservative . pointwise`` taxonomy cell; it is NOT valid for neighbourhood or
     reducing functions (use map_overlap / reduce for those).
 
-    Operands may mix DynamicArrays (read blockwise) and plain scalars (passed through;
-    NumPy broadcasts them). All DynamicArray operands must share the same shape.
+    Operand shapes follow NumPy broadcasting, so an nd array combines with a 0-d result
+    (``x > x.mean()``) or a ``keepdims`` one (``x - x.mean(axis=0, keepdims=True)``). A
+    broadcast operand is read at the output key collapsed onto its size-1 axes (see
+    :func:`_operand_key`). Scalars pass through and NumPy broadcasts them.
     """
 
     def __init__(self, func, operands, dtype=None, name=None, device=None):
         super().__init__()
         from dyna_zarr.dynamic_array import DynamicArray
         self.func = func
-        self.operands = list(operands)
+        self.operands = _as_operands(operands)
         self.device = device
         self.name = name or getattr(func, "__name__", "map_blocks")
         arrays = [o for o in self.operands if isinstance(o, DynamicArray)]
         if not arrays:
             raise ValueError("map_blocks requires at least one DynamicArray operand")
-        ref = arrays[0]
-        for a in arrays[1:]:
-            if a.shape != ref.shape:
-                raise ValueError(
-                    f"map_blocks operands must share shape; got {a.shape} vs {ref.shape}"
-                )
-        self.shape = ref.shape
-        self.chunks = ref.chunks
+        try:
+            self.shape = tuple(np.broadcast_shapes(*(a.shape for a in arrays)))
+        except ValueError:
+            raise ValueError(
+                "map_blocks operands must broadcast together; got shapes "
+                + ", ".join(str(tuple(a.shape)) for a in arrays)
+            ) from None
+        # The chunk grid comes from an operand that spans the full output; a broadcast
+        # operand's grid describes a different (smaller) array.
+        full = [a for a in arrays if tuple(a.shape) == self.shape]
+        self.chunks = full[0].chunks if full else None
         self.dtype = dtype if dtype is not None else _infer_mapblocks_dtype(func, self.operands)
+
+    def broadcast_operands(self):
+        """``(operand, broadcast_axes)`` for every DynamicArray operand that does NOT
+        span the output: ``broadcast_axes`` are the output axes along which it is
+        repeated (size 1 there, or absent). Used by io.write to plan around them."""
+        from dyna_zarr.dynamic_array import DynamicArray
+        out = []
+        for o in self.operands:
+            if not isinstance(o, DynamicArray) or tuple(o.shape) == self.shape:
+                continue
+            offset = len(self.shape) - len(o.shape)
+            axes = tuple(
+                i for i, s in enumerate(self.shape)
+                if s > 1 and (i < offset or o.shape[i - offset] == 1)
+            )
+            if axes:
+                out.append((o, axes))
+        return out
 
     def read(self, key):
         from dyna_zarr.dynamic_array import DynamicArray
         dev = resolve_device(self.device)
+        if not isinstance(key, tuple):
+            key = (key,)
+        key = key + (slice(None),) * (len(self.shape) - len(key))
         blocks = [
-            to_device(o._read_direct(key), dev) if isinstance(o, DynamicArray)
+            to_device(o._read_direct(
+                key if tuple(o.shape) == self.shape
+                else _operand_key(key, self.shape, o.shape)), dev)
+            if isinstance(o, DynamicArray)
             else o
             for o in self.operands
         ]
@@ -79,15 +149,17 @@ class MapBlocksTransform(Transform):
 # --------------------------------------------------------------------------- #
 
 def map_blocks(func, *operands, dtype=None, name=None, device=None):
-    """Apply an elementwise (chunk-independent) ``func`` to one or more equally-shaped
-    DynamicArrays (plus scalars), lazily and memory-bound. Every pointwise op here (ufuncs,
-    comparisons, logical ops, where, clip, astype) is a thin wrapper over this. ``func``
-    receives the read block of each operand; for neighbourhood/reducing funcs use
-    map_overlap / reduce. ``device`` (None=inherit the execution context, 'cpu', 'cuda')
-    runs this op on that device."""
+    """Apply an elementwise (chunk-independent) ``func`` to one or more DynamicArrays
+    (plus scalars) whose shapes broadcast together, lazily and memory-bound. Every
+    pointwise op here (ufuncs, comparisons, logical ops, where, clip, astype) is a thin
+    wrapper over this. ``func`` receives the read block of each operand; for
+    neighbourhood/reducing funcs use map_overlap / reduce. ``device`` (None=inherit the
+    execution context, 'cpu', 'cuda') runs this op on that device."""
     from dyna_zarr.dynamic_array import DynamicArray
     transform = MapBlocksTransform(func, operands, dtype=dtype, name=name, device=device)
-    ref = next(o for o in operands if isinstance(o, DynamicArray))
+    arrays = [o for o in transform.operands if isinstance(o, DynamicArray)]
+    # Carry the metadata of an operand that spans the output, not of a broadcast one.
+    ref = next((a for a in arrays if tuple(a.shape) == transform.shape), arrays[0])
     return ref._with_transform(transform)
 
 

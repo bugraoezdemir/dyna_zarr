@@ -116,10 +116,11 @@ _COMBINE = {
 }
 
 
-def scan_write(source, op, axis, output_path, output_chunks=None,
+def scan_write(source, op, axis, output, output_chunks=None,
                max_mem=_DEFAULT_SCAN_MEM, dtype=None, zarr_format=2):
-    """Stream a prefix scan of ``source`` along ``axis`` to ``output_path``, FULLY
-    memory-bounded. A scan has a bounded carry (a single slab perpendicular to the scan
+    """Stream a prefix scan of ``source`` along ``axis`` into ``output`` (a path, or an
+    opened sink from io.write - any backend, local or remote), FULLY memory-bounded.
+    Writes are strictly sequential, one strip at a time. A scan has a bounded carry (a single slab perpendicular to the scan
     axis), so we tile the cross-section and, within each tile, walk the scan axis in strips
     keeping a running carry: ``out_strip = combine(carry, local_scan(strip))``, then
     ``carry = last slab of out_strip``. Peak memory is ~ one strip x one cross-section tile,
@@ -138,8 +139,8 @@ def scan_write(source, op, axis, output_path, output_chunks=None,
 
     oc = tuple(output_chunks) if output_chunks is not None else (
         tuple(source.chunks) if source.chunks else tuple(min(s, 256) for s in shape))
-    out = zarr.open(str(output_path), mode="w", shape=shape, chunks=oc,
-                    dtype=dt, zarr_format=zarr_format)
+    from ..rechunk import _target
+    out = _target(output, shape, oc, dt, zarr_format)
 
     # cross-section tile (all axes but the scan axis) sized to <= budget/2 so the carry fits
     # and a strip of >= 2 slabs also fits; trailing axes grow first for contiguity.
@@ -175,7 +176,7 @@ def scan_write(source, op, axis, output_path, output_chunks=None,
             last = [slice(None)] * ndim
             last[a] = slice(-1, None)                  # keepdims last slab -> next carry
             carry = out_block[tuple(last)]
-    return output_path
+    return output
 
 
 def _scan(array, op, axis, device=None):

@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       full:
-        description: "Run the wheel install-check and metadata jobs too (slower)"
+        description: "Run the wheel install-check, dependency-floor and metadata jobs too (slower)"
         type: boolean
         default: true
       gpu:
@@ -99,8 +99,9 @@ jobs:
     # CuPy needs a CUDA device, which GitHub's standard runners do not have, so
     # this cannot run on the default fleet. It is kept as a hand-started job:
     # point it at a self-hosted CUDA runner (change `runs-on`) to exercise the
-    # `gpu`-marked tests. Until then the marker at least keeps them out of the
-    # core run and makes their absence explicit rather than invisible.
+    # `gpu`-marked tests (tests/test_gpu_device.py). Until then they are run locally
+    # before a release, on each platform supported; the marker keeps them out of
+    # the core run and makes their absence explicit rather than invisible.
     name: GPU backend (manual / self-hosted)
     if: github.event_name == 'workflow_dispatch' && inputs.gpu
     runs-on: ubuntu-latest
@@ -118,18 +119,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,gpu-cu12]"
 
-      - name: Run the GPU suite
-        # No `gpu`-marked tests exist yet, so pytest would exit 5 ("no tests
-        # collected") and fail the job. Tolerate exactly that code, and nothing
-        # else, so this starts working the moment the first GPU test is written.
-        shell: bash
+      - name: Fail if no usable CUDA device
+        # tests/test_gpu_device.py SKIPS as a whole without a usable CUDA runtime, so on
+        # a runner without one this job would go green having tested nothing - the
+        # failure mode this job exists to prevent (same guard as the zarrista job).
+        # Uses the suite's own probe, so the two can never disagree.
         run: |
-          python -m pytest tests/ -v -o addopts="" -m gpu || code=$?
-          if [ "${code:-0}" = "5" ]; then
-            echo "::notice::no gpu-marked tests yet - add pytest.mark.gpu to the GPU path tests"
-          elif [ "${code:-0}" != "0" ]; then
-            exit "$code"
-          fi
+          python -c "import sys; sys.path.insert(0, 'tests'); from test_gpu_device import _cuda_status; ok, why = _cuda_status(); assert ok, 'no usable CUDA device on this runner - the gpu tests would all skip: ' + why"
+
+      - name: Run the GPU suite
+        # No exit code is tolerated: the gpu-marked tests exist, so "no tests
+        # collected" (exit 5) would mean they went missing, not that there are none yet.
+        run: python -m pytest tests/ -v -o addopts="" -m gpu
 
   coverage:
     name: Coverage
@@ -244,6 +245,102 @@ jobs:
           # run here, since the extra was installed from the wheel's own metadata.
           run(py, "-m", "pytest", dest, "-v", "-o", "addopts=", "-m", "not gpu",
               cwd=outside)
+
+  floors:
+    # Hand-started runs can skip this via the `full` input; scheduled/PR runs always run it.
+    if: github.event_name != 'workflow_dispatch' || inputs.full
+    # Installs every dependency at its DECLARED FLOOR (uv --resolution lowest-direct) on the
+    # OLDEST supported Python and runs the suite against the built package. Every other job
+    # resolves the NEWEST versions, so a floor in pyproject.toml is otherwise never tested
+    # and silently rots: before this job existed the floors were numpy>=1.20 / scipy>=1.6
+    # (neither installable on Python 3.11) and an unpinned tensorstore/tifffile, which
+    # resolve to 0.1.0 / 0.1.0 at the floor and do not even build. The real floors come
+    # from couplings between OTHER packages (see the comments on `dependencies`), which
+    # is exactly what moves when those packages release - hence a job, not a one-off check.
+    name: Dependency floors (py3.11, ${{ matrix.variant }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Core floors on every OS: wheel availability at OLD versions is per-platform.
+          - {os: ubuntu-latest, variant: core}
+          - {os: windows-latest, variant: core}
+          - {os: macos-latest, variant: core}
+          # The [zarrista] extra adds its own floor (numpy>=2.1, for DLPack); that is
+          # platform-independent, and the zarrista job above already covers every OS.
+          - {os: ubuntu-latest, variant: zarrista}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # The oldest Python in requires-python (>=3.11): floors bite hardest there.
+          python-version: "3.11"
+
+      - name: Install at the floors, verify they resolved, run the suite
+        shell: python
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          import os, shutil, subprocess, sys, tempfile
+
+          def run(*cmd, **kw):
+              print("+", " ".join(map(str, cmd)), flush=True)
+              return subprocess.run(cmd, check=True, **kw)
+
+          variant = os.environ["VARIANT"]
+          repo = os.environ["GITHUB_WORKSPACE"]
+          run(sys.executable, "-m", "pip", "install", "--upgrade", "pip", "uv")
+          uv = [sys.executable, "-m", "uv"]
+
+          # A clean venv OUTSIDE the repo, so the source tree cannot satisfy imports.
+          fresh = os.path.join(tempfile.mkdtemp(prefix="dz-floor-"), "venv")
+          run(*uv, "venv", "--python", sys.executable, fresh)
+          bindir = "Scripts" if os.name == "nt" else "bin"
+          py = os.path.join(fresh, bindir, "python.exe" if os.name == "nt" else "python")
+
+          # lowest-direct: dyna's OWN dependencies at their floors; transitive ones
+          # resolve normally, as they would for a user who pinned dyna's floors.
+          target = repo + ("[zarrista]" if variant == "zarrista" else "")
+          run(*uv, "pip", "install", "--python", py, "--resolution", "lowest-direct", target)
+          # pytest separately and NOT at lowest - it is tooling, not a floor under test.
+          run(*uv, "pip", "install", "--python", py, "pytest")
+          run(*uv, "pip", "list", "--python", py)
+
+          # The floors must have resolved EXACTLY. If one ever cannot be installed at
+          # its floor (a transitive dependency starts to exclude it), the resolver
+          # silently picks something newer and this job would pass while testing the
+          # wrong versions - so say so instead. Core only: the [zarrista] extra raises
+          # numpy past the core floor on purpose, which moves scipy up with it.
+          if variant == "core":
+              # Runs INSIDE the floor venv; `packaging` is there because zarr needs it.
+              check = "\n".join([
+                  "import importlib.metadata as m",
+                  "from packaging.requirements import Requirement",
+                  "from packaging.version import Version",
+                  "bad = []",
+                  "for r in map(Requirement, m.requires('dyna-zarr')):",
+                  "    if r.marker is not None:",
+                  "        continue",
+                  "    for s in r.specifier:",
+                  "        if s.operator == '>=':",
+                  "            got = m.version(r.name)",
+                  "            print(f'{r.name}: floor {s.version}, installed {got}')",
+                  "            if Version(got) != Version(s.version):",
+                  "                bad.append((r.name, s.version, got))",
+                  "assert not bad, 'floor(s) did not resolve exactly (name, floor, installed): ' + repr(bad)",
+              ])
+              run(py, "-c", check)
+
+          # Run the copied suite from outside the repo against the installed package.
+          outside = tempfile.mkdtemp(prefix="dz-floor-run-")
+          dest = os.path.join(outside, "floor_tests")
+          shutil.copytree(os.path.join(repo, "tests"), dest)
+          run(py, "-c", "import dyna_zarr; assert 'site-packages' in dyna_zarr.__file__, dyna_zarr.__file__",
+              cwd=outside)
+          marks = "not gpu" if variant == "zarrista" else "not zarrista and not gpu"
+          run(py, "-m", "pytest", dest, "-v", "-o", "addopts=", "-m", marks, cwd=outside)
 
   lint:
     # Hand-started runs can skip this via the `full` input; scheduled/PR runs always run it.
