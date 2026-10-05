@@ -19,6 +19,12 @@ read - evaluates the ones a chain will need, fusing reductions of the same input
 streaming pass. Without that, ``x > x.mean()`` written region by region would re-stream
 the mean for every region. Larger results are never cached: they stay blockwise, and
 ``find_repeated_reductions`` reports where a broadcast makes them re-read.
+
+The associative results are cached as raw accumulator states (sum, not mean) on the
+reduction's INPUT, per reduced axes (``_StatsCache``), so every later reduction of that
+array finds them. Caching one of min/max/sum/mean computes all of min, max and sum in
+the same pass; var/std add the float64 sum of squares on top. That happens only when
+the whole bundle fits the same 1 MiB; see ``_bundle``.
 """
 
 import builtins
@@ -49,7 +55,7 @@ def _div_count(xp, s, count, ddof):
     return s / count
 
 
-def _var_partial(xp, b, ax):
+def _moments_partial(xp, b, ax):
     # accumulate in float64 so the one-pass sum-of-squares identity stays accurate
     bf = b.astype(xp.float64)
     return (xp.sum(bf, axis=ax), xp.sum(bf * bf, axis=ax))
@@ -69,18 +75,48 @@ def _std_finalize(xp, s, count, ddof):
     return xp.sqrt(_var_finalize(xp, s, count, ddof))
 
 
-class _Reducer:
-    """Associative reducers use partial(xp, block, axes)->state, combine(xp, a, b)->state,
-    finalize(xp, state, count, ddof)->result and are streamed over the reduced axis.
-    Non-associative reducers (argmin/argmax) can't be chunked on the reduced axis, so they
-    read it whole per kept-tile and apply direct(xp, block, axes) in one shot."""
-    def __init__(self, partial=None, combine=None, finalize=_ident,
-                 associative=True, direct=None):
+class _Accumulator:
+    """A streamable statistic: partial(xp, block, axes) -> state, combine(xp, a, b) ->
+    state. A state is an array over the KEPT axes (or a tuple of them). Several reducers
+    finalize the same accumulator (mean from sum; var and std from moments), which is
+    what lets one cached pass serve them all."""
+    def __init__(self, partial, combine):
         self.partial = partial
         self.combine = combine
+
+
+_ACCUMULATORS = {
+    "min":     _Accumulator(lambda xp, b, ax: xp.min(b, axis=ax),  lambda xp, a, b: xp.minimum(a, b)),
+    "max":     _Accumulator(lambda xp, b, ax: xp.max(b, axis=ax),  lambda xp, a, b: xp.maximum(a, b)),
+    "sum":     _Accumulator(lambda xp, b, ax: xp.sum(b, axis=ax),  lambda xp, a, b: xp.add(a, b)),
+    "prod":    _Accumulator(lambda xp, b, ax: xp.prod(b, axis=ax), lambda xp, a, b: xp.multiply(a, b)),
+    "any":     _Accumulator(lambda xp, b, ax: xp.any(b, axis=ax),  lambda xp, a, b: xp.logical_or(a, b)),
+    "all":     _Accumulator(lambda xp, b, ax: xp.all(b, axis=ax),  lambda xp, a, b: xp.logical_and(a, b)),
+    "moments": _Accumulator(_moments_partial, _pair_add),       # (sum, sum of squares), float64
+}
+
+#: Statistics computed together whenever a small reduction is cached. The CHEAP group
+#: costs about 3% of reading a raw block, so asking for any of min/max/sum/mean computes
+#: all three accumulators. The float64 sum of squares behind var/std costs about as much
+#: as the read itself, so it is only computed when var or std is asked for - and then
+#: the cheap group comes along. See _bundle.
+_CHEAP_GROUP = frozenset(("min", "max", "sum"))
+_BUNDLE_TRIGGERS = _CHEAP_GROUP | {"moments"}
+
+
+class _Reducer:
+    """An associative reducer finalizes a streamed accumulator: finalize(xp, state,
+    count, ddof) -> result. Non-associative reducers (argmin/argmax/median) can't be
+    chunked on the reduced axis, so they read it whole per kept-tile and apply
+    direct(xp, block, axes) in one shot."""
+    def __init__(self, acc=None, finalize=_ident, direct=None):
+        self.acc = acc
         self.finalize = finalize
-        self.associative = associative
         self.direct = direct
+
+    @property
+    def associative(self):
+        return self.acc is not None
 
 
 def _arg_axis(ax, ndim):
@@ -97,21 +133,19 @@ def _arg_axis(ax, ndim):
 
 
 _REDUCERS = {
-    "min":  _Reducer(lambda xp, b, ax: xp.min(b, axis=ax),  lambda xp, a, b: xp.minimum(a, b)),
-    "max":  _Reducer(lambda xp, b, ax: xp.max(b, axis=ax),  lambda xp, a, b: xp.maximum(a, b)),
-    "sum":  _Reducer(lambda xp, b, ax: xp.sum(b, axis=ax),  lambda xp, a, b: xp.add(a, b)),
-    "prod": _Reducer(lambda xp, b, ax: xp.prod(b, axis=ax), lambda xp, a, b: xp.multiply(a, b)),
-    "any":  _Reducer(lambda xp, b, ax: xp.any(b, axis=ax),  lambda xp, a, b: xp.logical_or(a, b)),
-    "all":  _Reducer(lambda xp, b, ax: xp.all(b, axis=ax),  lambda xp, a, b: xp.logical_and(a, b)),
-    "mean": _Reducer(lambda xp, b, ax: xp.sum(b, axis=ax),  lambda xp, a, b: xp.add(a, b), _div_count),
-    "var":  _Reducer(_var_partial, _pair_add, _var_finalize),
-    "std":  _Reducer(_var_partial, _pair_add, _std_finalize),
+    "min":  _Reducer("min"),
+    "max":  _Reducer("max"),
+    "sum":  _Reducer("sum"),
+    "prod": _Reducer("prod"),
+    "any":  _Reducer("any"),
+    "all":  _Reducer("all"),
+    "mean": _Reducer("sum", _div_count),
+    "var":  _Reducer("moments", _var_finalize),
+    "std":  _Reducer("moments", _std_finalize),
     # non-associative: read the reduced axis whole per kept-tile, apply in one shot
-    "argmin": _Reducer(associative=False,
-                       direct=lambda xp, b, ax: xp.argmin(b, axis=_arg_axis(ax, b.ndim))),
-    "argmax": _Reducer(associative=False,
-                       direct=lambda xp, b, ax: xp.argmax(b, axis=_arg_axis(ax, b.ndim))),
-    "median": _Reducer(associative=False, direct=lambda xp, b, ax: xp.median(b, axis=ax)),
+    "argmin": _Reducer(direct=lambda xp, b, ax: xp.argmin(b, axis=_arg_axis(ax, b.ndim))),
+    "argmax": _Reducer(direct=lambda xp, b, ax: xp.argmax(b, axis=_arg_axis(ax, b.ndim))),
+    "median": _Reducer(direct=lambda xp, b, ax: xp.median(b, axis=ax)),
 }
 
 
@@ -127,6 +161,132 @@ def _normalize_axes(axis, ndim) -> Tuple[int, ...]:
             raise ValueError(f"axis {a} out of bounds for ndim {ndim}")
         out.append(a)
     return tuple(sorted(set(out)))
+
+
+def _stream_accumulators(arr, R, input_slices, names, strip_bytes, device):
+    """``{name: state}`` for the kept region ``input_slices`` (reduced axes full) from
+    ONE streaming pass: the largest reduced axis is read in bounded chunks and every
+    block is fed to every accumulator in ``names``. This is what makes ``x.mean()`` and
+    ``x.std()`` together cost one pass, not two."""
+    kept_elems = 1
+    for a, s in enumerate(input_slices):
+        if a not in R:
+            kept_elems *= s.stop - s.start
+    if R:
+        chunk_axis = builtins.max(R, key=lambda a: arr.shape[a])
+        other_reduced = 1
+        for a in R:
+            if a != chunk_axis:
+                other_reduced *= arr.shape[a]
+        denom = builtins.max(1, kept_elems * other_reduced * arr.dtype.itemsize)
+        chunk_len = builtins.max(1, int(strip_bytes // denom))
+        size = arr.shape[chunk_axis]
+        # an empty reduced axis still reads one (empty) block, so the result is numpy's
+        # (sum -> 0, min -> raises) instead of no state at all
+        starts = range(0, size, chunk_len) if size else (0,)
+    else:
+        chunk_axis, starts = None, (0,)
+    dev = resolve_device(device)
+    states = dict.fromkeys(names)
+    for c in starts:
+        slices = list(input_slices)
+        if chunk_axis is not None:
+            slices[chunk_axis] = slice(c, builtins.min(size, c + chunk_len))
+        block = to_device(arr._read_direct(tuple(slices)), dev)
+        xp = array_namespace(block)
+        for name in names:
+            acc = _ACCUMULATORS[name]
+            p = acc.partial(xp, block, R)
+            states[name] = p if states[name] is None else acc.combine(xp, states[name], p)
+    return states
+
+
+def _state_to_host(state):
+    if isinstance(state, tuple):
+        return tuple(np.asarray(asnumpy(s)) for s in state)
+    return np.asarray(asnumpy(state))
+
+
+def _state_slice(state, idx, dev):
+    if isinstance(state, tuple):
+        return tuple(to_device(np.asarray(s[idx]), dev) for s in state)
+    return to_device(np.asarray(state[idx]), dev)
+
+
+def _acc_nbytes(arr, R, names):
+    """Bytes of the cached states of ``names`` for ``arr`` reduced over ``R``."""
+    kept = 1
+    for a in range(arr.ndim):
+        if a not in R:
+            kept *= arr.shape[a]
+    sample = np.zeros((1,) * arr.ndim, dtype=arr.dtype)
+    per = 0
+    for name in names:
+        st = _ACCUMULATORS[name].partial(np, sample, R)
+        per += builtins.sum(np.asarray(s).dtype.itemsize
+                            for s in (st if isinstance(st, tuple) else (st,)))
+    return kept * per
+
+
+def _bundle(arr, R, names):
+    """``names`` plus the statistics worth computing in the same pass (see the comment
+    at _CHEAP_GROUP), when the whole bundle fits the cache cap. Otherwise just
+    ``names``: the results are identical either way, only the sharing is lost."""
+    names = set(names)
+    # an empty input is left alone: min/max raise on it where sum/mean do not
+    if not names & _BUNDLE_TRIGGERS or arr.dtype.kind not in "biuf" or arr.size == 0:
+        return names
+    wider = names | _CHEAP_GROUP
+    return wider if _acc_nbytes(arr, R, wider) <= _CACHE_MAX_BYTES else names
+
+
+class _StatsCache:
+    """Cached accumulator states of the associative reductions of ONE input array:
+    ``{(axes, device): {accumulator name: host state}}``.
+
+    It lives on the INPUT, so every reduction of that array finds it: a second
+    ``a.mean()`` call, ``a.std()`` after ``a.var()``, ``a.max()`` after ``a.mean()``.
+    States are cached raw (sum, not mean), so keepdims and ddof apply per reader."""
+
+    def __init__(self):
+        self.entries = {}
+        self.lock = threading.Lock()
+
+    def get(self, key, name):
+        return self.entries.get(key, {}).get(name)
+
+    def ensure(self, arr, R, device, names, strip_bytes):
+        """Compute the missing states of ``names`` (plus their bundle) in one pass;
+        concurrent callers wait for it."""
+        key = (R, device)
+        if builtins.all(self.get(key, n) is not None for n in names):
+            return
+        with self.lock:
+            have = self.entries.get(key, {})
+            if not set(names) - set(have):
+                return
+            missing = _bundle(arr, R, names) - set(have)
+            full = [slice(0, n) for n in arr.shape]
+            states = _stream_accumulators(arr, R, full, sorted(missing), strip_bytes, device)
+            self.entries[key] = {**have, **{n: _state_to_host(s) for n, s in states.items()}}
+            _CACHED.add(self)
+
+    def clear(self, key):
+        with self.lock:
+            self.entries.pop(key, None)
+
+    def clear_cache(self):
+        with self.lock:
+            self.entries.clear()
+        _CACHED.discard(self)
+
+
+def _stats_of(arr, create=True):
+    """The _StatsCache of input ``arr`` (created on first use)."""
+    stats = arr.__dict__.get("_reduction_stats")
+    if stats is None and create:
+        stats = arr.__dict__.setdefault("_reduction_stats", _StatsCache())
+    return stats
 
 
 class ReduceTransform(Transform):
@@ -162,6 +322,8 @@ class ReduceTransform(Transform):
         self.dtype = self._infer_dtype()
 
         # Small outputs are computed once and kept (see the module docstring).
+        # Associative results are cached on the INPUT (_StatsCache, shared with sibling
+        # reductions); non-associative ones (argmin/argmax/median) here on the node.
         nbytes = int(np.prod(self.shape, dtype=np.int64)) * np.dtype(self.dtype).itemsize
         self.cacheable = nbytes <= _CACHE_MAX_BYTES
         self._cache = None
@@ -178,15 +340,21 @@ class ReduceTransform(Transform):
         return f"{self.reducer_name}(axis={self.R}) -> {tuple(self.shape)}"
 
     # --- cache ---------------------------------------------------------------------
-    def _set_cache(self, full):
-        """Store the FULL output (host, output shape) unless another thread already did."""
-        with self._cache_lock:
-            if self._cache is None:
-                self._cache = np.asarray(asnumpy(full))
-                _CACHED.add(self)
+    def _cached_state(self):
+        stats = _stats_of(self.array, create=False)
+        return None if stats is None else stats.get((self.R, self.device), self.reducer.acc)
+
+    def is_cached(self):
+        if self.reducer.associative:
+            return self._cached_state() is not None
+        return self._cache is not None
 
     def ensure_cached(self):
         """Compute and cache the full output once; concurrent callers wait for it."""
+        if self.reducer.associative:
+            _stats_of(self.array).ensure(self.array, self.R, self.device,
+                                         {self.reducer.acc}, self.strip_bytes)
+            return
         if self._cache is not None:
             return
         with self._cache_lock:
@@ -197,9 +365,14 @@ class ReduceTransform(Transform):
             _CACHED.add(self)
 
     def clear_cache(self):
+        """Forget this result - and, for an associative one, the sibling statistics
+        cached with it (same input, same axes)."""
         with self._cache_lock:
             self._cache = None
         _CACHED.discard(self)
+        stats = _stats_of(self.array, create=False)
+        if stats is not None:
+            stats.clear((self.R, self.device))
 
     def _infer_dtype(self):
         sample = np.ones((2,) * self.array.ndim, dtype=self._in_dtype)
@@ -212,46 +385,34 @@ class ReduceTransform(Transform):
         if not self.reducer.associative:
             res = self.reducer.direct(np, sample, self.R)
         else:
-            state = self.reducer.partial(np, sample, self.R)
+            state = _ACCUMULATORS[self.reducer.acc].partial(np, sample, self.R)
             res = self.reducer.finalize(np, state, 2 ** len(self.R), self.ddof)
         return np.asarray(res).dtype
 
     def _stream(self, input_slices):
-        """Reduce over self.R. Associative reducers stream the largest reduced axis in
-        bounded chunks + combine; non-associative ones read the reduced axis whole."""
+        """Reduce the kept region ``input_slices`` over self.R: from the cached state
+        when there is one, else by streaming the reduced axis (associative) or reading
+        it whole (non-associative)."""
         arr = self.array
+        dev = resolve_device(self.device)
         if not self.reducer.associative:
-            block = to_device(arr._read_direct(tuple(input_slices)), resolve_device(self.device))
+            block = to_device(arr._read_direct(tuple(input_slices)), dev)
             xp = array_namespace(block)
             if block.size == 0:      # empty kept region: numpy median/argmin choke -> build empty
                 empty_shape = tuple(s for i, s in enumerate(block.shape) if i not in self.R)
                 return xp.empty(empty_shape, dtype=self.dtype)
             return self.reducer.direct(xp, block, self.R)
-        kept_elems = 1
-        for a in self.kept:
-            s = input_slices[a]
-            kept_elems *= (s.stop - s.start)
-        chunk_axis = builtins.max(self.R, key=lambda a: arr.shape[a])
-        other_reduced = 1
-        for a in self.R:
-            if a != chunk_axis:
-                other_reduced *= arr.shape[a]
-        denom = builtins.max(1, kept_elems * other_reduced * self._in_dtype.itemsize)
-        chunk_len = builtins.max(1, int(self.strip_bytes // denom))
-
-        size = arr.shape[chunk_axis]
-        acc = None
-        for c in range(0, size, chunk_len):
-            slices = list(input_slices)
-            slices[chunk_axis] = slice(c, builtins.min(size, c + chunk_len))
-            block = to_device(arr._read_direct(tuple(slices)), resolve_device(self.device))
-            xp = array_namespace(block)
-            p = self.reducer.partial(xp, block, self.R)
-            acc = p if acc is None else self.reducer.combine(xp, acc, p)
+        state = self._cached_state()
+        if state is not None:
+            state = _state_slice(state, tuple(input_slices[a] for a in self.kept), dev)
+        else:
+            state = _stream_accumulators(arr, self.R, input_slices, (self.reducer.acc,),
+                                         self.strip_bytes, self.device)[self.reducer.acc]
+        xp = array_namespace(state[0] if isinstance(state, tuple) else state)
         count = 1
         for a in self.R:
             count *= arr.shape[a]
-        return self.reducer.finalize(xp, acc, count, self.ddof)
+        return self.reducer.finalize(xp, state, count, self.ddof)
 
     def read(self, key):
         if not isinstance(key, tuple):
@@ -261,7 +422,7 @@ class ReduceTransform(Transform):
         # first FULL read; a partial read of an uncached one stays blockwise - only the
         # kept-axis tile asked for is streamed - so e.g. mip[0:10, 0:10] never pays for
         # the whole projection just because the projection would fit the cache.
-        if self._cache is None and self.cacheable and _is_full_key(key, self.shape):
+        if self.cacheable and not self.is_cached() and _is_full_key(key, self.shape):
             self.ensure_cached()
         cached = self._cache
         if cached is not None:
@@ -270,7 +431,7 @@ class ReduceTransform(Transform):
 
     def _read_uncached(self, key):
         out_ndim = len(self.shape)
-        input_slices = [slice(None)] * self.array.ndim   # reduced axes stay full (streamed)
+        input_slices = [slice(0, n) for n in self.array.shape]   # reduced axes stay full
         params = []                                       # (start, stop, step, is_int) per out axis
         for oi in range(out_ndim):
             k = key[oi]
@@ -285,7 +446,7 @@ class ReduceTransform(Transform):
             in_axis = oi if self.keepdims else self.kept[oi]
             if in_axis in self.kept:
                 # contiguous read on this kept input axis; step/int applied after reduce
-                input_slices[in_axis] = slice(start, stop)
+                input_slices[in_axis] = slice(start, builtins.max(start, stop))
             # keepdims reduced axis: read stays full; its size-1 output handled in the crop
 
         block = self._finish(self._stream(input_slices))  # kept-axis order, reduced axes gone
@@ -313,50 +474,6 @@ def _is_full_key(key, shape):
     return True
 
 
-def _stream_group(transforms):
-    """Full results of several associative reductions of the SAME input over the SAME
-    axes, from ONE streaming pass: each bounded block is read once and fed to every
-    reducer. This is what makes ``x.mean()`` and ``x.std()`` cost one pass, not two."""
-    t0 = transforms[0]
-    arr = t0.array
-    R = t0.R
-    kept_elems = 1
-    for a in t0.kept:
-        kept_elems *= arr.shape[a]
-    chunk_axis = builtins.max(R, key=lambda a: arr.shape[a])
-    other_reduced = 1
-    for a in R:
-        if a != chunk_axis:
-            other_reduced *= arr.shape[a]
-    strip = builtins.min(t.strip_bytes for t in transforms)
-    denom = builtins.max(1, kept_elems * other_reduced * t0._in_dtype.itemsize)
-    chunk_len = builtins.max(1, int(strip // denom))
-    dev = resolve_device(t0.device)
-
-    accs = [None] * len(transforms)
-    xp = np
-    size = arr.shape[chunk_axis]
-    for c in range(0, size, chunk_len):
-        slices = [slice(0, n) for n in arr.shape]
-        slices[chunk_axis] = slice(c, builtins.min(size, c + chunk_len))
-        block = to_device(arr._read_direct(tuple(slices)), dev)
-        xp = array_namespace(block)
-        for i, t in enumerate(transforms):
-            p = t.reducer.partial(xp, block, R)
-            accs[i] = p if accs[i] is None else t.reducer.combine(xp, accs[i], p)
-    count = 1
-    for a in R:
-        count *= arr.shape[a]
-    results = []
-    for t, acc in zip(transforms, accs):
-        r = t._finish(t.reducer.finalize(xp, acc, count, t.ddof))
-        if t.keepdims:
-            for a in sorted(R):
-                r = xp.expand_dims(r, a)
-        results.append(r)
-    return results
-
-
 def _reductions_in(array):
     """Every ReduceTransform in ``array``'s chain, upstream first."""
     return [n._transform for n in iter_chain(array)
@@ -379,7 +496,8 @@ def _broadcast_consumers(array):
 def evaluate_small_reductions(array):
     """Compute, before any region is read, the cacheable reductions ``array`` will
     re-read: every 0-d one, and every small one feeding a broadcast operand. Reductions
-    of the same input over the same axes share ONE streaming pass.
+    of the same input over the same axes share ONE streaming pass, together with their
+    bundle (see _bundle).
 
     Called by ``compute()`` and ``io.write``. Partial reads of other small reductions
     are left blockwise (see ReduceTransform.read)."""
@@ -387,28 +505,19 @@ def evaluate_small_reductions(array):
     wanted = {id(t) for t in chain if t.cacheable and len(t.shape) == 0}
     for _node, operand, _axes in _broadcast_consumers(array):
         wanted.update(id(t) for t in _reductions_in(operand) if t.cacheable)
-    targets = [t for t in chain if id(t) in wanted and t._cache is None]
-    if not targets:
-        return
     groups = {}
-    for t in targets:            # insertion order = upstream first
+    for t in chain:              # upstream first
+        if id(t) not in wanted or t.is_cached():
+            continue
         if t.reducer.associative:
-            key = (id(t.array), t.R, t.device)
-            groups.setdefault(key, []).append(t)
+            groups.setdefault((id(t.array), t.R, t.device), []).append(t)
         else:
-            groups[("single", id(t))] = [t]
+            t.ensure_cached()
     for group in groups.values():
-        pending = [t for t in group if t._cache is None]
-        if not pending:
-            continue
-        t0 = pending[0]
-        if (len(pending) == 1 or not t0.reducer.associative or not t0.R
-                or 0 in tuple(t0.array.shape)):
-            for t in pending:
-                t.ensure_cached()
-            continue
-        for t, full in zip(pending, _stream_group(pending)):
-            t._set_cache(full)
+        t0 = group[0]
+        _stats_of(t0.array).ensure(t0.array, t0.R, t0.device,
+                                   {t.reducer.acc for t in group},
+                                   builtins.min(t.strip_bytes for t in group))
 
 
 def find_repeated_reductions(array):
@@ -420,7 +529,7 @@ def find_repeated_reductions(array):
     its own regions only when the shapes agree)."""
     found = []
     for node, operand, axes in _broadcast_consumers(array):
-        heavy = [t for t in _reductions_in(operand) if not t.cacheable and t._cache is None]
+        heavy = [t for t in _reductions_in(operand) if not t.cacheable and not t.is_cached()]
         if heavy:
             found.append((tuple(node.shape), axes, heavy[-1].describe()))
     return found

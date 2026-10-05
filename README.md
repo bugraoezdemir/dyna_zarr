@@ -18,18 +18,19 @@ from dyna_zarr import io, operations as ops
 vol = io.read("volume.zarr")                             # nothing read yet
 
 smoothed = ops.gaussian_filter(vol, sigma=(1, 2, 2))     # halo filter, still lazy
-level    = smoothed.mean() + 3 * smoothed.std()          # streaming, one pass
-mask     = ops.greater(smoothed, level).astype("uint8")  # lazy threshold
+mask     = (smoothed > 0.5).astype("uint8")              # lazy threshold
 
 io.write(mask, "mask.zarr", region_size_mb=64, max_workers=4)
 ```
 
-Only the last line touches the disk. The halo filter, the two reductions and the
-threshold are fused into one pull-based chain, and `io.write` streams it region by
-region, so peak RAM is set by the region budget and not by the size of the volume:
-a 2 GB array costs the same as a 200 MB one. The result is identical to the
-equivalent eager NumPy/SciPy code,
+Only the last line touches the disk. The halo filter and the threshold are fused into
+one pull-based chain, and `io.write` streams it region by region, so peak RAM is set
+by the region budget and not by the size of the volume: a 2 GB array costs the same
+as a 200 MB one. The result is identical to the equivalent eager NumPy/SciPy code,
 including at region boundaries.
+
+A threshold computed from the data itself, such as `smoothed.mean() + 3 * smoothed.std()`,
+works the same way; see [Reductions and statistics](#reductions-and-statistics).
 
 ## Memory-boundedness
 
@@ -38,15 +39,15 @@ There are two ways to run a lazy result, with different memory behavior:
 - `io.write(result, path)` streams the result to disk region by region. Peak RAM is set by `region_size_mb`, `max_workers` and the dtypes in the chain, and is **independent of the array size**. This is the memory-bounded path; see [What peak RAM actually is](#what-peak-ram-actually-is).
 - `result.compute()` returns a single in-memory NumPy array. It materializes the whole result by design (mirroring `dask.array.compute`).
 
-Every operation is memory-bounded on the `io.write` path except `median`, `argmin`, and `argmax`, which are flagged in the operations catalog below.
+Every operation is memory-bounded on the `io.write` path except `median`, `argmin`, `argmax`, and `unique`, which are flagged in the operations catalog below.
 
 ## Features
 
 - **Pull-based and lazy.** Operations defer until `.compute()` (materialize) or `io.write` (stream to disk).
-- **Memory-bounded streaming.** Region-wise `io.write` with per-worker memory and worker-count knobs. Even reshape, flatten, and rechunk of incompatibly-chunked data stay bounded, by staging through disk.
+- **Memory-bounded streaming.** Region-wise `io.write` with per-worker memory and worker-count knobs. Even reshape and flatten stay bounded, by staging through local disk.
 - **NumPy-like.** Operator overloads, array methods (`.astype`, `.clip`, `.round`), and the NumPy ufunc protocol (`np.sqrt(a)`, `np.add(a, 2)`) all work on a `DynamicArray`.
 - **Rich op set.** About 140 operations: pointwise ufuncs, streaming reductions, neighborhood (halo) filters, structural reshaping, differences, prefix scans, and array creation.
-- **Multi-format I/O.** Read TIFF, Zarr v2, and Zarr v3 (local, S3/GCS, HTTP); write Zarr v2/v3 with optional sharding. Optionally, [zarrista](https://github.com/developmentseed/zarrista) can serve reads and writes in place of the default.
+- **Multi-format I/O.** Read TIFF, Zarr v2, and Zarr v3 (local, S3/GCS, HTTP); write Zarr v2/v3 (local, S3/GCS) with optional sharding. Optionally, [zarrista](https://github.com/developmentseed/zarrista) can serve reads and writes in place of the default.
 - **Optional GPU.** Run an op chain on CUDA via CuPy, with a single host-to-device transfer per region.
 
 ## Installation
@@ -116,8 +117,14 @@ io.write(arr, "out_bounded.zarr", region_size_mb=64, max_workers=4)
 path that already holds one raises an error. Choose a new path, or pass
 `overwrite=True` to replace a local array. Only a path that already looks like a Zarr
 store is removed, so a mistyped path cannot delete an unrelated directory. (Not yet
-uniform: `backend="zarrista"` and the staged reshape/flatten/scan writes currently
-write into an existing array instead of raising.)
+uniform: with `backend="zarrista"`, writing to an existing array currently writes into
+it instead of raising.)
+
+Unless told otherwise, the output also keeps the input's **Zarr format, compressor and
+sharding**, so reading an array and writing it back gives the same kind of store. A
+source that has no Zarr format of its own (a NumPy array, a TIFF, a generated array
+such as `ops.zeros`) is written as Zarr v3 with Blosc/LZ4. Passing `zarr_format=`,
+`compressor=` or `shard_coefficients=` overrides each of them.
 
 #### Output chunks
 
@@ -145,13 +152,16 @@ What `chunk_size_mb=1` gives for a few sources:
 | `(300, 1024, 1024)` | float32 | `(64, 256, 256)` | `(64, 256, 256)` | `(4, 256, 256)` |
 | `(2048, 2048)` | float32 | `(2048, 2048)` | `(2048, 2048)` | `(512, 512)` |
 
-When the source has no chunk grid to align to, the budget alone decides: the chunk is
-made isotropic over the **last three axes** (both axes for a 2D array), with every
-leading axis at 1, on the assumption that the trailing axes are spatial and the leading
-ones are t/c. A cube rather than a slab matters for what comes next: a `(1, 256, 1024)`
-chunk of the same size would force a full XY plane to be read for every step along Z.
-With no `chunk_size_mb=` in that case, the budget is 1 MiB, for example `(64, 64, 64)`
-for a float32 volume.
+When the source has no chunk grid to align to (a reshaped or padded array, for
+example), the budget alone decides. The chunk gets **power-of-two sides**, as close to
+a cube over the **last three axes** as the budget allows (both axes for a 2D array),
+with every leading axis at 1, on the assumption that the trailing axes are spatial and
+the leading ones are t/c. A cube rather than a slab matters for what comes next: a
+`(1, 256, 1024)` chunk of the same size would force a full XY plane to be read for
+every step along Z. With no `chunk_size_mb=` in that case, the budget is 1 MiB:
+`(64, 64, 64)` for float32, `(64, 128, 128)` for uint8, `(32, 64, 64)` for float64.
+Generated arrays (`ops.zeros`, `ops.random`, ...) get the same grid unless you pass
+`chunks=` to them.
 
 ```python
 io.write(arr, "out_1mb.zarr", chunk_size_mb=1)          # budget, aligned to the source
@@ -181,10 +191,10 @@ large numbers of small files. Supported only with `zarr_format=3`.
 
 #### Regions vs chunks
 
-An important concept in dyna-zarr is the concept of regions. Regions are subsets of an array just similar to chunks. The two, however, are completely different:
+An important concept in dyna-zarr is the concept of regions. Regions are subsets of an array, similar to chunks. The two, however, are completely different:
 
 - **`chunks`** is the *storage* grid: what lands on disk.
-- **`region_shape`** (or `region_size_mb`) is the *read* grid: how much is pulled through the operation chain at a time, and therefore what bounds peak RAM. Typically a region contains multiple chunks. **Regions are purely a performance parameters and different region sizes supplied to the write function will lead to byte-identical output.**
+- **`region_shape`** (or `region_size_mb`) is the *read* grid: how much is pulled through the operation chain at a time, and therefore what bounds peak RAM. Typically a region contains multiple chunks. **Regions are purely a performance parameter and different region sizes supplied to the write function will lead to byte-identical output.**
 
 By default, `region_size_mb` controls the region size (8 MiB if not given). The region shape is then chosen automatically from that budget, the output chunks, the input chunks and the widest dtype in the chain. The other parameter, `region_shape`, sets the dimensions of the region directly. The two are alternatives: passing both is an error.
 
@@ -291,9 +301,72 @@ blurred  = ops.convolve(img, kernel)
 io.write(blurred, "blurred.zarr")
 ```
 
+### Reductions and statistics
+
+Reductions are lazy, like every other operation. `vol.mean()` returns a `DynamicArray`
+and nothing is read until it is needed. A one-element result converts on demand with
+`float()`, `int()` or `bool()`.
+
+```python
+vol      = io.read("volume.zarr")
+smoothed = ops.gaussian_filter(vol, sigma=(1, 2, 2))
+level    = smoothed.mean() + 3 * smoothed.std()          # lazy, 0-d
+mask     = (smoothed > level).astype("uint8")            # nd compared with 0-d
+
+io.write(mask, "mask_3sd.zarr", region_size_mb=64, max_workers=4)
+print(float(level))                                      # already computed, no extra read
+```
+
+The threshold depends on every voxel, so the volume has to be read twice: once for the
+statistics and once for the write. That is what dyna does. Before the first region is
+written, `io.write` computes the small reductions in the chain, in one pass for those
+that read the same input (`mean` and `std` above share it). Results of up to 1 MiB,
+such as a 0-d statistic or per-channel values, are then kept in memory, so every region
+reuses them and a later `float(level)` costs nothing.
+
+These results are kept with the array they were computed from, so a later
+`smoothed.max()` does not read anything either. When dyna computes any of `min`, `max`,
+`sum` or `mean`, it computes the other three in the same pass, since they cost very
+little next to reading the data. `var` and `std` need a float64 sum of squares, which
+costs roughly as much as the read itself, so they are only computed when you ask for
+them. If you do, the rest comes along. This works for reductions along any axis, as
+long as the whole set still fits in 1 MiB.
+
+The cache assumes the data does not change underneath. If you rewrite a source in
+place, call `io.clear_cache()` (or `arr.clear_cache()` for one array) and the next read
+recomputes.
+
+Shapes broadcast like in NumPy, so a reduction with `keepdims=True` can be combined
+with the full array:
+
+```python
+centred = vol - vol.mean(axis=0, keepdims=True)
+```
+
+An important point is that a larger result like this one, broadcast back over the axis
+it reduced, is needed in full by every region along that axis. When it fits the region
+budget, `io.write` shapes the regions to span that axis, so it is still read once. When
+it does not, dyna recomputes it for each region and warns with the number of repeats
+(`RepeatedReductionWarning`). The result is correct either way. To compute it only
+once, persist it first:
+
+```python
+m = vol.mean(axis=0, keepdims=True).persist()    # computed once, into a temporary store
+io.write(vol - m, "centred.zarr")
+```
+
+`persist()` writes to a temporary Zarr store that is removed when nothing uses it
+anymore, or to a path you give it (`persist("mean.zarr")`). A result of up to 1 MiB is
+simply kept in memory.
+
+`histogram` is lazy as well and returns `(counts, edges)` like `numpy.histogram`.
+Without `range=`, finding the range takes one extra pass. `unique` is the exception:
+the length of its result depends on the data, so it runs immediately and returns a
+NumPy array.
+
 ## Operations catalog
 
-About 140 operations, plus the three primitives they are built from. All are available flat on `dyna_zarr.operations` (`ops.gaussian_filter`) and also grouped by category submodule (`ops.neighborhood.gaussian_filter`). Every operation is lazy except `histogram` and `unique`, which run immediately and return NumPy results. Every operation is memory-bounded on the `io.write` path except `median`, `argmin`, and `argmax` (see Memory-boundedness), and `unique`, whose memory grows with the number of distinct values.
+About 140 operations, plus the three primitives they are built from. All are available flat on `dyna_zarr.operations` (`ops.gaussian_filter`) and also grouped by category submodule (`ops.neighborhood.gaussian_filter`). Every operation is lazy except `unique`, which runs immediately and returns a NumPy array. Every operation is memory-bounded on the `io.write` path except `median`, `argmin`, and `argmax` (see Memory-boundedness), and `unique`, whose memory grows with the number of distinct values.
 
 - **Pointwise, unary.**
   - Arithmetic and rounding: `abs`, `fabs`, `negative`, `positive`, `sign`, `sqrt`, `cbrt`, `square`, `reciprocal`, `floor`, `ceil`, `trunc`, `rint`, `round`, `clip`, `astype`, `conjugate`.
@@ -306,15 +379,15 @@ About 140 operations, plus the three primitives they are built from. All are ava
   - Comparisons: `greater`, `greater_equal`, `less`, `less_equal`, `equal`, `not_equal`.
   - Logical: `logical_and`, `logical_or`, `logical_xor`, `logical_not`.
   - Selection and binning: `where`, `isin`, `digitize`.
-- **Reductions.** Streaming and memory-bounded, with `axis=` and `keepdims=`: `min`, `max`, `sum`, `prod`, `mean`, `any`, `all`, `var`, `std`. Not fully bounded (hold the full reduced axis): `median`, `argmin`, `argmax`. Whole-array and eager: `histogram` (returns `(counts, bin_edges)` like `numpy.histogram`, memory-bounded) and `unique` (a sorted array of the distinct values, bounded by how many there are).
+- **Reductions.** Streaming and memory-bounded, with `axis=` and `keepdims=`: `min`, `max`, `sum`, `prod`, `mean`, `any`, `all`, `var`, `std`. Not fully bounded (hold the full reduced axis): `median`, `argmin`, `argmax`. Whole-array: `histogram` (lazy, returns `(counts, bin_edges)` like `numpy.histogram`, memory-bounded) and `unique` (eager, a sorted array of the distinct values, bounded by how many there are). See [Reductions and statistics](#reductions-and-statistics).
 - **Neighborhood (halo/overlap).** `gaussian_filter`, `uniform_filter`, `median_filter`, `minimum_filter`, `maximum_filter`, `grey_erosion`, `grey_dilation`, `convolve`, `correlate`, `laplace`, `gaussian_laplace`, `gaussian_gradient_magnitude`.
-- **Structural.** `concatenate`, `stack`, `transpose`, `swap_axes`, `reshape`, `flatten`, `squeeze`, `expand_dims`, `pad`, `tile`, `roll`, `flip`, `rot90`, `slice_array`.
+- **Structural.** `concatenate`, `stack`, `transpose`, `swap_axes`, `reshape`, `flatten`, `squeeze`, `expand_dims`, `pad`, `tile`, `roll`, `flip`, `rot90`, `slice_array`. Slicing follows NumPy, including negative steps (`arr[::-1]`). `pad` reads only what it needs at the borders, except for the statistic modes (`mean`, `median`, `maximum`, `minimum`, `linear_ramp`), which need the whole axis.
 - **Differences.** `diff`, `gradient`.
 - **Scan (prefix, along one axis).** `cumsum`, `cumprod`, `cummax`, `cummin`. Streamed with a bounded carry on the `io.write` path, so memory-bounded despite the sequential dependency.
 - **Creation.** `zeros`, `ones`, `full`, `empty`, `random`, and `zeros_like`, `ones_like`, `full_like`, `empty_like`. `random` is position-deterministic, so the result is independent of chunking.
 - **Primitives.** `map_blocks` (pointwise), `map_overlap` (neighborhood with a halo), `reduce` (streaming). Use these to build your own ops.
 
-## Memory-bounded reshape, flatten, and rechunk
+## Memory-bounded reshape and flatten
 
 C-order reshape and flatten conflict with n-dimensional chunk layout, so a naive implementation blows up. dyna-zarr stages these through disk (a Rechunker-style two-phase, read-once/write-once copy), so peak RAM stays a function of the per-worker budget rather than the array size. When you `io.write` an outermost `reshape` or `flatten`, this path is used automatically:
 
@@ -326,6 +399,19 @@ io.write(ops.flatten(arr), "flat.zarr", region_size_mb=128, max_workers=2)
 io.write(ops.reshape(arr, (a, b)), "reshaped.zarr")   # (a, b) is any target shape of the same size
 ```
 
+The staging happens in the system temp directory (set `TMPDIR`, or `TEMP` on Windows,
+to move it), never next to the output, so the output can also be remote. It needs free
+local disk of up to about 2x the uncompressed array for `flatten` and 3x for `reshape`.
+dyna checks this before anything is written and stops with an error that says how much
+is needed and where. An outermost scan (`cumsum` and friends) is streamed with a bounded
+carry and needs no staging. Everything else about the output (format, chunks,
+compression, sharding, backend, `overwrite`) works as for any other write. Note that
+`region_shape`, `memory_budget_mb` and `num_readers` belong to the region pipeline and
+are refused for these writes.
+
+Changing only the chunk grid needs no special call: `io.write(arr, path, chunks=...)`
+streams it like any other write.
+
 ## GPU (optional)
 
 With a CuPy install, run a chain on the GPU. Setting `device='cuda'` on a terminal call (`compute` or `io.write`) makes device-inheriting ops run on the GPU. A single host-to-device transfer happens at the first CUDA op and the data stays resident up the chain. Results are returned or written from the host.
@@ -335,6 +421,33 @@ result = ops.gaussian_filter(arr, sigma=3)
 out = result.compute(device="cuda")          # whole chain on the GPU
 io.write(result, "out_gpu.zarr", device="cuda")  # per-region GPU compute, streamed write
 ```
+
+## Remote storage
+
+Both backends read and write `s3://` and `gs://` arrays, and read `http(s)://` ones,
+with the same `storage_options`. Credentials come from the usual environment variables
+(and `~/.aws` for S3). For any non-AWS S3 (MinIO, Ceph, ...), pass the endpoint:
+
+```python
+opts = {"endpoint": "https://s3.example.org",
+        "region": "us-east-1",
+        "virtual_hosted_style_request": False}
+
+arr = io.read("s3://bucket/image.zarr", storage_options=opts)
+io.write(arr, "s3://bucket/out.zarr", storage_options=opts)
+io.write(arr, "s3://bucket/out2.zarr", backend="zarrista", storage_options=opts)
+```
+
+Add `"skip_signature": True` for a public bucket without credentials. Note that
+TensorStore's AWS client may log that `~/.aws/config` or `~/.aws/credentials` cannot be
+found. That is harmless when the credentials come from the environment.
+
+The default TensorStore backend understands `endpoint`, `region`, `skip_signature`,
+`virtual_hosted_style_request` and `client_options={"allow_http": ...}`, and refuses
+anything else with an error rather than ignoring it. It takes no credentials in
+`storage_options`, and `skip_signature` needs tensorstore 0.1.72 or newer. It cannot
+write over plain `http(s)://` (its HTTP store is read-only) and has no store for `az://`.
+`backend="zarrista"` covers both; see below.
 
 ## zarrista backend (optional)
 
@@ -356,7 +469,7 @@ Note that the default backend is tensorstore. Zarrista backend needs to be expli
 arr = io.read("image.zarr", backend = "zarrista")
 ```
 
-Remote stores (`s3://`, `gs://`, `az://`, `http://`) are read **and** written through zarrista's async API over [obstore](https://github.com/developmentseed/obstore), which the `[zarrista]` extra installs. Credentials come from obstore's usual environment variables. It is possible to pass custom options with `storage_options`, which then goes directly to `obstore.store.from_url`:
+With zarrista, remote stores (`s3://`, `gs://`, `az://`, `http://`) are read **and** written through zarrista's async API over [obstore](https://github.com/developmentseed/obstore), which the `[zarrista]` extra installs. Credentials come from obstore's usual environment variables. It is possible to pass custom options with `storage_options`, which then goes directly to `obstore.store.from_url`:
 
 ```python
 opts = {"endpoint": "https://s3.example.org",       # any non-AWS S3: MinIO, Ceph, ...
@@ -392,21 +505,24 @@ The tradeoff is that only operations that fit this slice-pushdown model belong i
 Two more differences worth knowing:
 
 - **Single machine, for now.** Parallelism today is threaded I/O within one process, plus the optional GPU path. There is no cluster or distributed execution yet; better and process-based parallelism is a possible future direction.
-- **Narrower surface.** About 140 operations today, extended where the slice-pushdown model permits. Binary ops also need equal-shaped operands (no general broadcasting between differently shaped lazy arrays yet).
+- **Narrower surface.** About 140 operations today, extended where the slice-pushdown model permits.
 
 ## Core components
 
 - `io.read(source, backend=..., storage_options=...)` reads TIFF, Zarr v2, or Zarr v3 (local or remote) into a `DynamicArray`; `backend` is `"tensorstore"` (default) or the optional `"zarrista"`.
-- `io.write(array, path, ...)` streams a `DynamicArray` to Zarr v2/v3 (chunks, sharding, compression, dtype cast, `region_size_mb` or `region_shape`, `max_workers`, `device`, `backend`, `storage_options`).
+- `io.write(array, path, ...)` streams a `DynamicArray` to Zarr v2/v3, locally or remotely. Output: `zarr_format`, `chunks` or `chunk_size_mb`, `shard_coefficients`, `compressor`, `dtype`, `overwrite`. Pipeline: `region_size_mb` or `region_shape`, `max_workers`, `num_readers`, `memory_budget_mb`, `device`. Storage: `backend`, `storage_options`.
+- `io.clear_cache()` forgets the cached small reductions (see [Reductions and statistics](#reductions-and-statistics)).
 - `operations` is the lazy op set above.
-- `DynamicArray` is the pull-based lazy array (slicing, `.compute()`, operators, `.astype`/`.clip`/`.round`, ufunc protocol).
+- `DynamicArray` is the pull-based lazy array (slicing, `.compute()`, `.persist()`, operators with NumPy broadcasting, lazy reductions such as `.mean()`, `.astype`/`.clip`/`.round`, ufunc protocol, `.shape`/`.dtype`/`.chunks`/`.size`/`.nbytes`).
 - `Codecs` is the compression configuration for Zarr v2 and v3.
 - `backends.zarrista_backend` implements the optional `backend="zarrista"` path used by `io.read` and `io.write`.
 
 ## Running the tests
 
-`[dev]` installs the tooling only. Tests for the optional backends are marked, so
-they are selected explicitly rather than skipped silently:
+`[dev]` installs the tooling only, including [moto](https://github.com/getmoto/moto),
+an in-process S3 emulator for the remote-storage tests, so they never touch a real
+cloud store. Tests for the optional backends are marked, so they are selected
+explicitly rather than skipped silently:
 
 ```bash
 pip install -e ".[dev]"
@@ -421,13 +537,18 @@ pytest -m gpu                           # needs a CUDA device
 
 CI runs the core suite on Linux, Windows, and macOS across Python 3.11-3.13, the
 zarrista suite on all three OSes as a separate job, and a wheel install-check on each
-OS. The GPU tests are **not** run by CI, since GitHub's standard runners have no CUDA
-device, so run `-m gpu` locally on each platform you support before releasing a
-change to the device path.
+OS. A separate job installs every dependency at its **minimum** version on Python 3.11
+and runs the suite there, so the version floors below are tested, not guessed. The
+GPU tests are **not** run by CI, since GitHub's standard runners have no CUDA device,
+so run `-m gpu` locally on each platform you support before releasing a change to the
+device path.
 
 ## Requirements
 
 - Python 3.11 or newer
-- zarr 3.0.0+, numpy 1.20+, scipy 1.6+, tensorstore, tifffile
+- zarr 3.1.5+, numpy 1.26+, scipy 1.10+, tensorstore 0.1.62+, tifffile 2025.5.21+
+- tensorstore 0.1.77 to 0.1.84 are excluded: after any S3 access they crash when the
+  Python process exits (seen on Windows), which turns a finished job into a failure.
 - Optional: CuPy (via the `gpu-cuXX` extras) for the GPU path
-- Optional: zarrista + obstore (via the `zarrista` extra) for the faster storage backend
+- Optional: zarrista + obstore (via the `zarrista` extra) for the faster storage backend;
+  this extra also needs numpy 2.1+

@@ -6,7 +6,9 @@ The contract under test:
 - Reduction METHODS are lazy (like operations.<reducer>); a one-element result
   converts on demand (float/int/bool/index).
 - Tier 1: a reduction with output <= 1 MiB is computed once, fused with its siblings
-  on the same input, and cached until io.clear_cache() / arr.clear_cache().
+  on the same input, and cached until io.clear_cache() / arr.clear_cache(). The cache
+  lives on the input, and a cached min/max/sum/mean brings the other three along
+  (var/std bring all of them) when the bundle fits the same 1 MiB.
 - Tier 2: a larger reduction stays blockwise. Broadcast back over the axes it reduced,
   io.write spans those axes when the region budget allows, else warns with the repeat
   count and recomputes; persist() computes it once.
@@ -269,6 +271,91 @@ def test_projection_is_blockwise_not_recomputed_per_region(tmp_path, source_read
     assert source_reads["n"] / data.size < 1.5          # halo only
     np.testing.assert_allclose(zarr.open_array(str(tmp_path / "mipg.zarr"))[...],
                                ndi.gaussian_filter(data.max(0), 2), atol=1e-6)
+
+
+# --------------------------------------------------------------------------- #
+# Tier 1: statistics cached on the INPUT, computed in bundles
+# --------------------------------------------------------------------------- #
+
+def _passes(source_reads, data):
+    return source_reads["n"] / data.size
+
+
+def test_separate_calls_reuse_the_cache(tmp_path, source_reads):
+    # The cache lives on the input, not on the result node, so a fresh a.mean() hits it.
+    data, a = _vol(tmp_path)
+    assert float(a.mean()) == float(a.mean())
+    assert _passes(source_reads, data) == 1
+
+
+def test_cheap_group_comes_with_any_member(tmp_path, source_reads):
+    data, a = _vol(tmp_path)
+    values = [float(f()) for f in (a.mean, a.min, a.max, a.sum)]
+    assert _passes(source_reads, data) == 1
+    np.testing.assert_allclose(values, [data.mean(), data.min(), data.max(), data.sum()],
+                               rtol=1e-5)
+
+
+def test_mean_does_not_pay_for_std_but_std_brings_everything(tmp_path, source_reads):
+    data, a = _vol(tmp_path)
+    float(a.mean())
+    float(a.std())
+    assert _passes(source_reads, data) == 2         # sum of squares is not bundled with mean
+
+    io.clear_cache()
+    source_reads["n"] = 0
+    float(a.std())
+    values = [float(f) for f in (a.var(), a.std(ddof=1), a.mean(), a.min(), a.max())]
+    assert _passes(source_reads, data) == 1         # ddof applies per reader, not per cache
+    np.testing.assert_allclose(
+        values, [data.var(), data.std(ddof=1), data.mean(), data.min(), data.max()], rtol=1e-5)
+
+
+def test_partial_reductions_bundle_per_axes(tmp_path, source_reads):
+    data, a = _vol(tmp_path)
+    a.mean(axis=0).compute()
+    mx = a.max(axis=0).compute()
+    mn = a.min(axis=0, keepdims=True).compute()     # keepdims applies per reader
+    assert _passes(source_reads, data) == 1
+    np.testing.assert_array_equal(mx, data.max(0))
+    np.testing.assert_array_equal(mn, data.min(0, keepdims=True))
+    a.max(axis=1).compute()                         # other axes: their own pass
+    assert _passes(source_reads, data) == 2
+
+
+def test_bundle_over_the_cap_falls_back_to_the_requested_statistic(source_reads):
+    data = np.zeros((4, 512, 512), "f4")
+    a = DynamicArray(data)
+    a.mean(axis=0).compute()                        # 1 MiB sum fits; 3 MiB bundle does not
+    a.max(axis=0).compute()
+    assert _passes(source_reads, data) == 2
+
+
+@pytest.mark.parametrize("first, then", [("std", "mean"), ("mean", "std"), ("var", "max")])
+def test_results_do_not_depend_on_what_was_cached_first(tmp_path, first, then):
+    data, a = _vol(tmp_path)
+    alone = float(getattr(a, then)())
+    io.clear_cache()
+    float(getattr(a, first)())
+    assert float(getattr(a, then)()) == alone       # bitwise
+
+
+def test_clearing_one_statistic_drops_its_siblings(tmp_path, source_reads):
+    data, a = _vol(tmp_path)
+    m = a.mean()
+    float(m)
+    zarr.open_array(str(tmp_path / "src.zarr"))[...] = data + 1
+    assert float(a.max()) == pytest.approx(float(data.max()))      # cached with the mean
+    m.clear_cache()
+    assert float(a.max()) == pytest.approx(float(data.max()) + 1)  # gone with it
+
+
+def test_empty_input_keeps_numpy_semantics():
+    # the cheap group is not added for an empty input: min would raise where sum does not
+    a = DynamicArray(np.zeros((0, 4), "f4"))
+    assert float(a.sum()) == 0.0
+    with pytest.raises(ValueError):
+        float(a.min())
 
 
 # --------------------------------------------------------------------------- #
