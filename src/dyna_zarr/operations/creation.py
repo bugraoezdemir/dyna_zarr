@@ -1,7 +1,8 @@
 """Creation ops (nullary generative sources): zeros/ones/full/empty/random (+ *_like).
 
-Without ``chunks=``, the array reports a ~1 MiB cube-like grid sized from its dtype, so
-it writes (and tiles) as memory-bounded as a stored array; ``chunks=`` sets it exactly.
+Without ``chunks=``, the array reports a ~1 MiB grid with power-of-two sides, sized from
+its dtype (float32 (64, 64, 64), uint8 (64, 128, 128)), so it writes (and tiles) as
+memory-bounded as a stored array; ``chunks=`` sets it exactly.
 
 These build a lazy DynamicArray from a shape/dtype with no underlying array. The
 GenerativeTransform *synthesizes* whatever region a read asks for, so creation stays
@@ -29,8 +30,8 @@ class GenerativeTransform(Transform):
         self.shape = tuple(int(s) for s in shape)
         self.dtype = np.dtype(dtype)
         # A generated array has no storage grid, so without `chunks=` one is chosen: the
-        # ~1 MiB cube (sized in bytes from THIS dtype, isotropic over the trailing <=3
-        # axes, leading axes 1) that io.write itself picks for a grid-less source. It
+        # ~1 MiB grid (sized in bytes from THIS dtype, power-of-two sides, as near a cube
+        # as that allows over the trailing <=3 axes, leading axes 1) that io.write itself picks for a grid-less source. It
         # used to be the whole array - and since io.write keeps the input grid, writing
         # zeros((300, 1024, 1024)) then stored ONE 1.2 GB chunk, which a region must
         # hold whole, so the write materialized the entire array.

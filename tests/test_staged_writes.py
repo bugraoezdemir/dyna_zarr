@@ -19,6 +19,7 @@ import numpy as np
 import pytest
 import zarr
 
+from dyna_zarr.io import OutputExistsError
 from dyna_zarr import Codecs, io, operations as ops
 from dyna_zarr import rechunk as rechunk_mod
 from dyna_zarr.rechunk import StagingSpaceError, staging_bytes
@@ -93,7 +94,7 @@ def test_staged_write_respects_overwrite(tmp_path, src, kind):
     _write(a[:, :, :4] * 0, str(tmp_path / "decoy.zarr"))       # unrelated array
     shutil.copytree(tmp_path / "decoy.zarr", out)
     # zarr.open(mode="w") used to REPLACE whatever was there, with no error.
-    with pytest.raises(Exception):
+    with pytest.raises(OutputExistsError):
         _write(_lazy(kind, a), str(out))
     assert zarr.open_array(str(out)).shape == (8, 32, 4)         # untouched
     _write(_lazy(kind, a), str(out), overwrite=True)

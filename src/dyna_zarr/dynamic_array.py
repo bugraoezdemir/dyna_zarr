@@ -47,7 +47,8 @@ def _ndarray_to_memory_zarr(arr: np.ndarray, chunks=None) -> zarr.Array:
                 break
             others = int(np.prod(chunks[axis + 1:])) or 1
             chunks[axis] = max(1, min(chunks[axis], target // others))
-        chunks = tuple(int(c) for c in chunks)
+        # a zero-length axis still needs a chunk side of at least 1: zarr >= 3.4 refuses 0
+        chunks = tuple(max(1, int(c)) for c in chunks)
     else:
         chunks = tuple(int(c) for c in chunks)
     z = zarr.create_array(store={}, shape=arr.shape, chunks=chunks, dtype=arr.dtype)
@@ -94,6 +95,16 @@ class _PersistOwner:
         import weakref
         self.tmpdir = tmpdir
         weakref.finalize(self, shutil.rmtree, tmpdir, True)
+
+
+#: Stored as a DynamicArray's shape when it is only known once the data is read.
+_DEFERRED_SHAPE = object()
+
+
+def _shape_of(transform):
+    """The shape to store for a transform's output: deferred when the transform says its
+    shape depends on the data (``shape_deferred``), so building the array reads nothing."""
+    return _DEFERRED_SHAPE if getattr(transform, "shape_deferred", False) else transform.shape
 
 
 def _checked_chunks(transform):
@@ -165,6 +176,20 @@ class DynamicArray:
     def _dtype(self, value):
         self._np_dtype = _as_numpy_dtype(value)
 
+    # The shape is stored the same way, so ONE place handles a shape that is not known
+    # until the data is read (ops.unique: its length depends on the data). Such an array
+    # stores _DEFERRED_SHAPE and asks its transform on every access; the transform computes
+    # its result once, so the first shape need - .shape, .size, compute, write, or building
+    # another op on it - is the one pass, and every internal shape read goes through here.
+    @property
+    def _shape(self):
+        shape = self._shape_value
+        return tuple(self._transform.shape) if shape is _DEFERRED_SHAPE else shape
+
+    @_shape.setter
+    def _shape(self, value):
+        self._shape_value = value if value is _DEFERRED_SHAPE else tuple(value)
+
     def __init__(self, source: Union[zarr.Array, np.ndarray, 'DynamicArray'],
                  chunks: Optional[Tuple[int, ...]] = None):
         _reject_dask(source)
@@ -183,7 +208,7 @@ class DynamicArray:
             self._zarr_array = source._zarr_array
             self._ts_array = source._ts_array
             self._is_tensorstore = source._is_tensorstore
-            self._shape = source._shape
+            self._shape = source._shape_value       # keeps a deferred shape deferred
             self._chunks = source._chunks
             self._dtype = source._dtype
             self._transform = source._transform
@@ -345,6 +370,8 @@ class DynamicArray:
 
     @property
     def ndim(self) -> int:
+        if self._shape_value is _DEFERRED_SHAPE:     # known without the data (unique: 1)
+            return self._transform.ndim
         return len(self._shape)
 
     # numpy/dask array attributes derived from shape and dtype alone - they never read
@@ -498,8 +525,8 @@ class DynamicArray:
         ``path`` - where to store it. Omitted, a result of at most 1 MiB is kept in
         memory and anything larger goes to a temporary Zarr store, deleted when the
         last array reading it is garbage-collected. Given, the store is written there
-        and left in place. Extra keyword arguments (dask's ``scheduler=`` etc.) are
-        accepted and ignored.
+        and left in place; an existing store there raises, as in io.write. Extra
+        keyword arguments (dask's ``scheduler=`` etc.) are accepted and ignored.
         """
         import tempfile
         from .io import io as _io
@@ -630,7 +657,7 @@ class DynamicArray:
         """
         result = DynamicArray(self)
         result._transform = transform
-        result._shape = transform.shape
+        result._shape = _shape_of(transform)
         result._chunks = _checked_chunks(transform)
         result._dtype = transform.dtype
         # Keep zarr metadata from original
@@ -646,7 +673,7 @@ class DynamicArray:
         self._zarr_array = None
         self._ts_array = None
         self._is_tensorstore = False
-        self._shape = tuple(transform.shape)
+        self._shape = _shape_of(transform)
         self._chunks = _checked_chunks(transform)
         self._dtype = np.dtype(transform.dtype)
         self._transform = transform
@@ -820,6 +847,16 @@ def _array_function_registry():
             raise NotImplementedError("np.histogram(density=/weights=) on a DynamicArray")
         return o.histogram(a, bins=bins, range=range)
 
+    def _unique(a, return_index=False, return_inverse=False, return_counts=False,
+                axis=None, *, equal_nan=True, sorted=True):
+        # values only (always sorted, so sorted=False is satisfied too); the rest is refused
+        # rather than ignored, which would return a different thing than was asked for
+        if return_index or return_inverse or return_counts or axis is not None or not equal_nan:
+            raise NotImplementedError(
+                "np.unique(return_index=/return_inverse=/return_counts=/axis=/"
+                "equal_nan=False) on a DynamicArray")
+        return o.unique(a)
+
     def _flip(a, axis=None):            # dyna flip is per-int-axis; chain for tuple / all-axes
         axes = range(a.ndim) if axis is None else ((axis,) if _np.isscalar(axis) else axis)
         out = a
@@ -858,7 +895,7 @@ def _array_function_registry():
         _np.round: lambda a, decimals=0, **k: o.round(a, decimals),
         _np.around: lambda a, decimals=0, **k: o.round(a, decimals),
         _np.clip: lambda a, a_min=None, a_max=None, **k: o.clip(a, a_min, a_max),
-        _np.unique: lambda a, **k: o.unique(a),
+        _np.unique: _unique,
         # complex-part extraction (pointwise; dispatched as array-functions, not ufuncs)
         _np.real: lambda a, **k: o.map_blocks(_np.real, a, name="real"),
         _np.imag: lambda a, **k: o.map_blocks(_np.imag, a, name="imag"),

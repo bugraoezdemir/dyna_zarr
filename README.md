@@ -113,12 +113,12 @@ io.write(arr, "out_zstd.zarr", compressor=Codecs(compressor="zstd", clevel=5), z
 io.write(arr, "out_bounded.zarr", region_size_mb=64, max_workers=4)
 ```
 
-`io.write` does not replace an existing array: with the default backend, writing to a
-path that already holds one raises an error. Choose a new path, or pass
-`overwrite=True` to replace a local array. Only a path that already looks like a Zarr
-store is removed, so a mistyped path cannot delete an unrelated directory. (Not yet
-uniform: with `backend="zarrista"`, writing to an existing array currently writes into
-it instead of raising.)
+`io.write` does not replace an existing array: writing to a path that already holds a
+Zarr array or group raises `OutputExistsError`. Choose a new path, or pass
+`overwrite=True` to delete what is there and write it anew. This is the same for both
+backends, locally and on S3. Only a path that already looks like a Zarr store is ever
+removed, so a mistyped path cannot delete an unrelated directory: if it holds other
+files, dyna refuses to write there at all.
 
 Unless told otherwise, the output also keeps the input's **Zarr format, compressor and
 sharding**, so reading an array and writing it back gives the same kind of store. A
@@ -360,13 +360,15 @@ anymore, or to a path you give it (`persist("mean.zarr")`). A result of up to 1 
 simply kept in memory.
 
 `histogram` is lazy as well and returns `(counts, edges)` like `numpy.histogram`.
-Without `range=`, finding the range takes one extra pass. `unique` is the exception:
-the length of its result depends on the data, so it runs immediately and returns a
-NumPy array.
+Without `range=`, finding the range takes one extra pass. `unique` is lazy too, with
+one catch: the length of its result depends on the data. So it reads nothing until
+something needs its shape or values (`.shape`, `.size`, `compute()`, a write, or
+building another operation on it), and then computes both in one pass and keeps them,
+like the small reductions above.
 
 ## Operations catalog
 
-About 140 operations, plus the three primitives they are built from. All are available flat on `dyna_zarr.operations` (`ops.gaussian_filter`) and also grouped by category submodule (`ops.neighborhood.gaussian_filter`). Every operation is lazy except `unique`, which runs immediately and returns a NumPy array. Every operation is memory-bounded on the `io.write` path except `median`, `argmin`, and `argmax` (see Memory-boundedness), and `unique`, whose memory grows with the number of distinct values.
+About 140 operations, plus the three primitives they are built from. All are available flat on `dyna_zarr.operations` (`ops.gaussian_filter`) and also grouped by category submodule (`ops.neighborhood.gaussian_filter`). Every operation is lazy. Every operation is memory-bounded on the `io.write` path except `median`, `argmin`, and `argmax` (see Memory-boundedness), and `unique`, whose memory grows with the number of distinct values.
 
 - **Pointwise, unary.**
   - Arithmetic and rounding: `abs`, `fabs`, `negative`, `positive`, `sign`, `sqrt`, `cbrt`, `square`, `reciprocal`, `floor`, `ceil`, `trunc`, `rint`, `round`, `clip`, `astype`, `conjugate`.
@@ -379,7 +381,7 @@ About 140 operations, plus the three primitives they are built from. All are ava
   - Comparisons: `greater`, `greater_equal`, `less`, `less_equal`, `equal`, `not_equal`.
   - Logical: `logical_and`, `logical_or`, `logical_xor`, `logical_not`.
   - Selection and binning: `where`, `isin`, `digitize`.
-- **Reductions.** Streaming and memory-bounded, with `axis=` and `keepdims=`: `min`, `max`, `sum`, `prod`, `mean`, `any`, `all`, `var`, `std`. Not fully bounded (hold the full reduced axis): `median`, `argmin`, `argmax`. Whole-array: `histogram` (lazy, returns `(counts, bin_edges)` like `numpy.histogram`, memory-bounded) and `unique` (eager, a sorted array of the distinct values, bounded by how many there are). See [Reductions and statistics](#reductions-and-statistics).
+- **Reductions.** Streaming and memory-bounded, with `axis=` and `keepdims=`: `min`, `max`, `sum`, `prod`, `mean`, `any`, `all`, `var`, `std`. Not fully bounded (hold the full reduced axis): `median`, `argmin`, `argmax`. Whole-array: `histogram` (lazy, returns `(counts, bin_edges)` like `numpy.histogram`, memory-bounded) and `unique` (lazy until its length is needed, a sorted array of the distinct values, bounded by how many there are). See [Reductions and statistics](#reductions-and-statistics).
 - **Neighborhood (halo/overlap).** `gaussian_filter`, `uniform_filter`, `median_filter`, `minimum_filter`, `maximum_filter`, `grey_erosion`, `grey_dilation`, `convolve`, `correlate`, `laplace`, `gaussian_laplace`, `gaussian_gradient_magnitude`.
 - **Structural.** `concatenate`, `stack`, `transpose`, `swap_axes`, `reshape`, `flatten`, `squeeze`, `expand_dims`, `pad`, `tile`, `roll`, `flip`, `rot90`, `slice_array`. Slicing follows NumPy, including negative steps (`arr[::-1]`). `pad` reads only what it needs at the borders, except for the statistic modes (`mean`, `median`, `maximum`, `minimum`, `linear_ramp`), which need the whole axis.
 - **Differences.** `diff`, `gradient`.

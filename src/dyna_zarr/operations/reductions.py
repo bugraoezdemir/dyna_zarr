@@ -790,27 +790,60 @@ def histogram(array, bins=256, range=None, strip_bytes=_DEFAULT_STRIP_BYTES, dev
     return counts, edges
 
 
-def unique(array, strip_bytes=_DEFAULT_STRIP_BYTES, device=None):
-    """Streaming distinct values over the whole array (like ``numpy.unique``: a sorted 1-D
-    array of the distinct values). Memory-bounded by the running set of distinct values plus
-    one region, so it is cheap when there are few distinct values (e.g. a label image) and
-    grows with that count otherwise. EAGER (unlike ``histogram``): returns a host numpy
-    array, since its length depends on the data and a lazy array needs a known shape.
+class UniqueTransform(_ComputedOnce):
+    """The sorted distinct values of an array (``numpy.unique``, values only).
+
+    The LENGTH depends on the data, so the shape is not known until the data is read:
+    ``shape_deferred`` makes the DynamicArray ask for it on first need, and that need -
+    ``.shape``, ``.size``, compute, write, or building another op on it - runs the one
+    pass that produces the values too. Cached like the small reductions
+    (io.clear_cache() / arr.clear_cache()). Memory is the running set of distinct values
+    plus one region: small for a label image, large for continuous data.
     """
-    from ..utils import parse_dtype
-    dev = resolve_device(device)
-    dt = parse_dtype(array.dtype)[0]
-    if 0 in tuple(array.shape):                # empty array -> no distinct values
-        return np.array([], dtype=dt)
-    acc = None
-    for region in _iter_region_slices(array.shape, dt.itemsize, strip_bytes):
-        block = to_device(array._read_direct(region), dev)
-        xp = array_namespace(block)
-        u = xp.unique(block)
-        acc = u if acc is None else xp.unique(xp.concatenate([acc, u]))
-    if acc is None:                       # empty array
-        return np.array([], dtype=dt)
-    return asnumpy(acc)
+
+    shape_deferred = True
+    ndim = 1
+
+    def __init__(self, array, strip_bytes, device):
+        super().__init__()
+        from ..utils import parse_dtype
+        self.array = array
+        self.strip_bytes = strip_bytes
+        self.device = device
+        self.dtype = parse_dtype(array.dtype)[0]
+
+    @property
+    def shape(self):
+        self.ensure_cached()
+        return self._cache.shape
+
+    @shape.setter
+    def shape(self, value):         # Transform.__init__ assigns None; the shape is derived
+        if value is not None:
+            raise AttributeError("the shape of a unique() result comes from the data")
+
+    def _compute_full(self):
+        dev = resolve_device(self.device)
+        acc = None
+        if 0 not in tuple(self.array.shape):
+            for region in _iter_region_slices(self.array.shape, self.dtype.itemsize,
+                                              self.strip_bytes):
+                block = to_device(self.array._read_direct(region), dev)
+                xp = array_namespace(block)
+                u = xp.unique(block)
+                acc = u if acc is None else xp.unique(xp.concatenate([acc, u]))
+        return np.array([], dtype=self.dtype) if acc is None else asnumpy(acc)
+
+
+def unique(array, strip_bytes=_DEFAULT_STRIP_BYTES, device=None):
+    """Sorted distinct values over the whole array, like ``numpy.unique`` (values only).
+
+    LAZY like the other reductions, with one difference: the result's length depends on
+    the data, so it is computed - in one streaming pass, then cached - the first time
+    anything needs its shape or values (``.shape``, ``.size``, ``compute()``, a write, or
+    building another op on it). Memory-bounded by the distinct values plus one region.
+    """
+    return array._with_transform(UniqueTransform(array, strip_bytes, device))
 
 
 __all__ = [
