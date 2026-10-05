@@ -11,6 +11,16 @@ import tifffile
 from pathlib import Path
 
 
+def pytest_configure(config):
+    # Also registered in pytest.ini; repeated here because the CI wheel/floor jobs copy
+    # only tests/ (no pytest.ini) to run against the INSTALLED package, and there the
+    # markers were unknown ("PytestUnknownMarkWarning: Unknown pytest.mark.gpu").
+    for marker in ("slow: slow integration tests",
+                   "zarrista: needs the optional zarrista backend",
+                   "gpu: needs CuPy and a CUDA device"):
+        config.addinivalue_line("markers", marker)
+
+
 # ============================================================================
 # TIFF Fixtures
 # ============================================================================

@@ -167,6 +167,12 @@ class ReduceTransform(Transform):
         self._cache = None
         self._cache_lock = threading.Lock()
 
+    def _finish(self, result):
+        """A finalized result in the reported dtype (numpy's), on whatever device it is."""
+        xp = array_namespace(result)
+        result = xp.asarray(result)
+        return result if result.dtype == self.dtype else result.astype(self.dtype)
+
     def describe(self):
         """Short human-readable name, for warnings: ``mean(axis=(0,)) -> (1, 512, 512)``."""
         return f"{self.reducer_name}(axis={self.R}) -> {tuple(self.shape)}"
@@ -197,6 +203,12 @@ class ReduceTransform(Transform):
 
     def _infer_dtype(self):
         sample = np.ones((2,) * self.array.ndim, dtype=self._in_dtype)
+        if self.reducer_name in ("mean", "var", "std"):
+            # numpy's OWN result dtype (float32 stays float32; ints -> float64). Deriving it
+            # from our sum/count arithmetic made it depend on the numpy version: NumPy 1.x
+            # promotes float32-scalar / int to float64, NumPy 2 does not - and var/std
+            # accumulate in float64 by design. Results are cast to this (see _finish).
+            return np.asarray(getattr(np, self.reducer_name)(sample, axis=self.R)).dtype
         if not self.reducer.associative:
             res = self.reducer.direct(np, sample, self.R)
         else:
@@ -276,7 +288,7 @@ class ReduceTransform(Transform):
                 input_slices[in_axis] = slice(start, stop)
             # keepdims reduced axis: read stays full; its size-1 output handled in the crop
 
-        block = self._stream(input_slices)               # kept-axis order, reduced axes gone
+        block = self._finish(self._stream(input_slices))  # kept-axis order, reduced axes gone
         xp = array_namespace(block)
         if self.keepdims:
             for a in sorted(self.R):
@@ -337,7 +349,7 @@ def _stream_group(transforms):
         count *= arr.shape[a]
     results = []
     for t, acc in zip(transforms, accs):
-        r = t.reducer.finalize(xp, acc, count, t.ddof)
+        r = t._finish(t.reducer.finalize(xp, acc, count, t.ddof))
         if t.keepdims:
             for a in sorted(R):
                 r = xp.expand_dims(r, a)
