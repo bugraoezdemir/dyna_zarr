@@ -8,7 +8,7 @@ large-scale (terabyte+) Zarr datasets.
 Includes efficient TIFF reading via tifffile's zarr bridge with concurrent access support.
 """
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 __author__ = "Bugra Oezdemir"
 
 # Import core classes
@@ -41,3 +41,9 @@ except ImportError:
         "slice_array",
         "Codecs",
     ]
+
+# Optional storage backends. `backends` itself never imports its optional
+# dependency, so this stays cheap and cannot fail on a plain install.
+from . import backends  # noqa: E402
+
+__all__ = __all__ + ["backends"]

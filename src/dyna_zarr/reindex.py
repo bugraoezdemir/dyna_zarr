@@ -35,22 +35,22 @@ def _c_strides(shape):
     return strides
 
 
-def reindex_write(input_array, out_shape, output_path, output_chunks,
+def reindex_write(input_array, out_shape, output, output_chunks,
                   dtype=None, zarr_format=2, cache_size=0):
-    """Write ``input_array`` reshaped (C-order) to ``out_shape`` at ``output_path``,
-    streaming per output chunk. Memory ~ one input chunk + one output chunk + O-sized index
-    arrays. ``cache_size`` (input chunks) optionally caches recent input chunks to cut
-    re-reads."""
+    """Write ``input_array`` reshaped (C-order) to ``out_shape`` into ``output`` (a path, or
+    an opened sink from io.write), streaming per output chunk, one chunk at a time. Memory ~
+    one input chunk + one output chunk + O-sized index arrays. ``cache_size`` (input chunks)
+    optionally caches recent input chunks to cut re-reads."""
+    from .rechunk import _source_grid, _target
     in_shape = tuple(int(s) for s in input_array.shape)
     out_shape = tuple(int(s) for s in out_shape)
     if int(np.prod(in_shape)) != int(np.prod(out_shape)):
         raise ValueError(f"reindex needs equal size: {in_shape} vs {out_shape}")
-    in_chunks = tuple(int(c) for c in (input_array.chunks or in_shape))
-    output_chunks = tuple(int(c) for c in output_chunks)
     dt = parse_dtype(dtype if dtype is not None else input_array.dtype)[0]
+    in_chunks = _source_grid(input_array, in_shape, dt)     # grid-less -> bounded default
+    output_chunks = tuple(int(c) for c in output_chunks)
 
-    out = zarr.open(str(output_path), mode="w", shape=out_shape,
-                    chunks=output_chunks, dtype=dt, zarr_format=zarr_format)
+    out = _target(output, out_shape, output_chunks, dt, zarr_format)
 
     in_ndim, out_ndim = len(in_shape), len(out_shape)
     out_strides = _c_strides(out_shape)
@@ -101,4 +101,4 @@ def reindex_write(input_array, out_shape, output_path, output_chunks,
             obuf[mask] = block[local]
         out[o_sl] = obuf.reshape(o_shape)
 
-    return output_path
+    return output

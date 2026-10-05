@@ -81,22 +81,95 @@ def _reject_dask(source) -> None:
         )
 
 
+class _PersistOwner:
+    """Owns a persist() temp directory; deletes it when the last array holding it goes.
+
+    Every DynamicArray derived from a persisted one (a copy, or a lazy op on it) carries
+    a reference to this object - copies directly, ops through their upstream array - so
+    the directory outlives every reader of it, not just the array persist() returned.
+    """
+
+    def __init__(self, tmpdir):
+        import shutil
+        import weakref
+        self.tmpdir = tmpdir
+        weakref.finalize(self, shutil.rmtree, tmpdir, True)
+
+
+def _checked_chunks(transform):
+    """``transform.chunks`` as a tuple of ints, after checking it can describe its output.
+
+    Every lazy op's grid passes through here, so the invariant holds for every op,
+    including ones added later: a grid is either None (no grid - the writer then picks
+    its default chunk) or one positive integer per axis of ``transform.shape``. Anything
+    else is a bug in that transform, and it raises rather than reach the writer, which
+    would otherwise act on it (an invented (1, 1, 1) grid became one-voxel chunks on
+    disk; a (1,) grid was reported for a 0-d squeeze).
+    """
+    chunks = transform.chunks
+    if chunks is None:
+        return None
+    shape = tuple(transform.shape)
+    try:
+        chunks = tuple(int(c) for c in chunks)
+    except (TypeError, ValueError):
+        chunks = None
+    if chunks is None or len(chunks) != len(shape) or any(c < 1 for c in chunks):
+        raise ValueError(
+            f"internal error: {type(transform).__name__} reported chunks "
+            f"{transform.chunks!r} for an output of shape {shape}. A grid must be None or "
+            f"one positive integer per axis; please report this as a dyna_zarr bug.")
+    return chunks
+
+
+def _as_numpy_dtype(dt):
+    """``dt`` as a real ``numpy.dtype``, whatever produced it.
+
+    TensorStore arrays report a ``tensorstore.dtype``: it prints as ``dtype("float32")``
+    and even compares equal to ``np.float32``, but NumPy cannot interpret it, so
+    ``np.zeros(shape, dt)`` / ``np.dtype(dt)`` / ``.itemsize`` all raise. It carries its
+    exact NumPy equivalent as ``.numpy_dtype``; anything else goes through parse_dtype.
+    """
+    if dt is None or isinstance(dt, np.dtype):
+        return dt
+    numpy_dtype = getattr(dt, "numpy_dtype", None)
+    if numpy_dtype is not None:
+        return np.dtype(numpy_dtype)
+    from .utils import parse_dtype
+    return parse_dtype(dt)[0]
+
+
 class DynamicArray:
     """
     Wrapper around Zarr arrays or TensorStore arrays that enables lazy operations.
-    
+
     Supports multiple input types:
     - zarr.Array: Wraps for lazy operations
     - TensorStore arrays: Wraps for lazy operations
     - DynamicArray: Copy constructor
-    
+
     To read from files, use operations.read(path) instead.
+
+    ``dtype`` is always a ``numpy.dtype``, whatever the source.
     """
+
+    # The dtype is normalised where it is STORED, not where it is read: every path that
+    # builds a DynamicArray assigns `_dtype` (the constructors, the readers' object.__new__
+    # paths, _with_transform), so a setter is the one place that covers all of them,
+    # including sources added later. Per-use parse_dtype() calls elsewhere predate this.
+    @property
+    def _dtype(self):
+        return self._np_dtype
+
+    @_dtype.setter
+    def _dtype(self, value):
+        self._np_dtype = _as_numpy_dtype(value)
 
     def __init__(self, source: Union[zarr.Array, np.ndarray, 'DynamicArray'],
                  chunks: Optional[Tuple[int, ...]] = None):
         _reject_dask(source)
-        if isinstance(source, np.ndarray):
+        from_numpy = isinstance(source, np.ndarray)
+        if from_numpy:
             # Route numpy through an in-memory zarr array rather than wrapping it raw.
             # Wrapping raw "works" but leaves `.chunks` as None, and chunks are load-bearing
             # here: they drive the tile/region defaults (tilewise-ccl's default_tile_shape
@@ -119,6 +192,7 @@ class DynamicArray:
             self._compressors = source._compressors
             self._shards = source._shards
             self._codecs = source._codecs
+            self._persist_owner = getattr(source, "_persist_owner", None)
         else:
             # Wrap a real Zarr array or TensorStore array
             # Check if it's tensorstore
@@ -132,104 +206,88 @@ class DynamicArray:
                 self._is_tensorstore = False
                 self._ts_array = None
                 self._zarr_array = source
-                self._extract_zarr_metadata(source)
-            
+
             self._source = source
             self._shape = tuple(source.shape)
             self._chunks = getattr(source, 'chunks', None)
             self._dtype = source.dtype
             self._transform = None
-            if not self._is_tensorstore:
+            if not self._is_tensorstore and not from_numpy:
                 self._extract_zarr_metadata(source)
             else:
+                # A TensorStore handle carries no zarr metadata object; a numpy array has
+                # no storage format at all - its in-memory staging store is an internal
+                # detail (zarr's defaults, e.g. zstd level 0), not something to inherit.
                 self._zarr_format = None
                 self._compressor = None
                 self._compressors = None
                 self._shards = None
                 self._codecs = None
+                if self._is_tensorstore:
+                    from .io import _ts_zarr_format
+                    self._zarr_format = _ts_zarr_format(source)
 
     def _extract_zarr_metadata(self, zarr_array):
-        """Extract metadata from Zarr array, handling both v2 and v3."""
-        # Detect Zarr format version
-        if hasattr(zarr_array, '_version'):
-            self._zarr_format = zarr_array._version
-        elif hasattr(zarr_array, 'store'):
-            # Try to detect from store structure
-            store = zarr_array.store
-            if hasattr(store, 'path'):
-                store_path = Path(store.path) if isinstance(store.path, str) else store.path
-                if (store_path / 'zarr.json').exists():
-                    self._zarr_format = 3
-                elif (store_path / '.zarray').exists():
-                    self._zarr_format = 2
-                else:
-                    self._zarr_format = 2  # Default to v2
-            else:
-                self._zarr_format = 2  # Default to v2
-        else:
-            self._zarr_format = 2  # Default to v2
+        """Storage format, compression and sharding of a zarr source, from zarr 3's API.
 
-        # Extract compressor/compressors based on format
-        if self._zarr_format == 3:
-            # Zarr v3
-            self._compressor = None
-            if hasattr(zarr_array, 'metadata'):
-                metadata = zarr_array.metadata
-                if 'codecs' in metadata:
-                    self._compressors = metadata['codecs']
-                else:
-                    self._compressors = None
-            elif hasattr(zarr_array, 'compressors'):
-                self._compressors = zarr_array.compressors
-            else:
-                self._compressors = None
+        These are what io.write INHERITS when the caller does not say otherwise, so
+        they must be right or absent - never guessed. The previous version probed
+        `_version` / `store.path` (zarr 2 era): under zarr 3 it reported every array,
+        v3 included, as v2, so a v3 input's codecs and shards were never inherited.
+        Anything that cannot be read reliably is left as None, which io.write treats
+        as "no preference" (format -> v3, codecs -> the default).
+        """
+        md = getattr(zarr_array, "metadata", None)
+        fmt = getattr(md, "zarr_format", None)
+        self._zarr_format = fmt if fmt in (2, 3) else None
+        try:
+            comps = tuple(getattr(zarr_array, "compressors", None) or ())
+        except Exception:
+            comps = ()
+        self._compressors = comps or None
+        self._compressor = comps[0] if (self._zarr_format == 2 and comps) else None
+        shards = getattr(zarr_array, "shards", None) if self._zarr_format == 3 else None
+        self._shards = tuple(int(s) for s in shards) if shards else None
+        self._codecs = self._codecs_from_compressors(comps) if self._zarr_format else None
 
-            # Extract shards
-            if hasattr(zarr_array, 'metadata') and 'shards' in zarr_array.metadata:
-                self._shards = zarr_array.metadata['shards']
-            elif hasattr(zarr_array, 'shards'):
-                self._shards = zarr_array.shards
-            else:
-                self._shards = None
-            
-            # Convert v3 codecs to Codecs instance
-            self._codecs = self._extract_codecs_from_v3(self._compressors)
-        else:
-            # Zarr v2
-            try:
-                self._compressor = zarr_array.compressor if hasattr(zarr_array, 'compressor') else None
-            except (TypeError, AttributeError):
-                # Handle Zarr v3 arrays that error on compressor access
-                self._compressor = None
-            self._compressors = None
-            self._shards = None
-            
-            # Convert v2 compressor to Codecs instance
-            if self._compressor is not None:
-                try:
-                    self._codecs = Codecs.from_numcodecs(self._compressor)
-                except Exception:
-                    # If conversion fails, use default
-                    self._codecs = None
-            else:
-                self._codecs = None
+    def _codecs_from_compressors(self, comps):
+        """``Codecs`` equivalent of a zarr array's ``compressors``, or None if unknown.
 
-    def _extract_codecs_from_v3(self, codecs_list):
-        """Extract Codecs instance from Zarr v3 codec pipeline."""
+        An array stored WITHOUT compression yields ``Codecs(None)``, so an uncompressed
+        input stays uncompressed; an unrecognised compressor yields None (the default).
+        """
+        if not comps:
+            return Codecs(compressor=None)
+        first = comps[0]
+        to_dict = getattr(first, "to_dict", None)
+        if to_dict is not None:                              # a zarr v3 codec
+            return self._extract_codecs_from_v3([to_dict()])
+        try:                                                 # a numcodecs (v2) codec
+            return Codecs.from_numcodecs(first)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_codecs_from_v3(codecs_list):
+        """Extract Codecs instance from Zarr v3 codec pipeline (a list of codec dicts)."""
         if codecs_list is None:
             return None
-        
+
+        # v3 serializes blosc's shuffle by NAME; Codecs uses numcodecs' ints.
+        shuffle_ids = {"noshuffle": 0, "shuffle": 1, "bitshuffle": 2}
+
         # Look for compression codec in the pipeline
         for codec in codecs_list:
             codec_name = codec.get('name', '')
             config = codec.get('configuration', {})
-            
+
             if codec_name == 'blosc':
+                shuffle = config.get('shuffle', 1)
                 return Codecs(
                     compressor='blosc',
                     clevel=config.get('clevel', 5),
                     cname=config.get('cname', 'lz4'),
-                    shuffle=config.get('shuffle', 1)
+                    shuffle=shuffle_ids.get(shuffle, shuffle),
                 )
             elif codec_name == 'zstd':
                 return Codecs(
@@ -248,7 +306,7 @@ class DynamicArray:
                     compressor='bz2',
                     clevel=config.get('level', 5)
                 )
-        
+
         # No compression codec found
         return None
 
@@ -258,13 +316,27 @@ class DynamicArray:
 
     @property
     def chunks(self) -> Tuple[int, ...]:
-        """Get the chunk shape of the underlying array."""
+        """Chunk grid of THIS array, or None when it has no meaningful one.
+
+        A transform is authoritative about its own grid, including when it says
+        None: an op that rewrites the index space (reshape, flatten) leaves no
+        grid behind. The underlying zarr array is consulted only for an
+        UNTRANSFORMED view of it, and even then only if the rank still matches -
+        the source tuple is copied along the whole chain, so without these guards
+        a 2-D `reshape((64,128,128) -> (64,16384))` reported the source's rank-3
+        `(8,64,64)`. Downstream that is worse than None, because the chunk grid
+        drives the writer's region and alignment defaults: None is handled, a
+        wrong-rank tuple is not.
+        """
         if self._chunks is not None:
             return self._chunks
-        # Fallback: try to get chunks from underlying zarr array
+        if self._transform is not None:
+            return None
         if self._zarr_array is not None and hasattr(self._zarr_array, 'chunks'):
-            return self._zarr_array.chunks
-        # If still None, return None (TensorStore or unknown)
+            chunks = self._zarr_array.chunks
+            if chunks is not None and len(chunks) == len(self._shape):
+                return tuple(int(c) for c in chunks)
+        # TensorStore, unknown, or a rank that no longer matches.
         return None
 
     @property
@@ -274,6 +346,23 @@ class DynamicArray:
     @property
     def ndim(self) -> int:
         return len(self._shape)
+
+    # numpy/dask array attributes derived from shape and dtype alone - they never read
+    # data, so they are free on any lazy array.
+    @property
+    def size(self) -> int:
+        """Number of elements (1 for a 0-d array), like ``numpy.ndarray.size``."""
+        return int(np.prod(self._shape, dtype=np.int64))
+
+    @property
+    def itemsize(self) -> int:
+        """Bytes per element, like ``numpy.ndarray.itemsize``."""
+        return int(self.dtype.itemsize)
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes the materialized array occupies (uncompressed), like ``numpy.ndarray.nbytes``."""
+        return self.size * self.itemsize
 
     @property
     def zarr_format(self) -> int:
@@ -330,13 +419,18 @@ class DynamicArray:
         result is always returned as a host numpy array.
         """
         from .operations._backend import device_context, to_device
+        from .operations.reductions import evaluate_small_reductions
         with device_context(device):
+            # Small reductions the chain needs are computed first, fused per input
+            # (x.mean() and x.std() share one pass), then served from the cache.
+            evaluate_small_reductions(self)
             if self._transform is None:
-                # No transform - read entire array
+                # No transform - read entire array. `[...]`, not `[:]`: a 0-d array
+                # has no axis for `:` to index (a persisted 0-d result is one).
                 if self._is_tensorstore:
-                    result = self._ts_array[:].read().result()
+                    result = self._ts_array.read().result()
                 else:
-                    result = self._zarr_array[:]
+                    result = self._zarr_array[...]
             else:
                 # Apply transformation to read all data
                 full_slice = tuple(slice(None) for _ in range(len(self.shape)))
@@ -392,11 +486,38 @@ class DynamicArray:
         """
         return self
 
-    def persist(self, **kwargs):
-        """No-op (accepts dask's signature). dask ``persist`` materializes and caches an
-        intermediate; the pull model has no graph to cache, so this returns the array
-        unchanged. Use ``io.write`` to stage an intermediate to disk when needed."""
-        return self
+    def persist(self, path=None, **kwargs):
+        """Compute this array ONCE and return a DynamicArray that reads the stored result.
+
+        Use it on an intermediate that would otherwise be recomputed, above all a large
+        partial reduction broadcast back over the array (``x - x.mean(axis=0)`` written
+        region by region re-streams the mean once per region along axis 0; ``io.write``
+        warns when that happens). The result is written with ``io.write``, so it is
+        memory-bounded at any size.
+
+        ``path`` - where to store it. Omitted, a result of at most 1 MiB is kept in
+        memory and anything larger goes to a temporary Zarr store, deleted when the
+        last array reading it is garbage-collected. Given, the store is written there
+        and left in place. Extra keyword arguments (dask's ``scheduler=`` etc.) are
+        accepted and ignored.
+        """
+        import tempfile
+        from .io import io as _io
+        from .utils import parse_dtype
+
+        nbytes = int(np.prod(self._shape, dtype=np.int64)) * parse_dtype(self._dtype)[0].itemsize
+        if path is None and nbytes <= (1 << 20):
+            return DynamicArray(np.asarray(self.compute()))
+        owner = None
+        if path is None:
+            tmpdir = tempfile.mkdtemp(prefix="dyna_persist_")
+            path = str(Path(tmpdir) / "persisted.zarr")
+            owner = _PersistOwner(tmpdir)
+        _io.write(self, str(path))
+        result = _io.read(str(path))
+        if owner is not None:
+            result._persist_owner = owner
+        return result
 
     def map_blocks(self, func, *args, dtype=None, device=None, **kwargs):
         """dask-compatible ``map_blocks``: apply ``func`` blockwise (shape-preserving). Extra
@@ -510,7 +631,7 @@ class DynamicArray:
         result = DynamicArray(self)
         result._transform = transform
         result._shape = transform.shape
-        result._chunks = transform.chunks
+        result._chunks = _checked_chunks(transform)
         result._dtype = transform.dtype
         # Keep zarr metadata from original
         return result
@@ -526,7 +647,7 @@ class DynamicArray:
         self._ts_array = None
         self._is_tensorstore = False
         self._shape = tuple(transform.shape)
-        self._chunks = transform.chunks
+        self._chunks = _checked_chunks(transform)
         self._dtype = np.dtype(transform.dtype)
         self._transform = transform
         self._zarr_format = None
@@ -536,72 +657,116 @@ class DynamicArray:
         self._codecs = None
         return self
     
-    # Eager reduction shortcuts. Each streams via operations.<reducer> (memory-bound)
-    # and computes immediately, returning a NumPy scalar/array. Use operations.<reducer>
-    # directly (e.g. operations.max(a, 0)) for a lazy, chainable/writable reduction.
+    # Reduction methods. LAZY, exactly like operations.<reducer> (and dask): each returns
+    # a DynamicArray, so `x > x.mean()` stays one lazy chain. A small result (<= 1 MiB,
+    # e.g. a 0-d statistic) is computed once and cached - see operations.reductions -
+    # and converts on demand: float(x.mean()), int(x.max()), `if x.any():`.
     def min(self, axis=None, keepdims=False):
-        """Minimum along ``axis`` (None = all). Computed immediately."""
+        """Minimum along ``axis`` (None = all). Lazy."""
         from . import operations
-        return operations.min(self, axis=axis, keepdims=keepdims).compute()
+        return operations.min(self, axis=axis, keepdims=keepdims)
 
     def max(self, axis=None, keepdims=False):
-        """Maximum along ``axis`` (None = all). Computed immediately."""
+        """Maximum along ``axis`` (None = all). Lazy."""
         from . import operations
-        return operations.max(self, axis=axis, keepdims=keepdims).compute()
+        return operations.max(self, axis=axis, keepdims=keepdims)
 
     def sum(self, axis=None, keepdims=False):
-        """Sum along ``axis`` (None = all). Computed immediately."""
+        """Sum along ``axis`` (None = all). Lazy."""
         from . import operations
-        return operations.sum(self, axis=axis, keepdims=keepdims).compute()
+        return operations.sum(self, axis=axis, keepdims=keepdims)
 
     def mean(self, axis=None, keepdims=False):
-        """Mean along ``axis`` (None = all). Computed immediately."""
+        """Mean along ``axis`` (None = all). Lazy."""
         from . import operations
-        return operations.mean(self, axis=axis, keepdims=keepdims).compute()
+        return operations.mean(self, axis=axis, keepdims=keepdims)
 
     def prod(self, axis=None, keepdims=False):
-        """Product along ``axis`` (None = all). Computed immediately."""
+        """Product along ``axis`` (None = all). Lazy."""
         from . import operations
-        return operations.prod(self, axis=axis, keepdims=keepdims).compute()
+        return operations.prod(self, axis=axis, keepdims=keepdims)
 
     def median(self, axis=None, keepdims=False):
-        """Median along ``axis`` (None = all). Computed immediately."""
+        """Median along ``axis`` (None = all). Lazy; reads the reduced axes whole."""
         from . import operations
-        return operations.median(self, axis=axis, keepdims=keepdims).compute()
+        return operations.median(self, axis=axis, keepdims=keepdims)
 
     def std(self, axis=None, keepdims=False, ddof=0):
-        """Standard deviation along ``axis`` (None = all). Computed immediately."""
+        """Standard deviation along ``axis`` (None = all). Lazy."""
         from . import operations
-        return operations.std(self, axis=axis, keepdims=keepdims, ddof=ddof).compute()
+        return operations.std(self, axis=axis, keepdims=keepdims, ddof=ddof)
 
     def var(self, axis=None, keepdims=False, ddof=0):
-        """Variance along ``axis`` (None = all). Computed immediately."""
+        """Variance along ``axis`` (None = all). Lazy."""
         from . import operations
-        return operations.var(self, axis=axis, keepdims=keepdims, ddof=ddof).compute()
+        return operations.var(self, axis=axis, keepdims=keepdims, ddof=ddof)
 
     def any(self, axis=None, keepdims=False):
-        """Whether any element is true along ``axis`` (None = all). Computed immediately."""
+        """Whether any element is true along ``axis`` (None = all). Lazy."""
         from . import operations
-        return operations.any(self, axis=axis, keepdims=keepdims).compute()
+        return operations.any(self, axis=axis, keepdims=keepdims)
 
     def all(self, axis=None, keepdims=False):
-        """Whether all elements are true along ``axis`` (None = all). Computed immediately."""
+        """Whether all elements are true along ``axis`` (None = all). Lazy."""
         from . import operations
-        return operations.all(self, axis=axis, keepdims=keepdims).compute()
+        return operations.all(self, axis=axis, keepdims=keepdims)
 
-    def argmin(self, axis=None):
-        """Index of the minimum along ``axis`` (None = flattened). Computed immediately."""
+    def argmin(self, axis=None, keepdims=False):
+        """Index of the minimum along ``axis`` (None = flattened). Lazy."""
         from . import operations
-        return operations.argmin(self, axis=axis).compute()
+        return operations.argmin(self, axis=axis, keepdims=keepdims)
 
-    def argmax(self, axis=None):
-        """Index of the maximum along ``axis`` (None = flattened). Computed immediately."""
+    def argmax(self, axis=None, keepdims=False):
+        """Index of the maximum along ``axis`` (None = flattened). Lazy."""
         from . import operations
-        return operations.argmax(self, axis=axis).compute()
+        return operations.argmax(self, axis=axis, keepdims=keepdims)
+
+    # --- scalar conversion: compute on demand, NumPy's rules -----------------------
+    def _one_element(self, what):
+        size = int(np.prod(self._shape)) if self._shape else 1
+        if size != 1:
+            raise TypeError(
+                f"only an array with exactly one element can be converted to {what}; "
+                f"this one has shape {self._shape}")
+        return np.asarray(self.compute()).reshape(())
+
+    def __float__(self):
+        return float(self._one_element("a Python float"))
+
+    def __int__(self):
+        return int(self._one_element("a Python int"))
+
+    def __complex__(self):
+        return complex(self._one_element("a Python complex"))
+
+    def __index__(self):
+        from .utils import parse_dtype
+        if parse_dtype(self._dtype)[0].kind not in "biu":
+            raise TypeError(
+                f"only an integer array can be used as an index; this one is {self._dtype}")
+        return int(self._one_element("an index"))
+
+    def __bool__(self):
+        # NumPy refuses to guess for more than one element, and so does this. It is
+        # checked from the shape, so an ambiguous `if arr:` raises WITHOUT reading data.
+        size = int(np.prod(self._shape)) if self._shape else 1
+        if size != 1:
+            raise ValueError(
+                "the truth value of a DynamicArray with more than one element is "
+                "ambiguous; use .any() or .all()")
+        return bool(self._one_element("a bool"))
+
+    def clear_cache(self):
+        """Forget the cached small-reduction results in this array's chain, so the next
+        read recomputes them (e.g. after the source data was rewritten in place).
+        ``io.clear_cache()`` does the same for every array."""
+        from .operations.reductions import clear_chain_cache
+        clear_chain_cache(self)
 
     def histogram(self, bins=256, range=None):
-        """Streaming histogram over the whole array. Returns ``(counts, bin_edges)`` like
-        numpy. Slice first for a per-channel/plane histogram: ``da[channel].histogram()``."""
+        """Lazy streaming histogram over the whole array: ``(counts, bin_edges)`` like numpy,
+        both lazy (see operations.histogram). Slice first for a per-channel/plane histogram:
+        ``da[channel].histogram()``."""
         from . import operations
         return operations.histogram(self, bins=bins, range=range)
 
@@ -647,6 +812,14 @@ def _array_function_registry():
             return fn(a, axis=axis, keepdims=kd, ddof=ddof)
         return h
 
+    def _histogram(a, bins=10, range=None, density=None, weights=None):
+        # numpy's own default is bins=10. density/weights are not implemented: refused
+        # (NotImplemented -> numpy raises TypeError) rather than silently ignored, which
+        # would return plain counts where the caller asked for something else.
+        if density or weights is not None:
+            raise NotImplementedError("np.histogram(density=/weights=) on a DynamicArray")
+        return o.histogram(a, bins=bins, range=range)
+
     def _flip(a, axis=None):            # dyna flip is per-int-axis; chain for tuple / all-axes
         axes = range(a.ndim) if axis is None else ((axis,) if _np.isscalar(axis) else axis)
         out = a
@@ -679,7 +852,7 @@ def _array_function_registry():
         _np.gradient: lambda a, *ar, axis=-1, **k: o.gradient(a, axis=axis),
         _np.digitize: lambda a, bins, right=False, **k: o.digitize(a, bins, right),
         _np.isin: lambda a, test, invert=False, **k: o.isin(a, test, invert),
-        _np.histogram: lambda a, bins=256, range=None, **k: o.histogram(a, bins=bins, range=range),
+        _np.histogram: _histogram,
         _np.cumsum: lambda a, axis=None, **k: o.cumsum(a, axis),
         _np.cumprod: lambda a, axis=None, **k: o.cumprod(a, axis),
         _np.round: lambda a, decimals=0, **k: o.round(a, decimals),

@@ -47,6 +47,10 @@ def test_dtype_argument(src):
     assert np.asarray(arr[:4], dtype=np.int32).dtype == np.dtype(np.int32)
 
 
+@pytest.mark.skipif(
+    int(np.__version__.split(".")[0]) < 2,
+    reason="NumPy 1.x np.array(copy=False) means 'copy if needed' and never passes "
+           "copy= to __array__; the must-raise contract is NumPy 2's")
 def test_copy_false_raises(src):
     """The data does not exist until read, so a no-copy view is impossible."""
     arr, _ = src
