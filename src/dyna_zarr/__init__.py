@@ -12,7 +12,7 @@ __version__ = "0.0.9"
 __author__ = "Bugra Oezdemir"
 
 # Import core classes
-from .dynamic_array import DynamicArray, slice_array
+from .dynamic_array import DynamicArray, slice_array, from_array
 from .codecs import Codecs
 
 # Import operations (now a package/module of flat ops) and io namespaces
@@ -46,4 +46,4 @@ except ImportError:
 # dependency, so this stays cheap and cannot fail on a plain install.
 from . import backends  # noqa: E402
 
-__all__ = __all__ + ["backends"]
+__all__ = __all__ + ["backends", "from_array"]

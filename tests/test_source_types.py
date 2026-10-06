@@ -77,4 +77,4 @@ def test_dask_rejection_names_the_alternative(data):
     da = pytest.importorskip("dask.array")
     with pytest.raises(TypeError) as exc:
         DynamicArray(da.from_array(data, chunks=(2, 4, 4)))
-    assert "dask backend" in str(exc.value)
+    assert "from_array" in str(exc.value) and "create_sink" in str(exc.value)
