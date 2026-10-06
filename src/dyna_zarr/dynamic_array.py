@@ -95,21 +95,88 @@ class _SourceAdapter:
     every read holds it, for sources that are not safe to read from several threads at
     once. A lock cannot be pickled, so an unpickled adapter gets a fresh one (one per
     process, which is what a per-process reader needs); the source itself must pickle.
+
+    A STRIDED read (a step > 1, as `simple` downscaling issues) is split into blocks.
+    Readers such as micro_reader decode the whole contiguous span of a strided slice
+    and subsample afterwards, so one strided key allocated step**n x the output (8x on
+    z/y/x: 512x, i.e. 4 GB for an 8 MB region). Here each strided axis is read in
+    contiguous blocks of about one grid unit, subsampled at once and placed into the
+    output, so memory is bounded by one block plus the output and every source block
+    is still read once.
     """
 
-    def __init__(self, source, lock=None):
+    #: source elements per strided axis per block when the source has no grid
+    STRIDED_BLOCK = 256
+
+    def __init__(self, source, lock=None, grid=None):
         self._source = source
         self._lock = lock
+        self._grid = tuple(grid) if grid is not None else None
         self._dask = _is_dask(source)
         self.shape = tuple(int(s) for s in source.shape)
         self.dtype = source.dtype
         self.ndim = len(self.shape)
 
     def _read(self, key):
-        block = self._source[key]
         if self._dask:
-            return np.asarray(block.compute(scheduler="synchronous"))
-        return np.asarray(block)
+            return np.asarray(self._source[key].compute(scheduler="synchronous"))
+        if self._is_plain_strided(key):
+            return self._read_strided(key)
+        return np.asarray(self._source[key])
+
+    def _is_plain_strided(self, key):
+        """A full-rank key of ints and positive-step slices with at least one step > 1
+        (anything else - Ellipsis, arrays, negative steps - is passed through)."""
+        if not isinstance(key, tuple) or len(key) != self.ndim:
+            return False
+        strided = False
+        for k in key:
+            if isinstance(k, slice):
+                step = 1 if k.step is None else k.step
+                if not isinstance(step, (int, np.integer)) or step < 1:
+                    return False
+                strided = strided or step > 1
+            elif not isinstance(k, (int, np.integer)):
+                return False
+        return strided
+
+    def _read_strided(self, key):
+        # per axis: an int (dropped), a unit-step slice (read as asked), or a strided
+        # slice split into blocks of `per_block` output elements
+        axes = []
+        for ax, k in enumerate(key):
+            if not isinstance(k, slice):
+                axes.append(("int", int(k), None))
+                continue
+            start, stop, step = k.indices(self.shape[ax])
+            n = len(range(start, stop, step))
+            if step == 1 or n == 0:
+                axes.append(("full", slice(start, stop), n))
+            else:
+                unit = self._grid[ax] if self._grid else self.STRIDED_BLOCK
+                per_block = max(1, int(unit) // step)
+                blocks = [(o, min(o + per_block, n)) for o in range(0, n, per_block)]
+                axes.append(("strided", (start, step, blocks), n))
+        out = np.empty(tuple(a[2] for a in axes if a[0] != "int"), dtype=self.dtype)
+        per_axis = [[None] if kind != "strided" else spec[2] for kind, spec, _ in axes]
+        for combo in itertools.product(*per_axis):
+            src_key, sub, dst = [], [], []
+            for (kind, spec, n), blk in zip(axes, combo):
+                if kind == "int":
+                    src_key.append(spec)
+                elif kind == "full":
+                    src_key.append(spec)
+                    sub.append(slice(None))
+                    dst.append(slice(0, n))
+                else:
+                    start, step, _ = spec
+                    o0, o1 = blk
+                    # the contiguous span this block needs, subsampled by `step`
+                    src_key.append(slice(start + o0 * step, start + (o1 - 1) * step + 1))
+                    sub.append(slice(None, None, step))
+                    dst.append(slice(o0, o1))
+            out[tuple(dst)] = np.asarray(self._source[tuple(src_key)])[tuple(sub)]
+        return out
 
     def __getitem__(self, key):
         if self._lock is None:
@@ -120,17 +187,17 @@ class _SourceAdapter:
     def __reduce__(self):
         # the lock is created on the UNPICKLING side; a lock object in the reduce
         # arguments would itself have to be pickled, which is impossible
-        return (_restore_source_adapter, (self._source, self._lock is not None))
+        return (_restore_source_adapter, (self._source, self._lock is not None, self._grid))
 
     def __repr__(self):
         locked = ", locked" if self._lock is not None else ""
         return f"<source {self._source!r}{locked}>"
 
 
-def _restore_source_adapter(source, locked):
+def _restore_source_adapter(source, locked, grid=None):
     """Unpickle a _SourceAdapter: a fresh lock in this process if it had one."""
     import threading
-    return _SourceAdapter(source, threading.Lock() if locked else None)
+    return _SourceAdapter(source, threading.Lock() if locked else None, grid)
 
 
 def _per_axis_grid(value, ndim):
@@ -1209,12 +1276,34 @@ def from_array(source, chunks=None, *, lock=False) -> DynamicArray:
     else:
         # advisory grids: a malformed one is ignored, not trusted
         grid = (_per_axis_grid(getattr(source, 'chunks', None), len(shape))
-                or _per_axis_grid(getattr(source, 'read_unit', None), len(shape)))
+                or _read_unit_grid(source, shape))
     if lock is True:
         lock = threading.Lock()
-    arr = DynamicArray(_SourceAdapter(source, lock or None))
-    arr._chunks = _clamped(grid, shape) if grid is not None else None
+    clamped = _clamped(grid, shape) if grid is not None else None
+    arr = DynamicArray(_SourceAdapter(source, lock or None, clamped))
+    arr._chunks = clamped
     return arr
+
+
+#: micro_reader decodes a block whole only up to this size (its STREAM_THRESHOLD); a
+#: larger block is streamed (only the rows a read needs) or area-decoded
+_READ_UNIT_MAX_BYTES = 16 << 20
+
+
+def _read_unit_grid(source, shape):
+    """micro_reader's ``read_unit`` as a grid - but only for a block it decodes WHOLE.
+
+    A larger block (a one-strip plane, a big CZI subblock) is streamed: a read of a few
+    rows costs a few rows. Reporting such a block as the grid would make io.write keep
+    it as the output chunk (64 MB for a one-strip 8192 x 4096 uint16 plane) and size
+    every region to hold at least one, so it is not reported; dyna's default applies.
+    """
+    unit = _per_axis_grid(getattr(source, 'read_unit', None), len(shape))
+    if unit is None:
+        return None
+    itemsize = np.dtype(source.dtype).itemsize
+    nbytes = int(np.prod([min(u, s) for u, s in zip(unit, shape)])) * itemsize
+    return unit if nbytes <= _READ_UNIT_MAX_BYTES else None
 
 
 def _require_grid(chunks, shape):

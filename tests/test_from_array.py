@@ -87,6 +87,21 @@ def test_grid_resolution(src, grid):
     assert from_array(src).chunks == grid
 
 
+def test_a_streamed_read_unit_is_not_taken_as_the_grid():
+    # micro_reader decodes blocks over 16 MB in parts (streamed rows / decoded areas),
+    # so such a read_unit (e.g. a 64 MB one-strip plane) is not a real read unit; taken
+    # as the grid it would become a 64 MB output chunk and set every region's minimum.
+    big = Duck(read_unit=(2, 16, 120, 90))                   # whole array, ~0.7 MB: fine
+    assert from_array(big).chunks == (2, 16, 120, 90)
+
+    class Huge(Duck):
+        def __init__(self):
+            super().__init__()
+            self.shape = (1, 8192, 4096)
+            self.read_unit = (1, 8192, 4096)                # 64 MB uint16: streamed
+    assert from_array(Huge()).chunks is None
+
+
 def test_explicit_chunks_win_and_are_validated():
     assert from_array(Duck(chunks=(1, 4, 64, 64)), chunks=(2, 8, 32, 32)).chunks == (2, 8, 32, 32)
     with pytest.raises(ValueError, match="one positive int per axis"):
@@ -171,6 +186,44 @@ def test_the_bare_constructor_still_refuses_dask():
     da = pytest.importorskip("dask.array")
     with pytest.raises(TypeError, match="from_array"):
         DynamicArray(da.zeros((4, 4)))
+
+
+class SpanLogger(Duck):
+    """Records the number of elements each source call spans (what a reader such as
+    micro_reader allocates for a strided key: the whole contiguous span)."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.spans = []
+
+    def __getitem__(self, key):
+        n = 1
+        for k, s in zip(key, self.shape):
+            if isinstance(k, slice):
+                start, stop, _ = k.indices(s)
+                n *= max(0, stop - start)        # the SPAN, steps ignored
+        self.spans.append(n)
+        return super().__getitem__(key)
+
+
+@pytest.mark.parametrize("sel", [
+    (0, slice(None), slice(None, None, 4), slice(None, None, 4)),
+    (slice(None), slice(None), slice(None, None, 8), slice(None, None, 8)),
+    (1, slice(3, 15, 5), slice(7, None, 3), slice(1, 89, 6)),
+    (1, 7, slice(100, None, 9), slice(5, None, 4)),
+])
+def test_strided_reads_are_split_into_bounded_blocks(sel):
+    # Before: one strided key went to the source as is, and a reader that decodes the
+    # contiguous span (micro_reader) allocated step**n x the output - 4 GB for an 8 MB
+    # region at 8x on z/y/x. Now each source call spans at most one grid unit per
+    # strided axis (times the requested extent of the unit-step axes).
+    src = SpanLogger(chunks=(1, 4, 32, 32))
+    out = np.asarray(from_array(src)[sel])
+    np.testing.assert_array_equal(out, DATA[sel])
+    whole = int(np.prod([len(range(*s.indices(n))) if isinstance(s, slice) and (s.step or 1) == 1
+                         else (1 if not isinstance(s, slice) else 32)
+                         for s, n in zip(sel, DATA.shape)]))
+    assert max(src.spans) <= whole, (max(src.spans), whole)
 
 
 def test_micro_reader_image(tmp_path):

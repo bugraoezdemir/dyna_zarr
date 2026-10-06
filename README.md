@@ -114,7 +114,11 @@ arr = from_array(reader, lock=True)        # one read at a time, for readers tha
 ```
 
 - The chunk grid is the source's own (`chunks`, dask's `chunksize`, or micro-reader's
-  `read_unit`) unless you pass `chunks=`.
+  `read_unit` when that block is 16 MB or less) unless you pass `chunks=`. Larger
+  micro-reader blocks are read in parts, so they are not used as the grid.
+- Slicing stays local: `arr[10, 100:200, 50:150]` asks the reader for exactly that
+  region. A strided slice such as `arr[:, ::8, ::8]` is read one chunk at a time, so
+  memory stays bounded even if the reader decodes the whole span of a strided request.
 - A dask array is computed one region at a time. To write a dask array, pushing it into
   `io.create_sink` (see [Writing a dask array](#writing-a-dask-array)) is faster.
 - To use worker processes, the source must pickle. A `micro_reader.Image` holds open
