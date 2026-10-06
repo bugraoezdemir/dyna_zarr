@@ -15,6 +15,7 @@ from urllib.parse import urlparse
 from typing import Union, Tuple, Optional, Any, List
 from dataclasses import dataclass, field
 import itertools
+import json
 import math
 import time
 import threading
@@ -1763,6 +1764,106 @@ def _open_zarrista_output(output_path, shape, chunks, dtype, codecs,
     return _ZarristaOutput(array)
 
 
+class OutputExistsError(FileExistsError, ValueError):
+    """The output location of ``io.write`` already holds something.
+
+    Raised before anything is written. A zarr array or group there is replaced only with
+    ``overwrite=True``; files that are not a zarr store are never touched. Also a
+    ValueError, which is what TensorStore's ALREADY_EXISTS used to surface as.
+    """
+
+
+def _classify_store(read_key, has_any_key):
+    """``None`` (nothing there), ``'array'``, ``'group'`` or ``'other'`` (keys that are not
+    a zarr store) from a store's metadata keys: v2 ``.zarray``/``.zgroup``, v3
+    ``zarr.json`` with its ``node_type``."""
+    if read_key(".zarray") is not None:
+        return "array"
+    if read_key(".zgroup") is not None:
+        return "group"
+    doc = read_key("zarr.json")
+    if doc is not None:
+        try:
+            node = json.loads(doc).get("node_type")
+        except (ValueError, AttributeError):
+            node = None
+        return node if node in ("array", "group") else "other"
+    return "other" if has_any_key() else None
+
+
+def _existing_output(path, *, remote, backend, storage_options):
+    """What is already at an io.write output location (see _classify_store).
+
+    An empty or missing local directory counts as nothing. A remote location is
+    inspected through the store the write itself will use (TensorStore's kvstore, or
+    obstore for backend='zarrista'), with the same storage_options.
+    """
+    if not remote:
+        p = Path(path)
+        if not p.exists():
+            return None
+        if not p.is_dir():
+            return "other"
+        return _classify_store(
+            lambda k: (p / k).read_bytes() if (p / k).is_file() else None,
+            lambda: any(p.iterdir()))
+    if backend == "zarrista":
+        import obstore
+        from .backends.zarrista_backend import _obstore
+        store = _obstore(path, storage_options)
+
+        def read_key(k):
+            try:
+                return bytes(obstore.get(store, k).bytes())
+            except FileNotFoundError:
+                return None
+
+        def has_any_key():
+            return any(len(batch) for batch in obstore.list(store, chunk_size=1))
+        return _classify_store(read_key, has_any_key)
+    kv = ts.KvStore.open(_ts_kvstore(path, storage_options, write=True)).result()
+
+    def read_key(k):
+        r = kv.read(k.encode()).result()
+        return r.value if r.state == "value" else None
+    return _classify_store(read_key, lambda: bool(kv.list().result()))
+
+
+def _delete_output(spec):
+    """Remove the zarr array/group at ``spec.path`` (everything under it) so it can be
+    recreated. Only reached with overwrite=True on a location _existing_output saw as
+    a zarr store."""
+    if not spec.remote:
+        shutil.rmtree(spec.path)
+    elif spec.backend == "zarrista":
+        import obstore
+        from .backends.zarrista_backend import _obstore
+        store = _obstore(spec.path, spec.storage_options)
+        paths = [o["path"] for batch in obstore.list(store) for o in batch]
+        if paths:
+            obstore.delete(store, paths)
+    else:
+        kv = ts.KvStore.open(_ts_kvstore(spec.path, spec.storage_options, write=True)).result()
+        kv.delete_range(ts.KvStore.KeyRange()).result()
+
+
+def _check_existing_output(path, overwrite, existing):
+    """Apply the overwrite rule, the same for every backend, write path and location."""
+    if existing is None:
+        return
+    if existing == "other":
+        raise OutputExistsError(
+            f"{path} already holds files that are not a zarr store (no .zarray, .zgroup "
+            f"or zarr.json). dyna does not write into or delete them, even with "
+            f"overwrite=True. Choose another path, or remove them yourself.")
+    if not overwrite:
+        extra = (" This deletes the whole group, including every array in it."
+                 if existing == "group" else "")
+        raise OutputExistsError(
+            f"{path} already holds a zarr {existing}. Choose another path, or pass "
+            f"overwrite=True to replace it.{extra}")
+
+
 @dataclass
 class _OutputSpec:
     """Everything io.write decides about its output, BEFORE anything is written.
@@ -1790,6 +1891,7 @@ class _OutputSpec:
     region_mb: float
     solved_region: Tuple[int, ...]
     notes: List[str] = field(default_factory=list)
+    existing: Optional[str] = None   # what _existing_output found there
 
 
 def _resolve_output(array, output_path, *, max_workers, num_readers, chunks, chunk_size_mb,
@@ -2052,7 +2154,15 @@ def _resolve_output(array, output_path, *, max_workers, num_readers, chunks, chu
                 f"(rounding down); note the larger one raises peak memory."
             )
 
+    # Last, once every argument is known to be valid: what is already at the output.
+    # The overwrite rule is applied here, the same for every backend, write path and
+    # location; _open_output only carries out the deletion it allows.
+    existing = _existing_output(output_path, remote=remote, backend=backend,
+                                storage_options=storage_options)
+    _check_existing_output(output_path, overwrite, existing)
+
     return _OutputSpec(
+        existing=existing,
         path=str(output_path), shape=tuple(int(s) for s in array.shape),
         dtype=dtype_obj, dtype_v2=dtype_v2, dtype_v3=dtype_v3,
         chunks=tuple(int(c) for c in final_chunks), shards=final_shards,
@@ -2112,24 +2222,12 @@ def _open_output(spec: _OutputSpec):
     """Create the output array for a resolved spec and return its write handle.
 
     The handle supports ``out[region].write(data)`` (a future, for the concurrent
-    region pipeline) on every backend. ``overwrite`` is applied here, once, for every
-    write strategy.
+    region pipeline) on every backend. An existing store that overwrite=True replaces
+    is deleted here, once, for every write strategy.
     """
-    if spec.overwrite and not spec.remote:
-        # Only remove something that already IS a zarr store: a mistyped output_path
-        # must never delete an unrelated tree. _detect_zarr_format_local checks for
-        # .zarray/.zgroup/zarr.json.
-        _out = Path(spec.path)
-        if _out.exists():
-            if not _out.is_dir():
-                raise ValueError(
-                    f"overwrite=True: {spec.path} exists and is not a directory")
-            if _detect_zarr_format_local(_out) is None and any(_out.iterdir()):
-                raise ValueError(
-                    f"overwrite=True refused: {spec.path} is a non-empty directory that "
-                    f"does not look like a zarr store (no .zarray/.zgroup/zarr.json). "
-                    f"Delete it yourself if you really mean to replace it.")
-            shutil.rmtree(_out)
+    if spec.existing is not None:
+        # _resolve_output already refused everything but a zarr store with overwrite=True
+        _delete_output(spec)
 
     if not spec.remote:
         # A URL is not a directory to create; the object store makes keys on write.
@@ -2337,14 +2435,13 @@ def write_array(
         Phase-B `map_overlap` reads each whole tile exactly once (no re-read / re-label
         amplification) while still storing small `chunks`.
     overwrite : bool
-        Replace an existing array at `output_path`. Default False: on the default
-        (TensorStore) region writer, writing to a path that already holds an array
-        raises ALREADY_EXISTS, even when the existing array has the same metadata.
-        NOT yet uniform: `backend='zarrista'` and the staged flatten/reshape/scan
-        writers still write into the existing array without raising, and the staged
-        writers ignore `overwrite` entirely. Only a local path that already looks like
-        a zarr store is removed, so a mistyped `output_path` cannot delete an
-        unrelated tree.
+        Replace a zarr array or group at `output_path`. Default False: if one is
+        already there, `OutputExistsError` (a FileExistsError and ValueError) is raised
+        before anything is written. With True it is deleted, everything under it, and
+        written anew. The same on every backend and write path, local or remote. Files
+        that are not a zarr store (no .zarray/.zgroup/zarr.json) are never written into
+        or deleted, even with True, so a mistyped `output_path` cannot destroy an
+        unrelated tree. An empty directory counts as nothing.
     gc_interval : float
         Seconds between GC runs (default: 15.0)
     """

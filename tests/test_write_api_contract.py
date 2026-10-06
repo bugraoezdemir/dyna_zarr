@@ -160,6 +160,6 @@ def test_overwrite_refuses_non_zarr_directory(tmp_path):
     (victim / "precious.txt").write_text("keep me")
 
     arr = _src(tmp_path)
-    with pytest.raises(ValueError, match="does not look like a zarr store"):
+    with pytest.raises(ValueError, match="not a zarr store"):
         io.write(arr, str(victim), chunks=(8, 8, 8), zarr_format=2, overwrite=True)
     assert (victim / "precious.txt").read_text() == "keep me"

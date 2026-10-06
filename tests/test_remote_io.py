@@ -13,9 +13,6 @@ moto server (the [dev] extra installs moto), else they skip.
 import contextlib
 import io as _stdio
 import os
-import socket
-import urllib.request
-import uuid
 
 import numpy as np
 import pytest
@@ -30,41 +27,7 @@ def _write(*args, **kwargs):
         return io.write(*args, **kwargs)
 
 
-@pytest.fixture(scope="session")
-def s3_endpoint():
-    """An S3-compatible endpoint URL with test credentials in the environment."""
-    saved = {k: os.environ.get(k) for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
-                                            "AWS_REGION", "AWS_DEFAULT_REGION")}
-    os.environ.update(AWS_ACCESS_KEY_ID="test", AWS_SECRET_ACCESS_KEY="test",
-                      AWS_REGION="us-east-1", AWS_DEFAULT_REGION="us-east-1")
-    server = None
-    endpoint = os.environ.get("DYNA_TEST_S3_ENDPOINT")
-    if not endpoint:
-        server_mod = pytest.importorskip("moto.server", reason="needs moto[server] or "
-                                         "DYNA_TEST_S3_ENDPOINT for S3 tests")
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-        server = server_mod.ThreadedMotoServer(ip_address="127.0.0.1", port=port)
-        server.start()
-        endpoint = f"http://127.0.0.1:{port}"
-    yield endpoint
-    if server is not None:
-        server.stop()
-    for k, v in saved.items():
-        if v is None:
-            os.environ.pop(k, None)
-        else:
-            os.environ[k] = v
-
-
-@pytest.fixture
-def bucket(s3_endpoint):
-    name = f"dz-{uuid.uuid4().hex[:12]}"
-    urllib.request.urlopen(urllib.request.Request(f"{s3_endpoint}/{name}", method="PUT")).read()
-    opts = {"endpoint": s3_endpoint, "region": "us-east-1",
-            "virtual_hosted_style_request": False, "client_options": {"allow_http": True}}
-    return name, opts
+# s3_endpoint / bucket fixtures live in conftest.py (shared with test_overwrite.py)
 
 
 X = np.arange(8 * 16 * 16, dtype="f4").reshape(8, 16, 16)
