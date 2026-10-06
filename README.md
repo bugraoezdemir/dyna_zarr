@@ -121,10 +121,12 @@ removed, so a mistyped path cannot delete an unrelated directory: if it holds ot
 files, dyna refuses to write there at all.
 
 Unless told otherwise, the output also keeps the input's **Zarr format, compressor and
-sharding**, so reading an array and writing it back gives the same kind of store. A
-source that has no Zarr format of its own (a NumPy array, a TIFF, a generated array
-such as `ops.zeros`) is written as Zarr v3 with Blosc/LZ4. Passing `zarr_format=`,
-`compressor=` or `shard_coefficients=` overrides each of them.
+sharding**, so reading an array and writing it back gives the same kind of store. This
+holds for a TensorStore handle on a stored Zarr array too (`DynamicArray(ts_array)`).
+A source that has no Zarr format of its own (a NumPy array, a TIFF, a generated array
+such as `ops.zeros`, a virtual TensorStore view such as `ts.downsample`) is written as
+Zarr v3 with Blosc/LZ4. Passing `zarr_format=`, `compressor=` or `shard_coefficients=`
+overrides each of them.
 
 #### Output chunks
 
@@ -188,6 +190,14 @@ io.write(arr, "out_sharded.zarr", zarr_format=3,
 Sharding keeps the chunk as the unit of compression and random access while storing
 many chunks per file, which suits object stores and filesystems that dislike very
 large numbers of small files. Supported only with `zarr_format=3`.
+
+A v3 array can also carry a name per axis. dyna writes them as given and attaches no
+meaning to them (formats built on Zarr do, e.g. OME-Zarr 0.5 requires its axis names
+here). Zarr v2 has no such field, so they are refused there:
+
+```python
+io.write(arr, "out_named.zarr", zarr_format=3, dimension_names=("z", "y", "x"))
+```
 
 #### Regions vs chunks
 
@@ -509,10 +519,32 @@ Two more differences worth knowing:
 - **Single machine, for now.** Parallelism today is threaded I/O within one process, plus the optional GPU path. There is no cluster or distributed execution yet; better and process-based parallelism is a possible future direction.
 - **Narrower surface.** About 140 operations today, extended where the slice-pushdown model permits.
 
+### Writing a dask array
+
+dyna does not pull from a dask graph, but dask can push into a dyna output.
+`io.create_sink` creates the output exactly as `io.write` would (format, chunks,
+codecs, shards, dimension names, overwrite rule, local or remote, either backend) and
+returns a sink that blocks are written into. Rechunk the dask array to
+`sink.write_unit` first: that is the chunk, or the shard when sharded, and it keeps
+concurrent writes from sharing one.
+
+```python
+import dask.array as da
+
+x = da.from_zarr("in.zarr") + 1
+sink = io.create_sink("out.zarr", x.shape, x.dtype, chunks=(8, 64, 64))
+da.store(x.rechunk(sink.write_unit), sink, lock=False)
+```
+
+On a 1.2 GB array this was about 3x faster than storing into a zarr-python array.
+`io.write` on a dyna array is still faster (0–30% here, depending on backend and
+operation), so prefer it when you can build the array with dyna.
+
 ## Core components
 
 - `io.read(source, backend=..., storage_options=...)` reads TIFF, Zarr v2, or Zarr v3 (local or remote) into a `DynamicArray`; `backend` is `"tensorstore"` (default) or the optional `"zarrista"`.
-- `io.write(array, path, ...)` streams a `DynamicArray` to Zarr v2/v3, locally or remotely. Output: `zarr_format`, `chunks` or `chunk_size_mb`, `shard_coefficients`, `compressor`, `dtype`, `overwrite`. Pipeline: `region_size_mb` or `region_shape`, `max_workers`, `num_readers`, `memory_budget_mb`, `device`. Storage: `backend`, `storage_options`.
+- `io.write(array, path, ...)` streams a `DynamicArray` to Zarr v2/v3, locally or remotely. Output: `zarr_format`, `chunks` or `chunk_size_mb`, `shard_coefficients`, `compressor`, `dtype`, `dimension_names`, `overwrite`. Pipeline: `region_size_mb` or `region_shape`, `max_workers`, `num_readers`, `memory_budget_mb`, `device`. Storage: `backend`, `storage_options`.
+- `io.create_sink(path, shape, dtype, ...)` creates an output with the same output and storage options as `io.write` and returns a sink to push blocks into (`sink[key] = block`, e.g. from `dask.array.store`).
 - `io.clear_cache()` forgets the cached small reductions (see [Reductions and statistics](#reductions-and-statistics)).
 - `operations` is the lazy op set above.
 - `DynamicArray` is the pull-based lazy array (slicing, `.compute()`, `.persist()`, operators with NumPy broadcasting, lazy reductions such as `.mean()`, `.astype`/`.clip`/`.round`, ufunc protocol, `.shape`/`.dtype`/`.chunks`/`.size`/`.nbytes`).
