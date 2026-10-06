@@ -99,6 +99,27 @@ arr = io.read("array.zarr", backend="zarrista")   # default is "tensorstore"
 
 Note the `backend` parameter is specific for a **Zarr** storage backend. It should not be supplied with any value when the input is a TIFF. Supplying a backend with TIFF input will result in an error.
 
+### Wrap an array you already have
+
+`from_array` makes any array-like object lazy: a NumPy, zarr, TensorStore or dask array,
+a `micro_reader.Image`, or your own reader. A reader needs only `shape`, `dtype` and
+`__getitem__` returning a NumPy array. Nothing is read until you compute or write.
+
+```python
+from dyna_zarr import from_array
+
+arr = from_array(image)                    # e.g. micro_reader.open(path).images[0]
+arr = from_array(reader, chunks=(1, 256, 256))
+arr = from_array(reader, lock=True)        # one read at a time, for readers that need it
+```
+
+- The chunk grid is the source's own (`chunks`, dask's `chunksize`, or micro-reader's
+  `read_unit`) unless you pass `chunks=`.
+- A dask array is computed one region at a time. To write a dask array, pushing it into
+  `io.create_sink` (see [Writing a dask array](#writing-a-dask-array)) is faster.
+- To use worker processes, the source must pickle. A `micro_reader.Image` holds open
+  files and does not.
+
 ### Write (memory-bounded streaming)
 
 ```python
@@ -545,6 +566,7 @@ operation), so prefer it when you can build the array with dyna.
 - `io.read(source, backend=..., storage_options=...)` reads TIFF, Zarr v2, or Zarr v3 (local or remote) into a `DynamicArray`; `backend` is `"tensorstore"` (default) or the optional `"zarrista"`.
 - `io.write(array, path, ...)` streams a `DynamicArray` to Zarr v2/v3, locally or remotely. Output: `zarr_format`, `chunks` or `chunk_size_mb`, `shard_coefficients`, `compressor`, `dtype`, `dimension_names`, `overwrite`. Pipeline: `region_size_mb` or `region_shape`, `max_workers`, `num_readers`, `memory_budget_mb`, `device`. Storage: `backend`, `storage_options`.
 - `io.create_sink(path, shape, dtype, ...)` creates an output with the same output and storage options as `io.write` and returns a sink to push blocks into (`sink[key] = block`, e.g. from `dask.array.store`).
+- `from_array(source, chunks=None, lock=False)` wraps any array-like source (NumPy, zarr, TensorStore, dask, `micro_reader.Image`, your own reader) as a `DynamicArray`.
 - `io.clear_cache()` forgets the cached small reductions (see [Reductions and statistics](#reductions-and-statistics)).
 - `operations` is the lazy op set above.
 - `DynamicArray` is the pull-based lazy array (slicing, `.compute()`, `.persist()`, operators with NumPy broadcasting, lazy reductions such as `.mean()`, `.astype`/`.clip`/`.round`, ufunc protocol, `.shape`/`.dtype`/`.chunks`/`.size`/`.nbytes`).

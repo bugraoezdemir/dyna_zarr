@@ -66,20 +66,85 @@ def _reject_dask(source) -> None:
     `.chunks` reports dask's tuple-of-tuples `((2,2),(4,4))` where every consumer here
     expects a per-axis shape `(2,4)`, silently misfeeding the region/tile machinery.
 
-    Supporting it properly would mean materializing dask blocks on read and normalizing
-    `.chunks` - i.e. making dyna a consumer of dask graphs, against its dask-free premise.
-    There is already a clean route: compute or write the dask array first, or just use the
-    dask backend directly. TODO: revisit if a dask->dyna bridge is ever wanted.
+    Supporting it properly means materializing each region's dask slice on read and
+    reporting `chunksize` as the grid, which is what `from_array` does. The bare
+    constructor keeps refusing, so a dask array only ever enters through that one
+    explicit, correct path.
     """
-    mod = type(source).__module__.split(".")[0]
-    if mod == "dask":
+    if _is_dask(source):
         raise TypeError(
-            f"DynamicArray cannot wrap a {type(source).__module__}.{type(source).__name__}. "
-            "dyna_zarr is a pull-model backend and does not consume dask graphs: wrapping "
-            "one silently breaks sliced np.asarray() and reports dask-style .chunks. "
-            "Materialize it (np.asarray(arr) / arr.compute()), write it to zarr and read "
-            "that back, or use the dask backend instead."
+            f"DynamicArray() cannot wrap a {type(source).__module__}.{type(source).__name__} "
+            "directly: it would hand back dask slices and dask-style .chunks. Use "
+            "dyna_zarr.from_array(x), which computes each region's slice on read, or push "
+            "the dask array into io.create_sink(...) with dask.array.store."
         )
+
+
+def _is_dask(source) -> bool:
+    return type(source).__module__.split(".")[0] == "dask"
+
+
+class _SourceAdapter:
+    """An array source as DynamicArray reads it through `from_array`.
+
+    Exposes only ``shape`` / ``dtype`` / ``ndim`` / ``__getitem__``, so the constructor
+    does not probe the source for zarr settings (a ``micro_reader.Image`` has a
+    ``.metadata`` property that READS THE FILE). A dask source has each region's slice
+    computed on read - synchronously, because dyna's own worker threads are the
+    parallelism (a threaded compute inside each would nest thread pools). With a lock,
+    every read holds it, for sources that are not safe to read from several threads at
+    once. A lock cannot be pickled, so an unpickled adapter gets a fresh one (one per
+    process, which is what a per-process reader needs); the source itself must pickle.
+    """
+
+    def __init__(self, source, lock=None):
+        self._source = source
+        self._lock = lock
+        self._dask = _is_dask(source)
+        self.shape = tuple(int(s) for s in source.shape)
+        self.dtype = source.dtype
+        self.ndim = len(self.shape)
+
+    def _read(self, key):
+        block = self._source[key]
+        if self._dask:
+            return np.asarray(block.compute(scheduler="synchronous"))
+        return np.asarray(block)
+
+    def __getitem__(self, key):
+        if self._lock is None:
+            return self._read(key)
+        with self._lock:
+            return self._read(key)
+
+    def __reduce__(self):
+        # the lock is created on the UNPICKLING side; a lock object in the reduce
+        # arguments would itself have to be pickled, which is impossible
+        return (_restore_source_adapter, (self._source, self._lock is not None))
+
+    def __repr__(self):
+        locked = ", locked" if self._lock is not None else ""
+        return f"<source {self._source!r}{locked}>"
+
+
+def _restore_source_adapter(source, locked):
+    """Unpickle a _SourceAdapter: a fresh lock in this process if it had one."""
+    import threading
+    return _SourceAdapter(source, threading.Lock() if locked else None)
+
+
+def _per_axis_grid(value, ndim):
+    """``value`` as one positive int per axis, or None if it is not such a grid
+    (absent, wrong rank, dask's tuple-of-tuples, non-positive)."""
+    if value is None:
+        return None
+    try:
+        grid = tuple(int(v) for v in value)
+    except (TypeError, ValueError):
+        return None
+    if len(grid) != ndim or any(v < 1 for v in grid):
+        return None
+    return grid
 
 
 class _PersistOwner:
@@ -1077,3 +1142,88 @@ _REGION_BUFFER_POOL = RegionBufferPool(max_size=64)
 
 
 
+
+
+def from_array(source, chunks=None, *, lock=False) -> DynamicArray:
+    """Wrap an array-like ``source`` as a lazy DynamicArray. Nothing is read until the
+    array is.
+
+    Supported sources:
+
+    - ``numpy.ndarray``, ``zarr.Array``, a TensorStore array, a ``DynamicArray``;
+    - a ``dask.array.Array``: each region's slice is computed when dyna reads it (with
+      dask's synchronous scheduler - dyna's worker threads are the parallelism). Correct
+      and memory-bounded, but work the graph shares between regions (an overlap filter,
+      a rechunk) is redone per region; to WRITE a dask array, pushing it into
+      ``io.create_sink`` is usually faster;
+    - a ``micro_reader.Image``, or any object with ``shape``, ``dtype`` and
+      ``__getitem__`` returning a NumPy array for a tuple of slices (e.g. a reader's own
+      region source).
+
+    Parameters
+    ----------
+    chunks : tuple of int, optional
+        The grid to report (it drives region alignment and io.write's default output
+        chunks). Default: the source's own grid - zarr / TensorStore chunks, dask's
+        ``chunksize``, otherwise a ``chunks`` attribute that is one int per axis, then
+        micro-reader's ``read_unit`` - else none.
+    lock : bool or lock, optional
+        Serialise every read, for a source that is not safe to read from several
+        threads at once (``True``: a new lock; or pass a lock to share it between
+        sources). Refused for numpy, zarr, TensorStore and dask, which are safe already.
+
+    Only zarr and TensorStore sources carry a storage format and codec for io.write to
+    keep; anything else is written with its defaults (zarr v3, blosc-lz4). A source must
+    pickle to be used by worker processes (a ``micro_reader.Image`` holds open files and
+    does not).
+    """
+    is_dask = _is_dask(source)
+    safe = is_dask or isinstance(source, (DynamicArray, np.ndarray, zarr.Array)) or (
+        hasattr(source, 'read') and hasattr(source, 'spec'))           # TensorStore
+    if lock and safe:
+        raise ValueError(
+            f"lock= is for sources that are not thread-safe; a {type(source).__name__} "
+            f"is safe to read from several threads already. Drop lock=.")
+
+    if safe and not is_dask:
+        # the constructor's own paths: they keep the storage settings (format, codecs,
+        # shards) that zarr and TensorStore sources carry
+        if isinstance(source, np.ndarray):
+            return DynamicArray(source, chunks=chunks)
+        arr = DynamicArray(source)
+        if chunks is not None:
+            arr._chunks = _clamped(_require_grid(chunks, arr.shape), arr.shape)
+        return arr
+
+    missing = [a for a in ('shape', 'dtype', '__getitem__') if not hasattr(source, a)]
+    if missing:
+        raise TypeError(
+            f"{type(source).__module__}.{type(source).__name__} is not array-like: it has "
+            f"no {', '.join(missing)}. A source needs shape, dtype and __getitem__ "
+            f"returning a NumPy array.")
+    shape = tuple(int(s) for s in source.shape)
+    if chunks is not None:
+        grid = _require_grid(chunks, shape)
+    elif is_dask:
+        grid = _per_axis_grid(source.chunksize, len(shape))
+    else:
+        # advisory grids: a malformed one is ignored, not trusted
+        grid = (_per_axis_grid(getattr(source, 'chunks', None), len(shape))
+                or _per_axis_grid(getattr(source, 'read_unit', None), len(shape)))
+    if lock is True:
+        lock = threading.Lock()
+    arr = DynamicArray(_SourceAdapter(source, lock or None))
+    arr._chunks = _clamped(grid, shape) if grid is not None else None
+    return arr
+
+
+def _require_grid(chunks, shape):
+    grid = _per_axis_grid(chunks, len(tuple(shape)))
+    if grid is None:
+        raise ValueError(f"chunks={chunks!r} must be one positive int per axis of "
+                         f"shape {tuple(shape)}")
+    return grid
+
+
+def _clamped(grid, shape):
+    return tuple(min(int(c), int(s)) for c, s in zip(grid, shape))
