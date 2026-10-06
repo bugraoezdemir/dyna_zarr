@@ -1745,7 +1745,7 @@ class _ZarristaOutput:
 
 
 def _open_zarrista_output(output_path, shape, chunks, dtype, codecs,
-                          zarr_format, shards, storage_options=None):
+                          zarr_format, shards, storage_options=None, dimension_names=None):
     """Create the output array through the optional zarrista backend.
 
     ``shards`` is the resolved shard SHAPE (already coefficients x chunks), or None.
@@ -1760,7 +1760,7 @@ def _open_zarrista_output(output_path, shape, chunks, dtype, codecs,
     else:
         array = create_v3(output_path, shape, chunks, dtype,
                           shard=tuple(shards) if shards else None, codecs=codecs,
-                          storage_options=storage_options)
+                          storage_options=storage_options, dimension_names=dimension_names)
     return _ZarristaOutput(array)
 
 
@@ -1892,12 +1892,13 @@ class _OutputSpec:
     solved_region: Tuple[int, ...]
     notes: List[str] = field(default_factory=list)
     existing: Optional[str] = None   # what _existing_output found there
+    dimension_names: Optional[Tuple[str, ...]] = None   # v3 only
 
 
 def _resolve_output(array, output_path, *, max_workers, num_readers, chunks, chunk_size_mb,
                     shard_coefficients, dtype, compressor, zarr_format, region_size_mb,
                     gc_interval, device, region_shape, memory_budget_mb, overwrite,
-                    backend, storage_options) -> _OutputSpec:
+                    backend, storage_options, dimension_names=None) -> _OutputSpec:
     """Validate every io.write argument and resolve the output's settings.
 
     Raises before anything touches storage, so a rejected write leaves nothing behind.
@@ -2128,6 +2129,21 @@ def _resolve_output(array, output_path, *, max_workers, num_readers, chunks, chu
                 f"{tuple(final_chunks)}, so the output is written unsharded. Pass "
                 f"shard_coefficients= to shard it.")
 
+    # --- dimension_names: v3 metadata, one name per axis ------------------------
+    # zarr v2 has no field for them; dropping them there would be the same silent
+    # discard the shard check above refuses, so v2 is refused too.
+    final_dim_names = None
+    if dimension_names is not None:
+        if final_format != 3:
+            raise ValueError(
+                f"dimension_names requires zarr_format=3; zarr v{final_format} has no "
+                f"dimension_names field. Pass zarr_format=3, or drop dimension_names.")
+        final_dim_names = tuple(dimension_names)
+        if len(final_dim_names) != ndim or not all(isinstance(n, str) for n in final_dim_names):
+            raise ValueError(
+                f"dimension_names must be {ndim} strings, one per axis, got "
+                f"{tuple(dimension_names)!r}")
+
     # --- region_shape: whole output chunks per axis -----------------------------
     if region_shape is not None:
         misaligned = [
@@ -2169,7 +2185,7 @@ def _resolve_output(array, output_path, *, max_workers, num_readers, chunks, chu
         codecs=final_codecs, zarr_format=final_format, backend=backend,
         storage_options=storage_options, overwrite=bool(overwrite), remote=remote,
         region_mb=region_mb, solved_region=tuple(int(r) for r in solved_region),
-        notes=list(notes),
+        notes=list(notes), dimension_names=final_dim_names,
     )
 
 
@@ -2207,6 +2223,8 @@ def _ts_output_spec(spec: _OutputSpec) -> dict:
             'codecs': codecs,
             'data_type': spec.dtype_v3,
         }
+        if spec.dimension_names is not None:
+            ts_spec['metadata']['dimension_names'] = list(spec.dimension_names)
     else:
         ts_spec['metadata'] = {
             'shape': list(spec.shape),
@@ -2240,6 +2258,7 @@ def _open_output(spec: _OutputSpec):
         return _open_zarrista_output(
             spec.path, spec.shape, spec.chunks, spec.dtype, spec.codecs,
             spec.zarr_format, spec.shards, spec.storage_options,
+            dimension_names=spec.dimension_names,
         )
     import tensorstore as ts
     return ts.open(_ts_output_spec(spec), create=True).result()
@@ -2267,6 +2286,59 @@ class _SyncSink:
             self._handle._array[key] = data         # normalizes the key, handles remote
         else:
             self._handle[key].write(data).result()
+
+
+class Sink(_SyncSink):
+    """An output array that blocks are PUSHED into: ``sink[key] = block``.
+
+    Returned by :func:`create_sink`, for producers that schedule their own work - e.g.
+    ``dask.array.store(x, sink, lock=False)``. The output is resolved and created exactly
+    as io.write's (format, chunks, codecs, shards, dimension names, overwrite rule,
+    local or remote, both backends); only the pull pipeline is left out.
+
+    Concurrent writers must each write whole ``write_unit`` blocks (the chunk, or the
+    shard when sharded) - the same rule io.write's regions follow, and what keeps
+    concurrent writes free of lost updates. Rechunk the producer to ``write_unit`` (or a
+    multiple of it) before storing.
+    """
+
+    def __init__(self, handle, spec: _OutputSpec):
+        super().__init__(handle, spec)
+        self.path = spec.path
+        self.shards = spec.shards
+        self.zarr_format = spec.zarr_format
+        self.ndim = len(spec.shape)
+
+    @property
+    def write_unit(self) -> Tuple[int, ...]:
+        """The block shape concurrent writers must not share: shards, else chunks."""
+        return tuple(self.shards) if self.shards is not None else tuple(self.chunks)
+
+
+def create_sink(output_path, shape, dtype, *, chunks=None, chunk_size_mb=None,
+                shard_coefficients=None, compressor=None, zarr_format=None,
+                overwrite=False, backend="tensorstore", storage_options=None,
+                dimension_names=None) -> Sink:
+    """Create an empty output array and return a :class:`Sink` to push blocks into.
+
+    The push counterpart of io.write, for producers dyna does not pull from (a dask
+    graph, a custom pipeline). Every output argument means what it means in io.write:
+    ``chunks`` exact, ``chunk_size_mb`` a budget (default: dyna's default grid), codecs
+    blosc-lz4 by default, ``zarr_format`` v3 by default, shards only on v3, and the same
+    overwrite rule. Validated before anything is created.
+    """
+    from .operations.creation import empty
+    # a generative stand-in carrying only shape / dtype / grid: never read
+    template = empty(tuple(int(s) for s in shape), dtype=dtype, chunks=chunks)
+    spec = _resolve_output(
+        template, output_path, max_workers=1, num_readers=None, chunks=chunks,
+        chunk_size_mb=chunk_size_mb, shard_coefficients=shard_coefficients, dtype=None,
+        compressor=compressor, zarr_format=zarr_format, region_size_mb=None,
+        gc_interval=15.0, device=None, region_shape=None, memory_budget_mb=None,
+        overwrite=overwrite, backend=backend, storage_options=storage_options,
+        dimension_names=dimension_names,
+    )
+    return Sink(_open_output(spec), spec)
 
 
 #: The outermost transforms io.write hands to a STAGED writer instead of the region
@@ -2344,6 +2416,7 @@ def write_array(
     overwrite: bool = False,
     backend: str = "tensorstore",
     storage_options: Optional[dict] = None,
+    dimension_names: Optional[Tuple[str, ...]] = None,
 ):
     """
     ASYNC VECTORIZED TensorStore write with queue-based pipeline:
@@ -2442,6 +2515,11 @@ def write_array(
         that are not a zarr store (no .zarray/.zgroup/zarr.json) are never written into
         or deleted, even with True, so a mistyped `output_path` cannot destroy an
         unrelated tree. An empty directory counts as nothing.
+    dimension_names : tuple of str, optional
+        One name per axis, stored as the zarr v3 array's ``dimension_names``. dyna
+        writes them verbatim and attaches no meaning to them; what they must be is the
+        caller's format (e.g. an OME-Zarr writer passes its axes). Zarr v3 only: v2 has
+        no such field, so passing them with zarr_format=2 is an error, not a silent drop.
     gc_interval : float
         Seconds between GC runs (default: 15.0)
     """
@@ -2455,6 +2533,7 @@ def write_array(
         region_size_mb=region_size_mb, gc_interval=gc_interval, device=device,
         region_shape=region_shape, memory_budget_mb=memory_budget_mb,
         overwrite=overwrite, backend=backend, storage_options=storage_options,
+        dimension_names=dimension_names,
     )
     _region_mb = spec.region_mb
     for _note in spec.notes:
@@ -3071,6 +3150,19 @@ class io:
         clear_all_caches()
 
     @staticmethod
+    def create_sink(output_path, shape, dtype, *, chunks=None, chunk_size_mb=None,
+                    shard_coefficients=None, compressor=None, zarr_format=None,
+                    overwrite=False, backend="tensorstore", storage_options=None,
+                    dimension_names=None) -> 'Sink':
+        """Create an empty output to PUSH blocks into (``sink[key] = block``), e.g. with
+        ``dask.array.store``. See :func:`create_sink`."""
+        return create_sink(output_path, shape, dtype, chunks=chunks,
+                           chunk_size_mb=chunk_size_mb,
+                           shard_coefficients=shard_coefficients, compressor=compressor,
+                           zarr_format=zarr_format, overwrite=overwrite, backend=backend,
+                           storage_options=storage_options, dimension_names=dimension_names)
+
+    @staticmethod
     def write(
         array: 'DynamicArray',
         output_path: str,
@@ -3092,6 +3184,7 @@ class io:
         overwrite: bool = False,
         backend: str = "tensorstore",
         storage_options: Optional[dict] = None,
+        dimension_names: Optional[Tuple[str, ...]] = None,
     ):
         """Write array to Zarr. See write_array() for details. ``device`` ('cpu'|'cuda')
         runs each region's op chain on that device (results are written from host).
@@ -3123,4 +3216,5 @@ class io:
             overwrite=overwrite,
             backend=backend,
             storage_options=storage_options,
+            dimension_names=dimension_names,
         )

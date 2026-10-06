@@ -151,6 +151,8 @@ def test_explicit_compressor_and_shards_still_win(tmp_path):
     dict(max_workers=0),
     dict(device="tpu"),
     dict(zarr_format=2, shard_coefficients=(1, 1, 1)),
+    dict(zarr_format=2, dimension_names=("z", "y", "x")),  # v2 has no such field
+    dict(zarr_format=3, dimension_names=("y", "x")),       # wrong rank
 ])
 def test_rejected_write_leaves_nothing_behind(tmp_path, bad):
     _, a = _src(tmp_path)
@@ -168,3 +170,16 @@ def test_http_output_on_tensorstore_is_refused_not_written_locally(tmp_path, mon
     with pytest.raises(UnsupportedByBackend, match="backend='zarrista'"):
         _write(a, "https://example.org/out.zarr")
     assert os.listdir(tmp_path) == []                   # no local 'https:' directory
+
+
+@pytest.mark.parametrize("backend", ["tensorstore",
+                                     pytest.param("zarrista", marks=pytest.mark.zarrista)])
+def test_dimension_names_are_written_to_v3_metadata(tmp_path, backend):
+    # a plain zarr v3 array field, written verbatim (callers such as an OME-Zarr writer
+    # decide what the names must be)
+    data, a = _src(tmp_path)
+    out = tmp_path / "out.zarr"
+    _write(a, str(out), zarr_format=3, dimension_names=("z", "y", "x"), backend=backend)
+    z = zarr.open_array(str(out))
+    assert z.metadata.dimension_names == ("z", "y", "x")
+    np.testing.assert_array_equal(z[...], data)

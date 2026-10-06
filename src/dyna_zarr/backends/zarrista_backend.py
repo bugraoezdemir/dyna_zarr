@@ -332,7 +332,7 @@ def _store(path):
 
 
 def create_v3(path, shape, chunks, dtype, shard=None, codecs=None,
-              storage_options=None):
+              storage_options=None, dimension_names=None):
     """Create a zarr v3 array. ``shard`` makes ``chunks`` the inner subchunk shape."""
     require_zarrista()
     from ..codecs import Codecs
@@ -347,6 +347,8 @@ def create_v3(path, shape, chunks, dtype, shard=None, codecs=None,
     ).compressors(_compressor_chain(codecs, dtype))
     if shard:
         builder = builder.subchunk_shape(tuple(chunks))
+    if dimension_names is not None:
+        builder = builder.dimension_names(list(dimension_names))
     if _is_remote(path):
         store = _obstore(path, storage_options)
         return ZarristaArray(

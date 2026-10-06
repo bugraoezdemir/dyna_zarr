@@ -251,6 +251,36 @@ class DynamicArray:
                 if self._is_tensorstore:
                     from .io import _ts_zarr_format
                     self._zarr_format = _ts_zarr_format(source)
+                    if self._zarr_format is not None:
+                        # a STORED zarr array (not a virtual view such as ts.downsample):
+                        # its spec carries the codecs and shards, its chunk layout the
+                        # grid - the same inheritable settings a zarr-python source gives
+                        self._inherit_ts_storage(source)
+
+    def _inherit_ts_storage(self, ts_array):
+        """Chunk grid, codecs and shards of a stored TensorStore zarr array.
+
+        Without them a TensorStore source reported ``chunks=None`` and no codec, so
+        io.write fell back to its default chunking and blosc - a TensorStore level (e.g.
+        a deferred ``downscale`` view in ome_zarr_pyramid) lost its storage settings on
+        the way through. Anything unreadable stays None ("no preference").
+        """
+        from .io import _storage_settings_from_metadata
+        try:
+            md = ts_array.spec().to_json().get("metadata")
+        except Exception:
+            md = None
+        _, codecs, shards = _storage_settings_from_metadata(md)
+        self._codecs = codecs
+        if shards is not None and len(shards) == len(self._shape):
+            self._shards = shards
+        if self._chunks is None:
+            try:
+                read_chunk = tuple(int(c) for c in ts_array.chunk_layout.read_chunk.shape)
+            except Exception:
+                read_chunk = None
+            if read_chunk and len(read_chunk) == len(self._shape) and all(c > 0 for c in read_chunk):
+                self._chunks = read_chunk
 
     def _extract_zarr_metadata(self, zarr_array):
         """Storage format, compression and sharding of a zarr source, from zarr 3's API.
