@@ -224,6 +224,55 @@ def astype(array, dtype):
     return map_blocks(lambda x: x.astype(dtype), array, dtype=np.dtype(dtype), name="astype")
 
 
+def _saturate_block(x, dtype):
+    """``x`` cast to ``dtype`` without wrapping: the block function of saturate_cast.
+
+    To an integer dtype: floats are rounded to nearest (254.7 -> 255, not 254) and NaN
+    becomes 0; then values are clipped to the target's range (uint16 4000 -> uint8 255,
+    -3 -> 0, +/-inf -> the bounds). Clipping happens only where the source range can
+    exceed the target, so a widening cast stays a plain dtype change. Float, bool and
+    complex targets are a plain ``astype`` (a float target's range covers any integer;
+    float64 -> float32 overflow gives inf, as in NumPy).
+    """
+    dtype = np.dtype(dtype)
+    if x.dtype == dtype:
+        return x
+    if dtype.kind not in "iu" or x.dtype.kind not in "biuf":
+        return x.astype(dtype)
+    info = np.iinfo(dtype)
+    if x.dtype.kind == "f":
+        if x.dtype.itemsize < 4:
+            x = x.astype(np.float32)        # float16 cannot hold the integer bounds
+        x = np.rint(np.where(np.isnan(x), 0, x))
+        with np.errstate(invalid="ignore", over="ignore"):    # the top bound: fixed below
+            out = np.clip(x, info.min, info.max).astype(dtype)
+        top = x.dtype.type(info.max)
+        if int(top) != info.max:
+            # the bound is not representable in the float dtype and rounds UP (float32
+            # 2**31 - 1 -> 2**31), so the clipped value is out of range for the cast
+            out[x >= top] = info.max
+        return out
+    src = np.iinfo(x.dtype) if x.dtype.kind in "iu" else np.iinfo(np.uint8)   # bool: 0/1
+    lo, hi = max(int(info.min), int(src.min)), min(int(info.max), int(src.max))
+    if lo > src.min or hi < src.max:
+        # bounds in the SOURCE dtype: mixing uint64 and int64 would go through float64
+        x = np.clip(x, x.dtype.type(lo), x.dtype.type(hi))
+    return x.astype(dtype)
+
+
+def saturate_cast(array, dtype):
+    """Lazily cast to ``dtype``, saturating instead of wrapping (see _saturate_block):
+    uint16 4000 -> uint8 255, float 254.7 -> 255, NaN -> 0. ``astype`` keeps NumPy's
+    wrapping semantics; io.write's ``dtype=`` uses this. A NumPy array is cast eagerly,
+    so this is also the block function for other libraries (``dask_arr.map_blocks(
+    saturate_cast, dtype, dtype=dtype)``)."""
+    dtype = np.dtype(dtype)
+    if isinstance(array, np.ndarray):
+        return _saturate_block(array, dtype)
+    return map_blocks(lambda x: _saturate_block(x, dtype), array, dtype=dtype,
+                      name="saturate_cast")
+
+
 # binary
 def add(a, b): return map_blocks(np.add, a, b, name="add")
 def subtract(a, b): return map_blocks(np.subtract, a, b, name="subtract")
@@ -295,7 +344,7 @@ def digitize(array, bins, right=False):
 __all__ = [
     "MapBlocksTransform", "map_blocks",
     "abs", "negative", "sign", "sqrt", "square", "exp", "log", "log2", "log10",
-    "floor", "ceil", "reciprocal", "round", "clip", "astype",
+    "floor", "ceil", "reciprocal", "round", "clip", "astype", "saturate_cast",
     "exp2", "expm1", "log1p", "cbrt", "fabs", "positive", "conjugate",
     "rint", "trunc", "spacing",
     "sin", "cos", "tan", "arcsin", "arccos", "arctan",

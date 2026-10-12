@@ -1,14 +1,10 @@
 """Optional zarrista storage backend.
 
-zarrista is a Rust-backed (zarrs) Zarr implementation. Benchmarked against the
-TensorStore path on this repo's ``benchmarks/`` harness -- matched codecs, matched
-concurrency, byte-identical output verified in both directions -- it was faster in
-every configuration measured (v3 unsharded 2.40x write / 2.00x read; v3 sharded
-1.62x / 2.15x; v2 1.62x / 1.47x).
+zarrista is a Rust-backed (zarrs) Zarr implementation, writing output byte-identical
+to the TensorStore path.
 
 It is **opt-in**, and deliberately so: zarrista 0.1.0 is beta-quality by its own
-README, and has two silent failure modes this module exists to contain. Both are
-documented with runnable repros in ``reports/zarrista_bugs/``.
+README, and has two silent failure modes this module exists to contain.
 
 1. **Misaligned concurrent writes silently lose data.** Threads writing regions that
    do not tile the array's write unit (the chunk when unsharded, the shard when
@@ -210,7 +206,7 @@ def check_write_alignment(region, write_unit, threads):
         raise AlignmentError(
             f"region {tuple(region)} is not a per-axis multiple of the write unit "
             f"{tuple(write_unit)} ({detail}). Concurrent writes to a shared unit "
-            f"SILENTLY lose data in zarrista 0.1.0 (see reports/zarrista_bugs/). "
+            f"SILENTLY lose data in zarrista 0.1.0. "
             f"Use a region that tiles the write unit, or pass threads=1."
         )
 
@@ -378,7 +374,8 @@ def create_v2(path, shape, chunks, dtype, codecs=None, separator="/",
         "chunks": list(chunks),
         "dtype": dtype.str,
         "compressor": codecs.to_v2_config(),
-        "fill_value": 0,
+        # typed like the TensorStore path's (false / 0.0 / 0), so both backends agree
+        "fill_value": False if dtype.kind == "b" else (0.0 if dtype.kind == "f" else 0),
         "order": "C",
         "filters": None,
         "dimension_separator": separator,

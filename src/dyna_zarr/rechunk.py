@@ -27,11 +27,14 @@ from itertools import product
 import numpy as np
 import zarr
 
+from ._compat import renamed
 from .utils import parse_dtype
 from .operations._backend import asnumpy
+from .operations.pointwise import _saturate_block
 
 DEFAULT_MAX_MEM = 256 * 1024 * 1024     # per-worker region-buffer budget, in bytes
-DEFAULT_MAX_WORKERS = 4                  # concurrent read->write regions
+DEFAULT_MAX_THREADS = 4                  # concurrent read->write regions
+DEFAULT_MAX_WORKERS = DEFAULT_MAX_THREADS  # old name
 
 
 # --------------------------------------------------------------------------- #
@@ -177,11 +180,11 @@ def _expand_region(base_chunk, shape, budget):
     return tuple(region)
 
 
-def _copy(src, dst, base_chunk, shape, budget, max_workers):
+def _copy(src, dst, base_chunk, shape, budget, max_threads):
     """Copy src->dst region by region. Each region is a multiple of ``base_chunk`` (the COARSER
     grid) sized to ``budget`` -> chunk-aligned both sides (read-once / write-once), disjoint ->
-    parallel-safe (distinct chunk files). Up to ``max_workers`` regions in flight => peak
-    ~= max_workers * region_bytes."""
+    parallel-safe (distinct chunk files). Up to ``max_threads`` regions in flight => peak
+    ~= max_threads * region_bytes."""
     ndim = len(shape)
     region = _expand_region(base_chunk, shape, budget)
     origins = list(product(*[range(0, shape[d], region[d]) for d in range(ndim)]))
@@ -189,27 +192,32 @@ def _copy(src, dst, base_chunk, shape, budget, max_workers):
     def task(origin):
         sl = tuple(slice(o, min(o + region[d], shape[d]))
                    for d, o in zip(range(ndim), origin))
-        dst[sl] = _read(src, sl)
+        block = _read(src, sl)
+        if block.dtype != dst.dtype:
+            block = _saturate_block(block, dst.dtype)     # never wraps (see saturate_cast)
+        dst[sl] = block
 
-    if max_workers <= 1 or len(origins) <= 1:
+    if max_threads <= 1 or len(origins) <= 1:
         for o in origins:
             task(o)
     else:
-        # ThreadPoolExecutor runs <= max_workers tasks concurrently; reads happen INSIDE the
-        # task, so at most max_workers regions are resident at once. list() surfaces exceptions.
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        # ThreadPoolExecutor runs <= max_threads tasks concurrently; reads happen INSIDE the
+        # task, so at most max_threads regions are resident at once. list() surfaces exceptions.
+        with ThreadPoolExecutor(max_workers=max_threads) as ex:
             list(ex.map(task, origins))
 
 
 def rechunk(source, target_chunks, output_path, dtype=None, zarr_format=2,
-            intermediate_path=None, max_mem=DEFAULT_MAX_MEM, max_workers=DEFAULT_MAX_WORKERS):
+            intermediate_path=None, max_mem=DEFAULT_MAX_MEM, max_threads=None, max_workers=None):
     """Rechunk ``source`` (a DynamicArray or zarr, same output shape) to ``target_chunks`` at
     ``output_path``, disk-staged and memory-bounded. Returns output_path.
 
-    Memory model (per-worker, matching io.write's region_size_mb + max_workers): each worker
+    Memory model (per-worker, matching io.write's region_size_mb + max_threads): each worker
     buffers up to ``max_mem`` bytes (one region = as many whole aligned chunks as fit, >= one
-    chunk); ``max_workers`` regions run concurrently, so peak ~= ``max_workers * max_mem``.
+    chunk); ``max_threads`` regions run concurrently, so peak ~= ``max_threads * max_mem``.
     """
+    max_threads = renamed(max_threads, max_workers, new="max_threads",
+                          old="max_workers", where="rechunk", default=DEFAULT_MAX_THREADS)
     shape = tuple(int(s) for s in source.shape)
     ndim = len(shape)
     dt = parse_dtype(dtype if dtype is not None else source.dtype)[0]
@@ -227,16 +235,16 @@ def rechunk(source, target_chunks, output_path, dtype=None, zarr_format=2,
     # (the same test as _needs_intermediate, which staging_bytes uses to size the disk)
 
     if src_divides_tgt:
-        _copy(source, out, tc, shape, budget, max_workers)   # consolidate: base = target chunk
+        _copy(source, out, tc, shape, budget, max_threads)   # consolidate: base = target chunk
     elif tgt_divides_src:
-        _copy(source, out, sc, shape, budget, max_workers)   # split: base = source chunk
+        _copy(source, out, sc, shape, budget, max_threads)   # split: base = source chunk
     else:
         ic = tuple(math.gcd(sc[d], tc[d]) for d in range(ndim))
         ipath = intermediate_path or (str(output_path) + ".rechunk_int.zarr")
         interm = zarr.open(ipath, mode="w", shape=shape, chunks=ic, dtype=dt,
                            zarr_format=zarr_format)
-        _copy(source, interm, sc, shape, budget, max_workers)   # phase 1 (int | source)
-        _copy(interm, out, tc, shape, budget, max_workers)      # phase 2 (int | target)
+        _copy(source, interm, sc, shape, budget, max_threads)   # phase 1 (int | source)
+        _copy(interm, out, tc, shape, budget, max_threads)      # phase 2 (int | target)
         try:
             shutil.rmtree(ipath)
         except Exception:
@@ -245,8 +253,8 @@ def rechunk(source, target_chunks, output_path, dtype=None, zarr_format=2,
 
 
 def flatten_write(source, output, output_chunks=None, max_mem=DEFAULT_MAX_MEM,
-                  max_workers=DEFAULT_MAX_WORKERS, dtype=None, zarr_format=2,
-                  staging_dir=None, extra_staging_bytes=0):
+                  max_threads=None, dtype=None, zarr_format=2,
+                  staging_dir=None, extra_staging_bytes=0, max_workers=None):
     """Flatten ``source`` (nd) to 1D into ``output``, memory-bounded + read-once.
 
     ``output`` is a path (a local zarr array is created there) or an opened sink from
@@ -262,6 +270,8 @@ def flatten_write(source, output, output_chunks=None, max_mem=DEFAULT_MAX_MEM,
     Free space is checked first (StagingSpaceError); ``extra_staging_bytes`` lets a
     caller that stages alongside (reshape) include its own share in that check.
     """
+    max_threads = renamed(max_threads, max_workers, new="max_threads",
+                          old="max_workers", where="flatten_write", default=DEFAULT_MAX_THREADS)
     shape = tuple(int(s) for s in source.shape)
     ndim = len(shape)
     dt = parse_dtype(dtype if dtype is not None else source.dtype)[0]
@@ -274,7 +284,7 @@ def flatten_write(source, output, output_chunks=None, max_mem=DEFAULT_MAX_MEM,
         ff_path = os.path.join(stage, "flat_contiguous.zarr")
         rechunk(source, ff_chunks, ff_path, dtype=dt, zarr_format=3,
                 intermediate_path=os.path.join(stage, "rechunk_int.zarr"),
-                max_mem=max_mem, max_workers=max_workers)    # read-once source, parallel
+                max_mem=max_mem, max_threads=max_threads)    # read-once source, parallel
         ff = zarr.open(ff_path, mode="r")
 
         N = suffix[0] * shape[0]
@@ -303,8 +313,8 @@ def flatten_write(source, output, output_chunks=None, max_mem=DEFAULT_MAX_MEM,
 
 
 def reshape_write(source, target_shape, output, output_chunks=None,
-                  max_mem=DEFAULT_MAX_MEM, max_workers=DEFAULT_MAX_WORKERS,
-                  dtype=None, zarr_format=2, staging_dir=None):
+                  max_mem=DEFAULT_MAX_MEM, max_threads=None,
+                  dtype=None, zarr_format=2, staging_dir=None, max_workers=None):
     """Reshape ``source`` -> ``target_shape`` (C-order) into ``output``, memory-bounded.
 
     ``output`` is a path or an opened sink from io.write (any backend, local or remote).
@@ -319,6 +329,8 @@ def reshape_write(source, target_shape, output, output_chunks=None,
     Shape change happens only at the F -> target flat-identity relabel (output flat index ==
     input flat index); everything else is same-shape staging.
     """
+    max_threads = renamed(max_threads, max_workers, new="max_threads",
+                          old="max_workers", where="reshape_write", default=DEFAULT_MAX_THREADS)
     from .dynamic_array import DynamicArray
     from .reindex import reindex_write
 
@@ -345,7 +357,7 @@ def reshape_write(source, target_shape, output, output_chunks=None,
         # region_size_mb said.)
         f_chunk = (max(1, min(N, int(max_mem) // dt.itemsize)),)
         flatten_write(source, f_path, output_chunks=f_chunk, max_mem=max_mem,
-                      max_workers=max_workers, dtype=dt, zarr_format=3,
+                      max_threads=max_threads, dtype=dt, zarr_format=3,
                       staging_dir=stage)
         F = DynamicArray(zarr.open(f_path, mode="r"))
         reindex_write(F, target_shape, output, output_chunks,

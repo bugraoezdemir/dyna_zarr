@@ -128,8 +128,8 @@ def test_the_source_is_not_probed_for_zarr_settings(tmp_path):
 
 def test_lock_serialises_reads(tmp_path):
     free, locked = Duck(chunks=(1, 4, 60, 90), delay=0.02), Duck(chunks=(1, 4, 60, 90), delay=0.02)
-    _write(from_array(free), tmp_path / "free.zarr", max_workers=8, region_shape=(1, 4, 60, 90))
-    _write(from_array(locked, lock=True), tmp_path / "locked.zarr", max_workers=8,
+    _write(from_array(free), tmp_path / "free.zarr", max_threads=8, region_shape=(1, 4, 60, 90))
+    _write(from_array(locked, lock=True), tmp_path / "locked.zarr", max_threads=8,
            region_shape=(1, 4, 60, 90))
     assert free.peak > 1                    # without a lock, regions are read concurrently
     assert locked.peak == 1                 # with one, never two reads at once
@@ -173,13 +173,14 @@ def test_dask_arrays_are_computed_per_region(tmp_path):
     region = np.asarray(a[1, 2:9, 10:70, 3])
     assert isinstance(region, np.ndarray)                   # materialized, not a dask slice
     np.testing.assert_array_equal(region, (DATA * 2 + 1)[1, 2:9, 10:70, 3])
-    _write(a + 1, tmp_path / "out.zarr", max_workers=8)
+    _write(a + 1, tmp_path / "out.zarr", max_threads=8)
     np.testing.assert_array_equal(zarr.open_array(str(tmp_path / "out.zarr"))[...],
                                   DATA * 2 + 2)
     np.testing.assert_array_equal(np.asarray(pickle.loads(pickle.dumps(a))[0, 0]),
                                   (DATA * 2 + 1)[0, 0])
-    with pytest.raises(ValueError, match="lock="):
-        from_array(x, lock=True)
+    # a dask graph can wrap any reader, so lock= is the caller's call (test_dask_read_locks)
+    assert from_array(x, lock=True)._source._lock is not None
+    assert from_array(x)._source._lock is None              # plain dask: no lock by default
 
 
 def test_the_bare_constructor_still_refuses_dask():

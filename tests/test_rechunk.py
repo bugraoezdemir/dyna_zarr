@@ -64,14 +64,14 @@ def test_rechunk_read_once(src3d, tmp_path):
     assert cz.reads == arr.size          # each source element read exactly once
 
 
-@pytest.mark.parametrize("max_workers", [1, 4])
-def test_rechunk_parallel_correct_and_read_once(src3d, max_workers, tmp_path):
+@pytest.mark.parametrize("max_threads", [1, 4])
+def test_rechunk_parallel_correct_and_read_once(src3d, max_threads, tmp_path):
     """Small max_mem forces MANY regions -> the thread pool is actually exercised. Result must
     match numpy and each source element must still be read exactly once under concurrency."""
     arr, z = src3d
     cz = CountZarr(z)
     out = str(tmp_path / "o.zarr")
-    rechunk(cz, (5, 7, 6), out, max_mem=4096, max_workers=max_workers, zarr_format=2)  # misaligned
+    rechunk(cz, (5, 7, 6), out, max_mem=4096, max_threads=max_threads, zarr_format=2)  # misaligned
     np.testing.assert_array_equal(zarr.open(out, mode="r")[:], arr)
     assert cz.reads == arr.size
 

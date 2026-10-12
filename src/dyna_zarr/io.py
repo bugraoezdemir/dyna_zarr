@@ -1,4 +1,4 @@
-﻿"""
+"""
 I/O utilities for reading and writing array formats.
 
 Provides unified interfaces for:
@@ -7,6 +7,8 @@ Provides unified interfaces for:
 - Supports both local and remote storage (gs://, s3://, http://, https://)
 """
 
+import contextlib
+import contextvars
 import tensorstore as ts
 import zarr
 import numpy as np
@@ -19,10 +21,15 @@ import json
 import math
 import time
 import threading
+import functools
 import gc
 import shutil
 import warnings
-from queue import Queue
+
+from ._compat import renamed
+
+from .operations.pointwise import _saturate_block
+from queue import Full, Queue
 
 from .tiff_reader import open_tiff_zarr, read_tiff_lazy
 from .codecs import Codecs
@@ -35,10 +42,182 @@ from .operations._backend import (
 )
 
 
-#: Smallest workable pipeline: 1 reader + 1 queued region + 1 in-flight write. `max_workers`
+#: Smallest workable pipeline: 1 reader + 1 queued region + 1 in-flight write. `max_threads`
 #: (the total live-region budget) is never taken below this, even by `memory_budget_mb` -
 #: a budget that cannot fit 3 regions warns instead of deadlocking on a zero-capacity stage.
+#: Where io's progress messages go: None prints them; a list collects them. A context
+#: variable, not sys.stdout, so concurrent writes in one process (threads) each keep
+#: their own messages and nobody else's output is swallowed.
+_MESSAGES = contextvars.ContextVar("dyna_zarr_io_messages", default=None)
+
+
+def _say(*args, sep=" ", end="\n", flush=False):
+    """Report a write decision or progress line: printed, or collected by
+    ``capture_messages`` in the calling context."""
+    sink = _MESSAGES.get()
+    if sink is None:
+        print(*args, sep=sep, end=end, flush=flush)
+    else:
+        sink.append(sep.join(str(a) for a in args).strip("\n"))
+
+
+@contextlib.contextmanager
+def capture_messages():
+    """Collect io's messages (chunk/region decisions, alignment notes, progress) in a
+    list instead of printing them, for writes started in this context - including
+    the worker threads those writes start. Other threads are unaffected::
+
+        with io.capture_messages() as messages:
+            io.write(arr, "out.zarr")
+        logger.debug("\n".join(messages))
+    """
+    messages = []
+    token = _MESSAGES.set(messages)
+    try:
+        yield messages
+    finally:
+        _MESSAGES.reset(token)
+
+
+class Extrema:
+    """Per-index minimum and maximum of everything io.write writes, for ``observe=``.
+
+    ``axis``: the axis to keep (e.g. the channel axis), or None for one value over
+    the whole array. Thread-safe (io.write's workers call it concurrently)::
+
+        ext = io.Extrema(axis=1)
+        io.write(x, "out.zarr", observe=ext)
+        ext.min, ext.max          # [min per channel], [max per channel]
+
+    The values are those WRITTEN, after the cast to the output dtype; NaN propagates
+    (a NaN anywhere along the kept index makes its min and max NaN), as ``numpy.min``.
+    Python scalars (``.item()``), or None for an index nothing was written to.
+    """
+
+    def __init__(self, axis=None):
+        self.axis = axis
+        self._lock = threading.Lock()
+        self._lo = None
+        self._hi = None
+
+    def __call__(self, key, block):
+        block = np.asarray(block)
+        if block.size == 0:
+            return
+        if self.axis is None:
+            lo, hi, start = np.atleast_1d(block.min()), np.atleast_1d(block.max()), 0
+        else:
+            axes = tuple(i for i in range(block.ndim) if i != self.axis)
+            lo, hi = block.min(axis=axes), block.max(axis=axes)
+            start = int(key[self.axis].start or 0)
+        with self._lock:
+            n = start + len(lo)
+            if self._lo is None:
+                self._lo = [None] * n
+                self._hi = [None] * n
+            if len(self._lo) < n:
+                self._lo += [None] * (n - len(self._lo))
+                self._hi += [None] * (n - len(self._hi))
+            for k in range(len(lo)):
+                i = start + k
+                self._lo[i] = lo[k] if self._lo[i] is None else np.minimum(self._lo[i], lo[k])
+                self._hi[i] = hi[k] if self._hi[i] is None else np.maximum(self._hi[i], hi[k])
+
+    @property
+    def min(self):
+        return [None if v is None else v.item() for v in (self._lo or [])]
+
+    @property
+    def max(self):
+        return [None if v is None else v.item() for v in (self._hi or [])]
+
+
+def _thread(target, name):
+    """A daemon worker thread that runs in a copy of the caller's context (so its
+    messages reach the caller's ``capture_messages``)."""
+    return threading.Thread(target=contextvars.copy_context().run, args=(target,),
+                            daemon=True, name=name)
+
+
+
 _MIN_LIVE_REGIONS = 3
+
+#: io.write's execution engines (see write_array). "fused" is the default.
+_ENGINES = ("fused", "pipeline")
+
+
+def _run_fused(chunk_indices, input_shape, input_array, output, final_dtype, device,
+               n_threads, early_tenth_timeout=None, early_quarter_timeout=None,
+               observe=None):
+    """io.write's default execution loop (``engine="fused"``).
+
+    ``n_threads`` threads each take the next band, read it (the op chain runs here, on
+    ``device``, with a CUDA stream per worker), cast it, write it and wait for the write -
+    no reader/queue/writer stages, so a region is held by exactly one worker from read to
+    write. Measured against the producer-consumer pipeline (``engine="pipeline"``, kept)
+    on 16 cases: bit-identical output; 1.2-1.35x faster on I/O-bound writes at equal
+    memory; a tie on CPU-bound chains, reductions and remote uploads; up to ~20% behind
+    on read-heavy cases (narrowing casts, broadcast reductions) at low worker counts.
+    Keeping a write in flight per worker was measured
+    too and never beat this at equal memory, locally, on GPU or remotely.
+
+    The early timeouts abort the write when the first tenth / quarter of the regions took
+    longer than given (checked once each, when the milestone is reached).
+    """
+    lock = threading.Lock()
+    state = {"next": 0, "done": 0, "error": None}
+
+    def worker():
+        stream = _new_stream(device)
+        try:
+            while True:
+                with lock:
+                    if state["error"] is not None or state["next"] >= len(chunk_indices):
+                        break
+                    band = chunk_indices[state["next"]]
+                    state["next"] += 1
+                region = tuple(slice(lo, min(hi, size))
+                               for (lo, hi), size in zip(band, input_shape))
+                with _use_stream(stream), _device_context(device):
+                    data = _asnumpy_pinned(input_array._read_direct(region))
+                if data.dtype != final_dtype:
+                    data = _saturate_block(data, final_dtype)
+                if observe is not None:
+                    observe(region, data)
+                output[region].write(data).result()
+                with lock:
+                    state["done"] += 1
+        except BaseException as exc:          # first error wins; the others stop
+            with lock:
+                if state["error"] is None:
+                    state["error"] = exc
+
+    threads = [_thread(worker, f"FusedWorker-{i}")
+               for i in range(max(1, int(n_threads)))]
+    start = time.time()
+    for t in threads:
+        t.start()
+    total = len(chunk_indices)
+    milestones = [(max(1, total // 10), early_tenth_timeout, "tenth"),
+                  (max(1, total // 4), early_quarter_timeout, "quarter")]
+    checked = set()
+    while any(t.is_alive() for t in threads):
+        for target, limit, name in milestones:
+            if limit is None or name in checked or state["done"] < target:
+                continue
+            checked.add(name)
+            elapsed = time.time() - start
+            if elapsed > limit:
+                with lock:
+                    if state["error"] is None:
+                        state["error"] = TimeoutError(
+                            f"Early {name} timeout: took {elapsed:.1f}s to write {target} "
+                            f"regions (limit: {limit:.1f}s). Aborting.")
+        for t in threads:
+            t.join(timeout=0.02)
+    if state["error"] is not None:
+        raise state["error"]
+
 
 #: Writer THREADS (not the in-flight write cap). `.write()` is async - it returns a future
 #: and TensorStore's C++ pool performs the I/O - so extra writer threads only submit futures
@@ -165,6 +344,12 @@ def _ts_kvstore(url, storage_options=None, *, write=False):
 
     if storage_type in ("s3", "gcs"):
         bucket, _, key = text.split("://", 1)[1].partition("/")
+        # TensorStore puts the key into the request URL as given, so a space (an
+        # eubi-bridge output named after "MDL4 S549 framescan 4.czi") made curl reject
+        # the URL. Percent-encoded, the object store decodes it and stores the key
+        # unchanged - the same key zarrista writes (verified on S3). '/' stays a separator.
+        from urllib.parse import quote
+        key = quote(key, safe="/~-._")
         kv = {"driver": "s3" if storage_type == "s3" else "gcs", "bucket": bucket,
               "path": key.rstrip("/") + "/" if key else ""}
         if storage_type == "s3":
@@ -532,10 +717,17 @@ def read_array(source: Union[str, Path], backend: Optional[str] = None,
             dyn_array._chunks = dyn_array._zarr_array.chunks
             dyn_array._extract_zarr_metadata(dyn_array._zarr_array)
             return dyn_array
-        except Exception:
-            # Fall back to zarr if read_file fails
-            pass
-    
+        except Exception as exc:
+            # An explicit backend='tensorstore' fails loudly. The default falls back to
+            # zarr-python, which reads a few stores TensorStore cannot (unusual dtypes or
+            # codecs), and says so rather than switching readers silently.
+            if explicit_backend:
+                raise
+            warnings.warn(
+                f"TensorStore could not open {str(source)!r} ({type(exc).__name__}: "
+                f"{exc}); reading it with zarr-python instead. Pass backend='tensorstore' "
+                f"to make this an error.", RuntimeWarning, stacklevel=2)
+
     # Remote URL or fallback to regular zarr opening
     if '://' in str(source):  # Likely a remote URL
         ts_array = read_file(source, storage_options)
@@ -1467,6 +1659,56 @@ def _chain_halo_depth(array, ndim, _seen=None, _level=0):
     return best
 
 
+def _chain_read_amplification(array, _seen=None, _level=0):
+    """How many input elements one OUTPUT element of ``array`` reads, at most: the
+    product of the ``read_amplification`` of the transforms along the chain (a 2x2x2
+    ``coarsen`` reads 8). Regions are shaped and budgeted in output elements, so without
+    this a downsampling chain would read 8x the region budget. 1 for ordinary chains.
+    Defensive like the other chain walks."""
+    if array is None or _level > 64:
+        return 1
+    if _seen is None:
+        _seen = set()
+    if id(array) in _seen:
+        return 1
+    _seen.add(id(array))
+    transform = getattr(array, "_transform", None)
+    if transform is None:
+        return 1
+    own = max(1, int(getattr(transform, "read_amplification", 1) or 1))
+    upstream_max = 1
+    for attr in _TRANSFORM_UPSTREAM_ATTRS:
+        upstream = getattr(transform, attr, None)
+        if upstream is None:
+            continue
+        for item in (upstream if isinstance(upstream, (list, tuple)) else [upstream]):
+            if hasattr(item, "shape"):
+                upstream_max = max(upstream_max,
+                                   _chain_read_amplification(item, _seen, _level + 1))
+    return own * upstream_max
+
+
+def _region_cost(array, extent, shape, out_dtype):
+    """``(read_bytes, out_bytes)`` of one region of ``extent`` in flight in io.write.
+
+    ``read_bytes`` is the region as the chain carries it: padded by the deepest halo
+    (clamped to the array) and in the widest dtype anywhere in the chain. ``out_bytes``
+    is the region in the output dtype. io.write budgets a region being read and
+    transformed as ``2 * read_bytes + out_bytes`` (source data and the chain's result,
+    then the output buffer). Measured over copy, +1, casts both ways, gaussian and
+    gaussian -> threshold -> uint8 at 64 MiB regions, that never under-counts and over-
+    counts by at most ~40%, where 1x the output region under-counted 1.9-10x.
+    """
+    halo = _chain_halo_depth(array, len(extent)) or (0,) * len(extent)
+    padded = [min(int(e) + 2 * int(d), int(s)) for e, d, s in zip(extent, halo, shape)]
+    out_itemsize = int(_as_np_dtype(out_dtype).itemsize)
+    widest = _widest_dtype(_chain_widest_dtype(array), out_dtype)
+    read_itemsize = int(_as_np_dtype(widest).itemsize) if widest is not None else out_itemsize
+    # a downsampling chain reads `amplification` input elements per output element
+    return (int(np.prod(padded)) * read_itemsize * _chain_read_amplification(array),
+            int(np.prod([int(e) for e in extent])) * out_itemsize)
+
+
 class RepeatedReductionWarning(UserWarning):
     """A reduction too large to cache is broadcast back over the axes it reduced, so a
     region-wise write re-streams it once per region along those axes. The result is
@@ -1547,7 +1789,7 @@ def _compute_region_shape(input_shape, final_chunks, region_size_mb, dtype=None,
     Algorithm:
     1. Start with a single output chunk
     2. Identify dimensions needing expansion (region < input_shape)
-    3. Expand dimensions in reverse order (last â†’ first) until region_size_mb reached
+    3. Expand dimensions in reverse order (last -> first) until region_size_mb reached
     4. For each dimension: expand until covered OR budget exhausted
     
     Example:
@@ -1596,7 +1838,7 @@ def _compute_region_shape(input_shape, final_chunks, region_size_mb, dtype=None,
         lcm = (input_chunk_arr[i] * output_chunk_arr[i]) // gcd
         expansion_increments[i] = lcm
     
-    # STEP 3: Expand dimensions in reverse order (last â†’ first)
+    # STEP 3: Expand dimensions in reverse order (last -> first)
     for dim in reversed(range(len(region_arr))):
         # Expand this dimension until complete or budget exhausted
         while region_arr[dim] < input_arr[dim]:
@@ -1743,6 +1985,81 @@ class _ZarristaOutput:
 
         return _Slot()
 
+    def append_chunk(self, region, data):
+        """Write one whole inner chunk with zarrs' partial encoding: appended to its shard
+        (and the shard index rewritten), never the whole shard - with zarrista-bounded,
+        whose filesystem store writes in place. Callers serialise writes per shard."""
+        import numpy as _np
+        from .backends.zarrista_backend import _call
+        _call(self._array._array.store_array_subset, region, _np.ascontiguousarray(data),
+              experimental_partial_encoding=True)
+
+
+def _big_shards_bounded(array, spec, region_shape, device, engine) -> bool:
+    """io.write hands the output to write_levels' chunk-by-chunk mode: a local zarr v3
+    output whose shard costs more than a region, that mode can write (dyna's shard
+    writer on TensorStore, or zarrista-bounded), and a plain DynamicArray chain on the
+    CPU with no read grid of its own (an exact region_shape, an op chain's alignment)."""
+    if (spec.zarr_format != 3 or spec.shards is None or spec.remote
+            or region_shape is not None or engine != "fused"
+            or device not in (None, "cpu")):
+        return False
+    if spec.backend == "tensorstore":
+        if not _shard_assembly_ok([spec]):
+            return False
+    elif not (spec.backend == "zarrista" and _bounded_partial_writes()):
+        return False
+    shape = tuple(int(n) for n in spec.shape)
+    if _aligned_region_shape(array, tuple(spec.chunks), shape) is not None:
+        return False
+    shard = tuple(min(int(u), n) for u, n in zip(spec.shards, shape))
+    read_bytes, _ = _region_cost(array, shard, shape, spec.dtype)
+    return read_bytes > float(spec.region_mb) * 2**20
+
+
+def _shard_assembly_ok(specs) -> bool:
+    """dyna's own shard writer (_shard_writer) can write these outputs chunk by chunk:
+    local zarr v3, compressed with what it encodes (blosc, zstd, gzip or nothing)."""
+    return all(sp.zarr_format == 3 and not sp.remote
+               and getattr(sp.codecs, "compressor", None) in (None, "blosc", "zstd", "gzip")
+               for sp in specs)
+
+
+class _WholeChunkOutput:
+    """An unsharded output in the chunk-by-chunk mode: a completed chunk is a whole
+    write unit, written as it is."""
+
+    __slots__ = ("_handle",)
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    def append_chunk(self, region, data):
+        self._handle[region].write(np.ascontiguousarray(data)).result()
+
+
+def _chunk_output(spec, handle):
+    """``append_chunk`` for a TensorStore-created output: dyna's shard writer for a
+    sharded one (refused loudly if its metadata is not one it writes), else whole
+    chunks through TensorStore."""
+    if spec.shards is None:
+        return _WholeChunkOutput(handle)
+    from ._shard_writer import ShardAssembler
+    return ShardAssembler(spec.path)
+
+
+def _bounded_partial_writes():
+    """zarrista appends to a shard in place (zarrista-bounded: zarrs' FilesystemStore
+    writes partial values in place). Upstream zarrista 0.1.0 rewrites the whole shard
+    per partial write, which is what this mode exists to avoid."""
+    from importlib.metadata import PackageNotFoundError, version
+    try:
+        version("zarrista-bounded")
+    except PackageNotFoundError:
+        return False
+    from .backends.zarrista_backend import ZARRISTA_AVAILABLE
+    return ZARRISTA_AVAILABLE
+
 
 def _open_zarrista_output(output_path, shape, chunks, dtype, codecs,
                           zarr_format, shards, storage_options=None, dimension_names=None):
@@ -1791,6 +2108,31 @@ def _classify_store(read_key, has_any_key):
     return "other" if has_any_key() else None
 
 
+def _housekeeping_obstore(path, backend, storage_options):
+    """The obstore store for a remote location's housekeeping (what exists there, and
+    deleting it for overwrite=True), or None to use TensorStore's kvstore.
+
+    TensorStore's S3 driver cannot do it for a key that needs URL encoding (a space,
+    '+', '(' ...): object requests need the key pre-encoded, listing encodes it again.
+    obstore gets keys right, so it is used whenever installed (zarrista needs it anyway;
+    ome_zarr_pyramid[remote] brings it). Without it such keys are refused, clearly."""
+    try:
+        import obstore  # noqa: F401
+    except ImportError:
+        if backend == "zarrista":
+            raise
+        from urllib.parse import quote
+        key = str(path).split("://", 1)[1].partition("/")[2]
+        if quote(key, safe="/~-._") != key:
+            raise ValueError(
+                f"{str(path)!r} has characters that must be URL-encoded (spaces, '+', "
+                f"'(' ...), which TensorStore's object-store driver cannot list or delete. "
+                f"Install obstore (pip install obstore) or rename the output.") from None
+        return None
+    from .backends.zarrista_backend import _obstore
+    return _obstore(path, storage_options)
+
+
 def _existing_output(path, *, remote, backend, storage_options):
     """What is already at an io.write output location (see _classify_store).
 
@@ -1807,10 +2149,9 @@ def _existing_output(path, *, remote, backend, storage_options):
         return _classify_store(
             lambda k: (p / k).read_bytes() if (p / k).is_file() else None,
             lambda: any(p.iterdir()))
-    if backend == "zarrista":
+    store = _housekeeping_obstore(path, backend, storage_options)
+    if store is not None:
         import obstore
-        from .backends.zarrista_backend import _obstore
-        store = _obstore(path, storage_options)
 
         def read_key(k):
             try:
@@ -1835,10 +2176,9 @@ def _delete_output(spec):
     a zarr store."""
     if not spec.remote:
         shutil.rmtree(spec.path)
-    elif spec.backend == "zarrista":
+    elif (store := _housekeeping_obstore(spec.path, spec.backend,
+                                         spec.storage_options)) is not None:
         import obstore
-        from .backends.zarrista_backend import _obstore
-        store = _obstore(spec.path, spec.storage_options)
         paths = [o["path"] for batch in obstore.list(store) for o in batch]
         if paths:
             obstore.delete(store, paths)
@@ -1895,7 +2235,7 @@ class _OutputSpec:
     dimension_names: Optional[Tuple[str, ...]] = None   # v3 only
 
 
-def _resolve_output(array, output_path, *, max_workers, num_readers, chunks, chunk_size_mb,
+def _resolve_output(array, output_path, *, max_threads, num_readers, chunks, chunk_size_mb,
                     shard_coefficients, dtype, compressor, zarr_format, region_size_mb,
                     gc_interval, device, region_shape, memory_budget_mb, overwrite,
                     backend, storage_options, dimension_names=None) -> _OutputSpec:
@@ -2002,7 +2342,7 @@ def _resolve_output(array, output_path, *, max_workers, num_readers, chunks, chu
     _check_axes("shard_coefficients", shard_coefficients)
 
     for _name, _val, _min in (
-        ("max_workers", max_workers, 1),
+        ("max_threads", max_threads, 1),
         ("num_readers", num_readers, 1),
         ("region_size_mb", region_mb, None),
         ("memory_budget_mb", memory_budget_mb, None),
@@ -2039,13 +2379,20 @@ def _resolve_output(array, output_path, *, max_workers, num_readers, chunks, chu
     # carries, or a narrowing write (a uint8 mask from a float32 volume) budgets at
     # 1 byte per element while each region really holds 4.
     final_dtype = dtype if dtype is not None else array.dtype
+    # A downsampling chain (coarsen) reads many input elements per output element; the
+    # region is shaped in OUTPUT elements, so its budget shrinks by that factor and a
+    # region still READS about region_size_mb.
+    _amp = _chain_read_amplification(array)
+    _solver_region_mb = region_size_mb
+    if _amp > 1 and region_shape is None:
+        _solver_region_mb = region_mb / _amp
     # A neighbourhood op reads its region PLUS a halo on every side, so the region
     # has to be shaped against that work and not only against the I/O grid.
     final_chunks, solved_region, notes = _solve_grids(
         tuple(array.shape), getattr(array, "chunks", None), final_dtype,
         _widest_dtype(_chain_widest_dtype(array), final_dtype),
         chunks=chunks, chunk_mb=chunk_size_mb,
-        region_shape=region_shape, region_mb=region_size_mb,
+        region_shape=region_shape, region_mb=_solver_region_mb,
         halo=_chain_halo_depth(array, ndim),
     )
     dtype_obj, dtype_v2, dtype_v3 = parse_dtype(final_dtype)
@@ -2128,6 +2475,12 @@ def _resolve_output(array, output_path, *, max_workers, num_readers, chunks, chu
                 f"the input's shards {inherited} do not hold whole output chunks "
                 f"{tuple(final_chunks)}, so the output is written unsharded. Pass "
                 f"shard_coefficients= to shard it.")
+    if final_shards is not None:
+        # No bigger than the array, rounded up to whole chunks: a shard past the array's
+        # end only holds empty chunk slots (a small pyramid level would otherwise get a
+        # 3x-chunk shard around a one-chunk array). Still a whole number of chunks.
+        final_shards = tuple(min(int(s), -(-int(n) // int(c)) * int(c))
+                             for s, n, c in zip(final_shards, array.shape, final_chunks))
 
     # --- dimension_names: v3 metadata, one name per axis ------------------------
     # zarr v2 has no field for them; dropping them there would be the same silent
@@ -2232,6 +2585,9 @@ def _ts_output_spec(spec: _OutputSpec) -> dict:
             'dtype': spec.dtype_v2,
             'dimension_separator': '/',
             'compressor': spec.codecs.to_v2_config(),
+            # TensorStore leaves a v2 fill_value null unless told; zarrista writes 0. A
+            # null fill makes a chunk never written undefined for readers, so state it.
+            'fill_value': False if spec.dtype.kind == 'b' else 0,
         }
     return ts_spec
 
@@ -2264,6 +2620,16 @@ def _open_output(spec: _OutputSpec):
     return ts.open(_ts_output_spec(spec), create=True).result()
 
 
+def _normalize_key(key, shape):
+    """``key`` as a full tuple of step-1 slices with explicit bounds (what ``observe``
+    receives on every path)."""
+    if not isinstance(key, tuple):
+        key = (key,)
+    key = key + (slice(None),) * (len(shape) - len(key))
+    return tuple(slice(*k.indices(int(n))[:2]) if isinstance(k, slice)
+                 else slice(int(k), int(k) + 1) for k, n in zip(key, shape))
+
+
 class _SyncSink:
     """Blocking ``sink[key] = block`` over an :func:`_open_output` handle.
 
@@ -2271,17 +2637,23 @@ class _SyncSink:
     order, through this - so they get every resolved output setting and every backend,
     local or remote, from the same opener the region pipeline uses. Serial writes also
     keep them clear of zarrista's one data-loss bug, which needs CONCURRENT writes to a
-    shared chunk/shard (reports/zarrista_bugs).
+    shared chunk/shard.
     """
 
-    def __init__(self, handle, spec: _OutputSpec):
+    def __init__(self, handle, spec: _OutputSpec, observe=None):
         self._handle = handle
         self.shape = spec.shape
         self.chunks = spec.chunks
         self.dtype = spec.dtype
+        self._observe = observe
 
     def __setitem__(self, key, value):
-        data = np.ascontiguousarray(value, dtype=self.dtype)
+        value = np.asarray(value)
+        if value.dtype != self.dtype:
+            value = _saturate_block(value, self.dtype)       # never wraps
+        data = np.ascontiguousarray(value)
+        if self._observe is not None:
+            self._observe(_normalize_key(key, self.shape), data)
         if isinstance(self._handle, _ZarristaOutput):
             self._handle._array[key] = data         # normalizes the key, handles remote
         else:
@@ -2302,8 +2674,8 @@ class Sink(_SyncSink):
     multiple of it) before storing.
     """
 
-    def __init__(self, handle, spec: _OutputSpec):
-        super().__init__(handle, spec)
+    def __init__(self, handle, spec: _OutputSpec, observe=None):
+        super().__init__(handle, spec, observe)
         self.path = spec.path
         self.shards = spec.shards
         self.zarr_format = spec.zarr_format
@@ -2318,27 +2690,888 @@ class Sink(_SyncSink):
 def create_sink(output_path, shape, dtype, *, chunks=None, chunk_size_mb=None,
                 shard_coefficients=None, compressor=None, zarr_format=None,
                 overwrite=False, backend="tensorstore", storage_options=None,
-                dimension_names=None) -> Sink:
+                dimension_names=None, observe=None) -> Sink:
     """Create an empty output array and return a :class:`Sink` to push blocks into.
 
     The push counterpart of io.write, for producers dyna does not pull from (a dask
     graph, a custom pipeline). Every output argument means what it means in io.write:
     ``chunks`` exact, ``chunk_size_mb`` a budget (default: dyna's default grid), codecs
     blosc-lz4 by default, ``zarr_format`` v3 by default, shards only on v3, and the same
-    overwrite rule. Validated before anything is created.
+    overwrite rule. Validated before anything is created. Blocks of another dtype are
+    cast as io.write casts: saturating, never wrapping. ``observe(key, block)`` sees every
+    block as written (see io.write).
     """
     from .operations.creation import empty
     # a generative stand-in carrying only shape / dtype / grid: never read
     template = empty(tuple(int(s) for s in shape), dtype=dtype, chunks=chunks)
     spec = _resolve_output(
-        template, output_path, max_workers=1, num_readers=None, chunks=chunks,
+        template, output_path, max_threads=1, num_readers=None, chunks=chunks,
         chunk_size_mb=chunk_size_mb, shard_coefficients=shard_coefficients, dtype=None,
         compressor=compressor, zarr_format=zarr_format, region_size_mb=None,
         gc_interval=15.0, device=None, region_shape=None, memory_budget_mb=None,
         overwrite=overwrite, backend=backend, storage_options=storage_options,
         dimension_names=dimension_names,
     )
-    return Sink(_open_output(spec), spec)
+    return Sink(_open_output(spec), spec, observe)
+
+
+def _write_dask(x, output_path, *, max_threads, num_readers, chunks, chunk_size_mb,
+                shard_coefficients, dtype, compressor, zarr_format, region_size_mb,
+                early_quarter_timeout, early_tenth_timeout, device, region_shape,
+                memory_budget_mb, overwrite, backend, storage_options, dimension_names,
+                engine, observe=None):
+    """io.write for a dask array: the dask PUMP into a dyna sink.
+
+    The output is resolved and created exactly as for a DynamicArray (:func:`create_sink`:
+    format, chunks, codecs, shards, dimension names, overwrite rule, local or remote, both
+    backends). dask then runs its own graph on ``max_threads`` local threads and pushes
+    blocks rechunked to the sink's write unit, so every concurrent write is a whole chunk
+    (or shard). Each task reads, computes and writes its block - the fused model with
+    dask's scheduler as the pool. Pulling the graph through dyna's region loop instead
+    (``from_array(x)``) recomputes shared ancestors per region and was slower (1.58 s vs
+    1.32 s on 1.2 GB).
+    """
+    # These shape dyna's own region loop, which a dask array does not go through.
+    refused = [name for name, value in (
+        ("region_shape", region_shape), ("region_size_mb", region_size_mb),
+        ("memory_budget_mb", memory_budget_mb), ("num_readers", num_readers),
+        ("early_quarter_timeout", early_quarter_timeout),
+        ("early_tenth_timeout", early_tenth_timeout)) if value is not None]
+    if device not in (None, "cpu"):
+        refused.append(f"device={device!r}")
+    if engine != "fused":
+        refused.append(f"engine={engine!r}")
+    if refused:
+        raise ValueError(
+            f"{', '.join(refused)} {'does' if len(refused) == 1 else 'do'} not apply to a "
+            f"dask array: io.write hands it to dask's own scheduler (da.store into the "
+            f"output), not to dyna's region loop. Its memory is about max_threads x the "
+            f"output's write unit (chunk, or shard). Drop {', '.join(refused)}, or wrap "
+            f"it with dyna_zarr.from_array(x) to write it through dyna's region loop.")
+    if int(max_threads) < 1:
+        raise ValueError(f"max_threads must be >= 1, got {max_threads}")
+    if any(not np.isfinite(s) for s in x.shape):
+        raise ValueError(
+            f"the dask array has unknown chunk sizes (shape {x.shape}); call "
+            f"x.compute_chunk_sizes() first.")
+
+    import dask
+    import dask.array as da
+    try:                           # an active distributed Client would be bypassed here
+        from distributed import default_client
+        default_client()
+    except Exception:
+        pass
+    else:
+        warnings.warn(
+            "a dask.distributed Client is active, but io.write runs the dask graph on "
+            "local threads: the output cannot be shipped to distributed workers yet.",
+            RuntimeWarning, stacklevel=3)
+
+    if chunks is None and chunk_size_mb is None:
+        chunks = tuple(int(c) for c in x.chunksize)    # keep the input's chunks, as io.write does
+    out_dtype = _as_np_dtype(dtype) if dtype is not None else np.dtype(x.dtype)
+    sink = create_sink(output_path, x.shape, out_dtype, chunks=chunks,
+                       chunk_size_mb=chunk_size_mb, shard_coefficients=shard_coefficients,
+                       compressor=compressor, zarr_format=zarr_format, overwrite=overwrite,
+                       backend=backend, storage_options=storage_options,
+                       dimension_names=dimension_names, observe=observe)
+    if x.dtype != out_dtype:
+        x = x.map_blocks(_saturate_block, out_dtype, dtype=out_dtype)   # never wraps
+    _say(f"[Optimized] dask array: {x.npartitions} tasks -> write unit {sink.write_unit}, "
+          f"{int(max_threads)} threads", flush=True)
+    with dask.config.set(scheduler="threads", num_workers=int(max_threads)):
+        da.store(x.rechunk(sink.write_unit), sink, lock=False)
+    _say(f"Successfully wrote array to {output_path}")
+    return output_path
+
+
+def _morton(ty, tx):
+    """Z-order index of tile (ty, tx): neighbouring tiles come together."""
+    out, bit = 0, 0
+    while ty or tx:
+        out |= ((ty & 1) << (2 * bit + 1)) | ((tx & 1) << (2 * bit))
+        ty, tx, bit = ty >> 1, tx >> 1, bit + 1
+    return out
+
+
+#: write_levels (assembled shards): how many blocks per thread the workers may run ahead
+#: of the oldest unfinished block; bounds the chunk rows open at once (and the estimate)
+_AHEAD_PER_THREAD = 2
+
+
+def _plan_xy_tiles(shape, factors, inner, level_shapes, itemsize, budget, unit, *,
+                   workers, block_cost, read_cost, region_bytes, src_chunks):
+    """The tiled pass that fits ``budget`` bytes: how many leading levels, how many workers,
+    the y/x tile and the block depth (blocks are the whole tile in y/x, ``bz`` deep).
+
+    Memory = open output chunks + blocks in flight (``workers x block_cost``, a worker's
+    memory for one block); ``read_cost`` of a block stays within ``region_bytes``
+    (region_size_mb, as everywhere in io.write). Open chunks
+    per level: the chunk rows the blocks in flight span in z (``workers x bz`` source
+    planes over a chunk's depth in source planes, plus the row being finished) over the
+    tile, rounded up to whole chunks. Tile edges are multiples of every written level's
+    chunk footprint (chunks complete inside a tile) and of its deepest window (no output
+    pixel from two tiles). Several tiles go slab by slab (``slab`` planes of z, every tile
+    of a slab before the next slab), so a source read plane by plane - a stack of files -
+    reads each plane in one stretch rather than once per full-depth tile sweep.
+    Preference: full-width tiles with at least half the workers; then narrower tiles
+    with at least half the workers (a narrower tile reads each row in pieces, once per
+    tile across: measured 2.6x slower on a 2916-wide stack, more than losing up to half
+    the workers costs); then the same with fewer workers. Within that: more workers, then
+    more levels in this pass (the rest come from a stored level later), then FEWER tiles
+    (each tile re-reads every plane: per-file costs for a stack of files), then deeper
+    blocks.
+    Returns a dict; ``fits`` False means even the smallest pass exceeds the budget.
+    """
+    from math import lcm
+    ndim = len(shape)
+    z, ya, xa = ndim - 3, ndim - 2, ndim - 1
+    Z, Y, X = shape[z], shape[ya], shape[xa]
+    N = len(factors)
+
+    def ceil_div(p_, q_):
+        return -(-p_ // q_)
+
+    level_bytes = [int(np.prod(L)) * itemsize for L in level_shapes]
+
+    # the pass's first output is the source itself (factors all 1) in a first pass; in a
+    # later pass (the rest of a pyramid, from a stored level) it is a smaller level
+    first_is_source = all(int(f) == 1 for f in factors[0])
+
+    def held(n):
+        """Deep levels held WHOLE (from the deepest up, never the full-resolution output):
+        their chunks may straddle tiles, so tiles need not align to their footprints - only
+        to their windows. Held only where that costs little: the whole level is no bigger
+        than its two rolling chunk rows across the plane, or it is small (1/16 of the
+        budget); all held levels within a quarter of the budget. In a later pass the first
+        output may be held too (a 0.5 MB level 5 otherwise forced whole-plane blocks)."""
+        out, used = set(), 0
+        for k in range(n - 1, 0 if first_is_source else -1, -1):
+            c, L = inner[k], level_shapes[k]
+            lead = int(np.prod([min(int(c[a_]), int(L[a_])) for a_ in range(z)]))
+            rows_full = 2 * lead * min(int(c[z]), int(L[z])) * L[ya] * L[xa] * itemsize
+            if (level_bytes[k] > max(rows_full, budget / 16)
+                    or used + level_bytes[k] > budget / 4):
+                break
+            out.add(k)
+            used += level_bytes[k]
+        return out
+
+    def align(n):
+        out, keep = [], held(n)
+        for a_ in (ya, xa):
+            u = 1
+            for k, (f, c) in enumerate(zip(factors[:n], inner[:n])):
+                u = lcm(u, int(f[a_])) if k in keep else lcm(u, int(f[a_]) * int(c[a_]),
+                                                                 int(f[a_]))
+            out.append(min(u, shape[a_]))
+        return out
+
+    def aligned_step(w, c, size):
+        # whole windows are required (correctness); whole source chunks only while that
+        # is cheap: lcm(16, 101) = 1616 planes made the smallest block of a 101-deep
+        # chunked source 12 GB. Otherwise blocks read parts of chunks (bounded memory,
+        # some re-decoding).
+        c = min(int(c), size)
+        if c == size:
+            return size
+        u = lcm(w, c)
+        return u if u <= 4 * w and u <= size else min(w, size)
+
+    def z_step(n):
+        w = 1
+        for f in factors[:n]:
+            w = lcm(w, int(f[z]))
+        sc = int(src_chunks[z]) if src_chunks is not None else 1
+        return aligned_step(w, sc, Z)
+
+    def lead_block(n):
+        out = []
+        for a_ in range(z):
+            w = 1
+            for f in factors[:n]:
+                w = lcm(w, int(f[a_]))
+            c = int(src_chunks[a_]) if src_chunks is not None else 1
+            out.append(aligned_step(w, c, shape[a_]))
+        return tuple(out)
+
+    def block(n, ty, tx, bz):
+        return lead_block(n) + (min(bz, Z), min(ty, Y), min(tx, X))
+
+    def chunks_bytes(n, ty, tx, bz, w, D):
+        """Open output chunks with slabs of ``D`` planes (``D >= Z``: each tile sweeps all
+        of z). A level whose chunk rows fit whole slabs completes them per tile; a deeper
+        one keeps a chunk row open across the whole plane until its slabs are done, and
+        the next row only over the tiles the blocks in flight have reached."""
+        total, keep = 0, held(n)
+        tiled = ceil_div(Y, ty) * ceil_div(X, tx) > 1 and D < Z
+        for k, (f, c, L) in enumerate(zip(factors[:n], inner[:n], level_shapes[:n])):
+            if k in keep:
+                total += level_bytes[k]                # held whole: at most the level
+                continue
+            lead = int(np.prod([min(int(c[a_]), int(L[a_])) for a_ in range(z)]))
+            S = int(c[z]) * int(f[z])                  # a chunk row, in source planes
+            ly = min(L[ya], ceil_div(ceil_div(min(ty, Y), f[ya]), c[ya]) * c[ya])
+            lx = min(L[xa], ceil_div(ceil_div(min(tx, X), f[xa]), c[xa]) * c[xa])
+            # blocks in flight: at most _AHEAD_PER_THREAD x w consecutive ones (the
+            # writer's window), each bz planes deep
+            span = _AHEAD_PER_THREAD * w * bz
+            rolling = min(ceil_div(L[z], c[z]), ceil_div(span, S) + 1)
+            if not tiled:
+                rows, area = rolling, ly * lx
+            elif D % S == 0:
+                # rows complete within a tile-slab; the window spans this many tile-slabs
+                rows = min(D // S, rolling) * min(ceil_div(Y, ty) * ceil_div(X, tx),
+                                                  ceil_div(span, D) + 1)
+                area = ly * lx
+            elif D < S:
+                # a chunk row spans several slabs: open across the plane until its last
+                # slab is done; the next row opens slab-major, over the tiles the blocks
+                # in flight have reached (w blocks of bz planes, D / bz per tile-slab)
+                # (measured: 433 MiB peak where 2 plane rows estimated 671)
+                n_tiles = ceil_div(Y, ty) * ceil_div(X, tx)
+                reached = min(n_tiles, ceil_div(span, D) + 1)
+                rows, area = 1, L[ya] * L[xa] + min(L[ya] * L[xa], reached * ly * lx)
+            else:                                      # open across the plane
+                rows, area = 2, L[ya] * L[xa]
+            total += lead * rows * min(int(c[z]), int(L[z])) * area * itemsize
+        return total
+
+    def total(n, ty, tx, bz, w, D):
+        return chunks_bytes(n, ty, tx, bz, w, D) + w * block_cost(block(n, ty, tx, bz))
+
+    def slab_candidates(n, ty, tx):
+        """Slab depths, shallowest first: multiples of level 0's chunk row and of every
+        window. One tile, or no such depth below Z: the whole of z (tile-major)."""
+        if ceil_div(Y, ty) * ceil_div(X, tx) == 1:
+            return [Z]
+        w = 1
+        for f in factors[:n]:
+            w = lcm(w, int(f[z]))
+        base = lcm(w, int(inner[0][z]) * int(factors[0][z]))
+        if base >= Z:
+            return [Z]
+        return [m * base for m in range(1, ceil_div(Z, base)) if m * base < Z] + [Z]
+
+    def tile_candidates(n):
+        ay, ax = align(n)
+        ys = sorted({Y} | {m * ay for m in range(1, ceil_div(Y, ay) + 1) if m * ay < Y}, reverse=True)
+        xs = sorted({X} | {m * ax for m in range(1, ceil_div(X, ax) + 1) if m * ax < X}, reverse=True)
+        cands = [(ty, tx) for ty in ys for tx in xs]
+        # full width first, at any tile count: planes are stored row by row, so a full-
+        # width tile reads each row in one stretch, a narrower one in pieces (1536 x 1152
+        # tiles of a 2916-wide stack: 3.75 min against 1.37 untiled). Then fewest tiles,
+        # then the larger tile.
+        return sorted(cands, key=lambda t: (t[1] != X, ceil_div(Y, t[0]) * ceil_div(X, t[1]),
+                                            -(t[0] * t[1])))
+
+    def depths(n, ty, tx):
+        step = z_step(n)
+        top = step
+        while top + step <= Z and read_cost(block(n, ty, tx, top + step)) <= region_bytes:
+            top += step
+        return list(range(top, 0, -step))
+
+    def first_fit(w, n, slabbed, full):
+        # slabbed: several tiles, z in slabs; else one tile, or tiles sweeping all of z.
+        # full: full-width tiles only; else narrower ones only
+        for ty, tx in tile_candidates(n):
+            if (min(tx, X) == X) != full:
+                continue
+            for D in slab_candidates(n, ty, tx):
+                if (D < Z) != slabbed:
+                    continue
+                for bz in depths(n, ty, tx):
+                    if bz <= D and total(n, ty, tx, bz, w, D) <= budget:
+                        return (n, ty, tx, bz, w, D)
+        return None
+
+    W = max(1, int(workers))
+    half = max(1, ceil_div(W, 2))
+    passes = [(True, range(W, half - 1, -1)), (False, range(W, half - 1, -1)),
+              (True, range(half - 1, 0, -1)), (False, range(half - 1, 0, -1))]
+    best = None
+    for full, ws in passes:
+        for w in ws:
+            for n in range(N, 0, -1):
+                # one tile first (no tiling); then slabs with any number of tiles, before
+                # tiles that each sweep all of z: those re-read every plane once per tile,
+                # far apart in time (a stack of files: every file opened again per tile)
+                single = first_fit(w, n, False, full)
+                if (single is not None
+                        and ceil_div(Y, single[1]) * ceil_div(X, single[2]) == 1):
+                    best = single
+                else:
+                    best = first_fit(w, n, True, full) or single
+                if best:
+                    break
+            if best:
+                break
+        if best:
+            break
+    fits = best is not None
+    if not fits:                                   # the smallest pass there is
+        ay, ax = align(1)
+        best = (1, ay, ax, z_step(1), 1, Z)
+    n, ty, tx, bz, w, D = best
+
+    amp, need_units = 1, None
+    if unit is not None and len(unit) == ndim:
+        uy, ux = int(unit[ya]), int(unit[xa])
+        amp = (ceil_div(min(uy, Y), ty) if uy > ty else 1) * \
+              (ceil_div(min(ux, X), tx) if ux > tx else 1)
+        if amp > 1:
+            ay, ax = align(n)
+            cy = min(Y, ceil_div(min(uy, Y), ay) * ay)
+            cx = min(X, ceil_div(min(ux, X), ax) * ax)
+            need_units = total(n, cy, cx, z_step(n), w, Z)
+    ay, ax = align(n)
+    return dict(n=n, tile=(ty, tx), bz=bz, workers=w, slab=D, block=block(n, ty, tx, bz),
+                chunks=chunks_bytes(n, ty, tx, bz, w, D),
+                blocks=w * block_cost(block(n, ty, tx, bz)), fits=fits, amp=amp,
+                need_units=need_units, minimal=(ay, ax),
+                need_minimal=total(1, *align(1), z_step(1), 1, Z))
+
+def write_levels(array, outputs, *, method="simple", max_threads=None, region_size_mb=None,
+                 dtype=None, compressor=None, zarr_format=None, backend="tensorstore",
+                 storage_options=None, overwrite=False, dimension_names=None,
+                 reducer=None, observe=None, memory_budget_mb=None, max_workers=None):
+    """Write ``array`` and downsampled versions of it from ONE read of ``array``.
+
+    ``outputs`` is a sequence of dicts, coarsest last:
+    ``{"path": ..., "factors": (f0, f1, ...)}`` - per-axis integer factors relative to
+    ``array`` (all 1 = ``array`` itself) - plus, optionally, ``"chunks"`` or
+    ``"chunk_size_mb"`` and ``"shard_coefficients"``, meaning what they mean in io.write.
+    The other options apply to every output, as in io.write. ``method`` is ``'simple'``
+    (every n-th element) or a ``coarsen`` method (mean / median / min / max / mode,
+    TensorStore's rules); every level is computed from ``array``'s own data, never from
+    another level, so it is the same as writing ``coarsen(array, factors)`` per level.
+
+    Every output chunk (shard, when sharded) is written WHOLE and exactly once: a region
+    spans a whole number of ``factors x write unit`` of every output it feeds, and one
+    worker owns it. Deeper levels need larger regions, so only as many LEADING outputs as
+    fit in the region budget (``region_size_mb``, counted like io.write's) are written in
+    the pass. Returns how many that was (at least 1); write the rest from a stored level.
+
+    When a single write unit is larger than the budget (big shards, tensorstore backend),
+    every output is written in ONE pass over ``array``, in budget-sized blocks on the grid
+    of the deepest window. Each output shard is assembled in a TensorStore transaction:
+    blocks stay within a shard and go shard by shard, so a shard is written once, when
+    its last block is done. A source whose own chunks are larger than a shard (a stack of
+    planes) is read in whole source chunks instead - reading part of a plane reads all of
+    it - and a shard is then written whenever it holds ``region_size_mb``.
+
+    ``memory_budget_mb`` (big shards appended chunk by chunk: local zarr v3 outputs,
+    with backend='tensorstore' - dyna's own shard writer - or 'zarrista' with
+    zarrista-bounded): the memory this write may use on top of what the process already
+    holds (as in io.write).
+    The open output chunks then cover a y/x TILE of the plane, not
+    the whole plane: tiles go z-first, edges on every written level's chunk footprint and
+    deepest window, in Morton order. Only as many levels as tile within the budget are
+    written (the rest, from a stored level, is the caller's next pass). Tiles that split
+    the source's read unit (a whole compressed plane read for any piece of it) re-decode
+    it; that is warned about with the budget that avoids it. Without it: untiled.
+
+    ``observe(key, block)``, as in io.write, sees every block written to the FIRST
+    output (e.g. ``io.Extrema(axis)`` for the full-resolution level's channel min/max).
+
+    ``reducer(block, factors, method)``, if given, computes a level from a NumPy block
+    instead of ``coarsen_block`` (e.g. TensorStore's ``downsample``, for a caller that
+    lets the user choose); 'simple' always strides.
+
+    Compared with one io.write per level from the stored level above, it saves the
+    re-read of every level but the last one written and a write setup per level.
+    """
+    import itertools as _it
+    from math import lcm
+    from .dynamic_array import _is_dask
+    from .operations.creation import empty
+    from .operations.downsampling import METHODS, coarsen_block
+    from .operations.pointwise import _saturate_block
+
+    if method != "simple" and method not in METHODS:
+        raise ValueError(f"method must be 'simple' or one of {METHODS}, got {method!r}")
+    if _is_dask(array):
+        raise ValueError("write_levels reads a DynamicArray; wrap a dask array with "
+                         "dyna_zarr.from_array(x)")
+    if not outputs:
+        raise ValueError("write_levels needs at least one output")
+    max_threads = renamed(max_threads, max_workers, new="max_threads", old="max_workers",
+                          where="write_levels", default=4)
+    from .dynamic_array import DynamicArray, from_array
+    if not isinstance(array, DynamicArray):
+        array = from_array(array)                  # numpy / zarr / TensorStore
+    shape = tuple(int(s) for s in array.shape)
+    ndim = len(shape)
+    final_dtype = _as_np_dtype(dtype) if dtype is not None else _as_np_dtype(array.dtype)
+    budget = float(_DEFAULT_REGION_MB if region_size_mb is None else region_size_mb) * 2**20
+    base_chunks = getattr(array, "chunks", None)
+
+    # --- resolve every output (validated, nothing created) ---------------------------
+    specs, factors = [], []
+    for out in outputs:
+        f = tuple(int(x) for x in out.get("factors", (1,) * ndim))
+        if len(f) != ndim or any(x < 1 for x in f):
+            raise ValueError(f"factors {f} must be {ndim} integers >= 1")
+        level_shape = tuple(-(-s // k) for s, k in zip(shape, f))
+        grid = (tuple(max(1, int(c) // k) for c, k in zip(base_chunks, f))
+                if base_chunks is not None else None)
+        template = empty(level_shape, dtype=final_dtype, chunks=grid)
+        # every level inherits the source's format and codecs, as io.write of a
+        # downsampled chain would (shards are per level: resolved from its own chunks)
+        template._zarr_format = getattr(array, "zarr_format", None)
+        template._codecs = getattr(array, "codecs", None)
+        specs.append(_resolve_output(
+            template, out["path"], max_threads=max_threads, num_readers=None,
+            chunks=out.get("chunks"), chunk_size_mb=out.get("chunk_size_mb"),
+            shard_coefficients=out.get("shard_coefficients"), dtype=None,
+            compressor=compressor, zarr_format=zarr_format, region_size_mb=None,
+            gc_interval=15.0, device=None, region_shape=None, memory_budget_mb=None,
+            overwrite=overwrite, backend=backend, storage_options=storage_options,
+            dimension_names=dimension_names))
+        factors.append(f)
+
+    # --- how many leading outputs fit: the region must span whole write units of each --
+    def aligned(n):
+        unit = [1] * ndim
+        for spec, f in zip(specs[:n], factors[:n]):
+            w = spec.shards if spec.shards is not None else spec.chunks
+            unit = [lcm(u, int(k) * int(c)) for u, k, c in zip(unit, f, w)]
+        return tuple(min(u, s) for u, s in zip(unit, shape))   # a whole axis is aligned
+
+    def cost(region):
+        read_bytes, _ = _region_cost(array, region, shape, final_dtype)
+        return read_bytes
+
+    from ._read_cost import read_overhead
+    read_factor = read_overhead(array)
+
+    def worker_cost(region):
+        """A write_levels worker's memory for one block: the block read (with what the
+        reader holds on top: 1.25x for zarrista / micro-reader, 2x for TensorStore,
+        ``_read_cost.read_overhead``), and every level's output computed from it."""
+        read_bytes, out_bytes = _region_cost(array, region, shape, final_dtype)
+        levels_out = sum(out_bytes / float(np.prod(f)) for f in factors)
+        return int(read_factor * read_bytes + levels_out)
+
+    def grown(start, limit):
+        """``start`` grown to the budget, innermost axis first (contiguous reads), in
+        whole multiples of ``start``, never past ``limit``."""
+        region = list(start)
+        for a in reversed(range(ndim)):
+            while region[a] < limit[a]:
+                trial = region.copy()
+                trial[a] = min(region[a] + start[a], -(-limit[a] // start[a]) * start[a])
+                if cost(tuple(min(t, s) for t, s in zip(trial, limit))) > budget:
+                    break
+                region = trial
+        return tuple(min(r, s) for r, s in zip(region, limit))
+
+    streamed = cost(aligned(1)) > budget
+    # Memory-bounded mode: whole inner chunks appended to their shards as they complete
+    # (zarrista-bounded: zarrs' partial encoding; tensorstore: dyna's own shard writer,
+    # _shard_writer, since a TensorStore transaction holds the whole shard). Local zarr v3
+    # outputs only: an object store cannot write a value in parts.
+    assembled = streamed and not specs[0].remote and (
+        (backend == "zarrista" and _bounded_partial_writes())
+        or (backend == "tensorstore" and _shard_assembly_ok(specs)))
+    if memory_budget_mb is not None and streamed and not assembled:
+        # whole write units are assembled in memory (a TensorStore transaction per shard,
+        # or a whole unit read): the budget cannot be kept by tiling
+        unit_mib = float(np.prod(aligned(1))) * np.dtype(final_dtype).itemsize / 2**20
+        msg = (f"memory_budget_mb={memory_budget_mb:g} cannot bound this write: a whole "
+               f"write unit of {aligned(1)} (~{unit_mib:.0f} MiB) is assembled in memory per "
+               f"thread. Big shards are appended chunk by chunk within a budget for local "
+               f"zarr v3 outputs, with backend='tensorstore' (blosc / zstd / gzip / no "
+               f"compression) or backend='zarrista' (zarrista-bounded).")
+        _say(f"[Levels] WARNING: {msg}", flush=True)
+        if unit_mib * max(1, int(max_threads)) > float(memory_budget_mb):
+            warnings.warn(msg, RuntimeWarning, stacklevel=2)
+    if streamed and backend != "tensorstore" and not assembled:
+        _say(f"[Levels] a whole write unit of {aligned(1)} exceeds region_size_mb, and "
+             f"only the tensorstore backend can assemble it from blocks: reading it "
+             f"whole", flush=True)
+        streamed = False
+
+    lock = threading.Lock()
+    state = {"next": 0, "error": None}
+
+    def level_blocks(data, origin):
+        """Every output's block computed from one source block at ``origin``:
+        ``(level, dst, block)``."""
+        for level, f in enumerate(factors[:n]):
+            if all(k == 1 for k in f):
+                out = data
+            elif method == "simple":
+                out = data[tuple(slice(None, None, k) for k in f)]
+            else:
+                out = (reducer or coarsen_block)(data, f, method)
+            dst = tuple(slice(o // k, o // k + b) for o, k, b in zip(origin, f, out.shape))
+            if level == 0 and observe is not None:
+                observe(dst, out)
+            yield level, dst, out
+
+    def read_block(origin, stop):
+        data = _asnumpy_pinned(array._read_direct(
+            tuple(slice(o, e) for o, e in zip(origin, stop))))
+        if data.dtype != final_dtype:
+            data = _saturate_block(data, final_dtype)
+        return data
+
+    if not streamed:
+        # every region spans whole write units of each output: read, reduced and written
+        # in one go, one worker per region
+        n = 1
+        while n < len(specs) and cost(aligned(n + 1)) <= budget:
+            n += 1
+        unit = aligned(n)
+        region = grown(unit, shape)
+        if memory_budget_mb is not None:
+            # as in io.write: the budget caps the threads (a ceiling, never a target)
+            per_thread = max(1, int(worker_cost(region)))
+            affordable = int(float(memory_budget_mb) * 2**20 // per_thread)
+            if affordable < 1:
+                msg = (f"memory_budget_mb={memory_budget_mb:g} cannot fit even one thread "
+                       f"(~{per_thread / 2**20:.0f} MiB for a region of {region}). Running "
+                       f"with one thread; reduce region_size_mb or raise the budget.")
+                _say(f"[Levels] WARNING: {msg}", flush=True)
+                warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            max_threads = max(1, min(int(max_threads), affordable))
+        handles = [_open_output(spec) for spec in specs[:n]]
+        items = [(origin, tuple(min(o + g, s) for o, g, s in zip(origin, region, shape)))
+                 for origin in _it.product(*[range(0, s, r) for s, r in zip(shape, region)])]
+        _say(f"[Levels] {n} of {len(specs)} outputs in one pass: {len(items)} regions of "
+             f"{region} (aligned to {unit}), {max_threads} threads", flush=True)
+
+        def worker():
+            try:
+                while True:
+                    with lock:
+                        if state["error"] is not None or state["next"] >= len(items):
+                            return
+                        origin, stop = items[state["next"]]
+                        state["next"] += 1
+                    for level, dst, out in level_blocks(read_block(origin, stop), origin):
+                        handles[level][dst].write(np.ascontiguousarray(out)).result()
+            except BaseException as exc:          # first error wins; the others stop
+                with lock:
+                    if state["error"] is None:
+                        state["error"] = exc
+    elif assembled:
+        # A write unit (a shard) is larger than the budget, and the output can take whole
+        # inner chunks appended to their shards. All levels in ONE pass over the source,
+        # in budget-sized blocks on the grid of the deepest window (no window is split),
+        # read in whole source chunks (a stack of planes: whole planes). Each level's
+        # blocks fill raw inner-chunk buffers; a chunk is written the moment it is
+        # complete - appended to its shard, one writer per shard at a time (zarrs forbids
+        # concurrent partial writes to a shard) - and freed. Only whole chunks are
+        # written: a partial one would leave its superseded copy in the shard as dead
+        # space. Blocks go z-major, so the open chunks are about one row of chunks deep
+        # per level; nothing scales with the shard size.
+        from ._read_cost import read_unit as _read_unit
+        inner = [tuple(int(c) for c in spec.chunks) for spec in specs]
+        units = [tuple(int(u) for u in (spec.shards if spec.shards is not None
+                                        else spec.chunks)) for spec in specs]
+        level_shapes = [tuple(int(v) for v in spec.shape) for spec in specs]
+        src_chunks = getattr(array, "chunks", None)
+        src_unit = _read_unit(array)
+        if src_unit is None and src_chunks is not None and len(src_chunks) == ndim:
+            src_unit = tuple(int(c) for c in src_chunks)   # unknown: a whole chunk
+        n = len(specs)
+        tile = tuple(shape)
+        plan_note = ""
+        planned_block = None
+        slab = None
+        if memory_budget_mb is not None and ndim >= 3:
+            # the budget is what this write may ADD to the process (as in io.write); the
+            # caller, who owns the process, accounts for what it already holds
+            budget_bytes = float(memory_budget_mb) * 2**20
+            plan = _plan_xy_tiles(shape, factors, inner, level_shapes,
+                                  np.dtype(final_dtype).itemsize, budget_bytes,
+                                  src_unit, workers=max_threads, block_cost=worker_cost,
+                                  read_cost=cost, region_bytes=budget,
+                                  src_chunks=src_chunks)
+            n, max_threads, planned_block = plan["n"], plan["workers"], plan["block"]
+            slab = plan["slab"]
+            ty, tx = plan["tile"]
+            tile = tuple(shape[:-2]) + (ty, tx)
+            mib = lambda b_: f"{b_ / 2**20:.0f} MiB"
+            plan_note = (f"; tiles of {ty}x{tx}"
+                         f"{f' in slabs of {slab} planes' if slab < shape[-3] else ''}, "
+                         f"{max_threads} threads, estimate: open "
+                         f"chunks {plan['chunks'] / 2**20:.1f} + blocks "
+                         f"{plan['blocks'] / 2**20:.0f} "
+                         f"= {mib(plan['chunks'] + plan['blocks'])} of {memory_budget_mb:.0f}")
+            if not plan["fits"]:
+                msg = (f"memory_budget_mb={memory_budget_mb:.0f} is below what even the "
+                       f"smallest pass (tiles of {plan['minimal'][0]}x{plan['minimal'][1]}, "
+                       f"1 thread) needs: at least {mib(plan['need_minimal'])}. Writing "
+                       f"with that anyway.")
+                _say(f"[Levels] WARNING: {msg}", flush=True)
+                warnings.warn(msg, RuntimeWarning, stacklevel=2)
+            if plan["amp"] > 1:
+                msg = (f"tiles of {ty}x{tx} split the source's read unit "
+                       f"{tuple(src_unit[-2:])}: every unit is decoded ~{plan['amp']}x. A "
+                       f"memory budget of at least {mib(plan['need_units'])} keeps whole "
+                       f"read units in one tile.")
+                _say(f"[Levels] WARNING: {msg}", flush=True)
+                warnings.warn(msg, RuntimeWarning, stacklevel=2)
+        window = [1] * ndim
+        for f in factors[:n]:
+            window = [lcm(w, int(k)) for w, k in zip(window, f)]
+        if src_chunks is None or len(src_chunks) != ndim:
+            src_chunks = tuple(min(w, sz) for w, sz in zip(window, shape))
+        if planned_block is not None:
+            block = planned_block
+        else:
+            first = []
+            for c, w, lim in zip(src_chunks, window, tile):
+                c = min(int(c), lim)
+                u = lcm(c, w)
+                first.append(lim if c == lim else (u if u <= lim else min(w, lim)))
+            block = grown(tuple(first), tile)
+        handles = [_open_output(spec) for spec in specs[:n]]
+        if backend == "tensorstore":
+            # TensorStore created each array; dyna writes the shard files chunk by chunk
+            handles = [_chunk_output(spec, h) for spec, h in zip(specs[:n], handles)]
+        tiles = sorted(_it.product(*[range(0, sz, t) for sz, t in zip(shape[-2:], tile[-2:])]),
+                       key=lambda o: _morton(o[0] // tile[-2], o[1] // tile[-1]))
+        items = []
+        zs = ndim - 3                                 # the slab axis (z), when tiled
+        depth = slab if slab is not None and ndim >= 3 else None
+        for z0 in (range(0, shape[zs], depth) if depth else [None]):
+            for ty0, tx0 in tiles:
+                t_stop = list(shape[:-2]) + [min(ty0 + tile[-2], shape[-2]),
+                                             min(tx0 + tile[-1], shape[-1])]
+                t_origin = [0] * (ndim - 2) + [ty0, tx0]
+                if z0 is not None:                    # this slab of this tile
+                    t_origin[zs], t_stop[zs] = z0, min(z0 + depth, shape[zs])
+                for origin in _it.product(*[range(o, e, b) for o, e, b in
+                                            zip(t_origin, t_stop, block)]):
+                    items.append((origin, tuple(min(o + b, e) for o, b, e in
+                                                zip(origin, block, t_stop))))
+        buffers = {}                                  # (level, chunk) -> [buffer, left]
+        shard_locks = {}
+        held = {"now": 0, "peak": 0}                  # bytes in open chunk buffers
+        _say(f"[Levels] {n} of {len(specs)} outputs in one pass: {len(items)} blocks of "
+             f"{block} (whole source chunks, whole windows of every level), {max_threads} "
+             f"threads; whole inner chunks appended to their shards as they complete"
+             f"{plan_note}", flush=True)
+
+        def chunk_box(level, idx):
+            c, L = inner[level], level_shapes[level]
+            return tuple(slice(i * k, min((i + 1) * k, n_)) for i, k, n_ in zip(idx, c, L))
+
+        # Workers run at most `ahead` blocks ahead of the oldest unfinished one, and a
+        # block is finished only once the chunks it completed are appended: otherwise the
+        # others race ahead while one thread appends a completed row (128 chunks) and
+        # open rows without bound (measured 4 tile rows where 2 were planned).
+        ahead = _AHEAD_PER_THREAD * max(1, int(max_threads))
+        window = {"low": 0, "finished": set()}
+        room = threading.Condition(lock)
+
+        def worker():
+            try:
+                while True:
+                    with room:
+                        while (state["error"] is None and state["next"] < len(items)
+                               and state["next"] >= window["low"] + ahead):
+                            room.wait(0.1)
+                        if state["error"] is not None or state["next"] >= len(items):
+                            return
+                        j = state["next"]
+                        origin, stop = items[j]
+                        state["next"] += 1
+                    for level, dst, out in level_blocks(read_block(origin, stop), origin):
+                        c = inner[level]
+                        for idx in _it.product(*[range(d.start // k, -(-d.stop // k))
+                                                 for d, k in zip(dst, c)]):
+                            box = chunk_box(level, idx)
+                            part = tuple(slice(max(d.start, b.start), min(d.stop, b.stop))
+                                         for d, b in zip(dst, box))
+                            src = tuple(slice(q.start - d.start, q.stop - d.start)
+                                        for q, d in zip(part, dst))
+                            into = tuple(slice(q.start - b.start, q.stop - b.start)
+                                         for q, b in zip(part, box))
+                            key = (level, idx)
+                            with lock:
+                                entry = buffers.get(key)
+                                if entry is None:
+                                    entry = buffers[key] = [
+                                        np.empty(tuple(b.stop - b.start for b in box),
+                                                 dtype=final_dtype),
+                                        int(np.prod([b.stop - b.start for b in box]))]
+                                    held["now"] += entry[0].nbytes
+                                    held["peak"] = max(held["peak"], held["now"])
+                            # disjoint parts of one buffer: filled without the lock
+                            entry[0][into] = out[src]
+                            with lock:
+                                entry[1] -= int(np.prod([q.stop - q.start for q in part]))
+                                done = entry[1] == 0
+                                if done:
+                                    del buffers[key]
+                                    shard = (level,) + tuple(i * k // u for i, k, u in
+                                                             zip(idx, c, units[level]))
+                                    shard_lock = shard_locks.setdefault(shard,
+                                                                        threading.Lock())
+                            if done:
+                                with shard_lock:
+                                    handles[level].append_chunk(box, entry[0])
+                                with lock:                # held until it is written
+                                    held["now"] -= entry[0].nbytes
+                    with room:
+                        window["finished"].add(j)
+                        while window["low"] in window["finished"]:
+                            window["finished"].discard(window["low"])
+                            window["low"] += 1
+                        room.notify_all()
+            except BaseException as exc:          # first error wins; the others stop
+                with lock:
+                    if state["error"] is None:
+                        state["error"] = exc
+    else:
+        # A write unit (a shard) is larger than the budget. Aligning regions to whole
+        # shards of every level would make a region factor**ndim shards (8 GB for 1 GB
+        # shards at factor 2), and splitting the levels over several passes re-reads the
+        # source per pass. Instead ALL levels are written in one pass over the source, in
+        # budget-sized blocks on the grid of the deepest window (no window is split). Each
+        # output shard is assembled in its own TensorStore transaction and committed once,
+        # when the last block that touches it is done. Blocks go shard by shard (coarsest
+        # level's shard first), so about one shard per level is open at a time.
+        n = len(specs)
+        window = [1] * ndim
+        for f in factors:
+            window = [lcm(w, int(k)) for w, k in zip(window, f)]
+        units = [tuple(int(u) for u in (spec.shards if spec.shards is not None
+                                        else spec.chunks)) for spec in specs]
+        # Blocks stay within about one shard of the first output, so each shard is
+        # completed by consecutive blocks and written once ...
+        limit = tuple(min(sz, max(w, (int(k) * u // w) * w))
+                      for sz, w, k, u in zip(shape, window, factors[0], units[0]))
+        # ... unless that splits the SOURCE's chunks. A planar source (a TIFF plane per
+        # file, stored as one strip) is read whole for any piece of it: shard-sized blocks
+        # read every plane ~9x (191 s vs eubi-bridge's 113 s on a 17.6 GB stack). Such a
+        # source is read in whole source chunks; a shard then fills over many blocks, and
+        # holding all of it would mean a slab of shards, so a shard's transaction is
+        # committed whenever it holds region_size_mb (a few writes per shard instead of
+        # one per block: TensorStore merges them).
+        src_chunks = getattr(array, "chunks", None)
+        planar = (src_chunks is not None and len(src_chunks) == ndim and any(
+            min(int(c), sz) > lim for c, sz, lim in zip(src_chunks, shape, limit)))
+        if planar:
+            first = []
+            for c, w, sz in zip(src_chunks, window, shape):
+                c = min(int(c), sz)
+                u = lcm(c, w)
+                # a chunk spanning the axis: the whole axis (windows end with it)
+                first.append(sz if c == sz else (u if u <= sz else min(w, sz)))
+            block = grown(tuple(first), shape)
+            flush_bytes = budget
+        else:
+            block = grown(tuple(min(w, sz) for w, sz in zip(window, shape)), limit)
+            flush_bytes = float("inf")
+        handles = [_open_output(spec) for spec in specs]
+        level_shapes = [tuple(int(v) for v in spec.shape) for spec in specs]
+
+        def dst_of(origin, stop, level):
+            f = factors[level]
+            return tuple(slice(o // k, min(-(-e // k), L))
+                         for o, e, k, L in zip(origin, stop, f, level_shapes[level]))
+
+        def shards_of(dst, level):
+            return list(_it.product(*[range(d.start // u, -(-d.stop // u))
+                                      for d, u in zip(dst, units[level])]))
+
+        items, pending = [], {}
+        for origin in _it.product(*[range(0, sz, b) for sz, b in zip(shape, block)]):
+            stop = tuple(min(o + b, sz) for o, b, sz in zip(origin, block, shape))
+            for lv in range(n):
+                for sh in shards_of(dst_of(origin, stop, lv), lv):
+                    pending[(lv, sh)] = pending.get((lv, sh), 0) + 1
+            # shard by shard, the coarsest level's shard first: few shards open at a time
+            order = tuple(tuple(d.start // u for d, u in zip(dst_of(origin, stop, lv), units[lv]))
+                          for lv in reversed(range(n)))
+            items.append((order, origin, stop))
+        items.sort()
+        open_txns = {}                        # (level, shard) -> its open transaction
+        _say(f"[Levels] {n} of {len(specs)} outputs in one pass: {len(items)} blocks of "
+             f"{block} ({'whole source chunks' if planar else 'within one shard'}, whole "
+             f"windows of every level), {max_threads} threads; {len(pending)} shards, each "
+             f"assembled in a transaction and written "
+             f"{'every ~' + format(flush_bytes / 2**20, '.0f') + ' MiB' if planar else 'once'}",
+             flush=True)
+
+        def worker():
+            import tensorstore as ts
+            try:
+                while True:
+                    with lock:
+                        if state["error"] is not None or state["next"] >= len(items):
+                            return
+                        _, origin, stop = items[state["next"]]
+                        state["next"] += 1
+                    commit = []
+                    for level, dst, out in level_blocks(read_block(origin, stop), origin):
+                        unit = units[level]
+                        for sh in shards_of(dst, level):
+                            key = (level, sh)
+                            piece = tuple(slice(max(d.start, i * u), min(d.stop, (i + 1) * u))
+                                          for d, i, u in zip(dst, sh, unit))
+                            local = tuple(slice(q.start - d.start, q.stop - d.start)
+                                          for q, d in zip(piece, dst))
+                            with lock:
+                                entry = open_txns.get(key)
+                                if entry is None:
+                                    txn = ts.Transaction()
+                                    entry = open_txns[key] = {
+                                        "txn": txn, "view": handles[level].with_transaction(txn),
+                                        "bytes": 0, "writing": 0, "closed": False}
+                                entry["writing"] += 1
+                            data = np.ascontiguousarray(out[local])
+                            entry["view"][piece].write(data).result()
+                            with lock:
+                                entry["writing"] -= 1
+                                entry["bytes"] += data.nbytes
+                                pending[key] -= 1
+                                if not entry["closed"] and (pending[key] == 0
+                                                            or entry["bytes"] >= flush_bytes):
+                                    entry["closed"] = True         # later pieces: a new one
+                                    if open_txns.get(key) is entry:
+                                        del open_txns[key]
+                                if entry["closed"] and entry["writing"] == 0 \
+                                        and not entry.get("committing"):
+                                    entry["committing"] = True
+                                    commit.append(entry["txn"])
+                    for txn in commit:
+                        txn.commit_sync()
+            except BaseException as exc:          # first error wins; the others stop
+                with lock:
+                    if state["error"] is None:
+                        state["error"] = exc
+
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        threads = [_thread(worker, f"LevelsWorker-{i}")
+                   for i in range(max(1, int(max_threads)))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        if gc_was_enabled:
+            gc.enable()
+    if state["error"] is not None:
+        raise state["error"]
+    if assembled:
+        for h in handles:                         # shards whose chunks were all empty
+            finish = getattr(h, "finish", None)
+            if finish is not None:
+                finish()
+        _say(f"[Levels] open chunk buffers peaked at {held['peak'] / 2**20:.1f} MiB",
+             flush=True)
+    return n
 
 
 #: The outermost transforms io.write hands to a STAGED writer instead of the region
@@ -2347,7 +3580,7 @@ _STAGED_WRITES = {"FlattenTransform": "flatten", "ReshapeTransform": "reshape",
                   "ScanTransform": "scan"}
 
 
-def _write_staged(kind, array, spec: _OutputSpec, *, max_workers, device,
+def _write_staged(kind, array, spec: _OutputSpec, *, max_threads, device,
                   region_shape, memory_budget_mb, num_readers):
     """Write ``array`` (an outermost reshape/flatten/scan) with its staged writer.
 
@@ -2369,8 +3602,8 @@ def _write_staged(kind, array, spec: _OutputSpec, *, max_workers, device,
         raise ValueError(
             f"{', '.join(ignored)} {'does' if len(ignored) == 1 else 'do'} not apply to a "
             f"{kind} write: an outermost {kind} is written by a staged writer, not by the "
-            f"region pipeline. Its memory budget is region_size_mb (per worker, x "
-            f"max_workers). Drop {', '.join(ignored)}.")
+            f"region pipeline. Its memory budget is region_size_mb (per thread, x "
+            f"max_threads). Drop {', '.join(ignored)}.")
 
     from .rechunk import check_staging_space, staging_bytes, flatten_write, reshape_write
     from .operations.scan import scan_write
@@ -2387,18 +3620,18 @@ def _write_staged(kind, array, spec: _OutputSpec, *, max_workers, device,
                   zarr_format=spec.zarr_format)
     with device_context(device):
         if kind == "flatten":
-            flatten_write(source, sink, max_workers=max_workers, **common)
+            flatten_write(source, sink, max_threads=max_threads, **common)
         elif kind == "reshape":
-            reshape_write(source, spec.shape, sink, max_workers=max_workers, **common)
+            reshape_write(source, spec.shape, sink, max_threads=max_threads, **common)
         else:
             scan_write(source, transform.op, transform.axis, sink, **common)
     return spec.path
 
 
-def write_array(
+def _write_array(
     array: 'DynamicArray',
     output_path: str,
-    max_workers: int = 4,
+    max_threads: Optional[int] = None,
     num_readers: Optional[int] = None,
     chunks: Optional[Tuple[int, ...]] = None,
     chunk_size_mb: Optional[float] = None,
@@ -2417,61 +3650,86 @@ def write_array(
     backend: str = "tensorstore",
     storage_options: Optional[dict] = None,
     dimension_names: Optional[Tuple[str, ...]] = None,
+    engine: str = "fused",
+    observe: Optional[Any] = None,
+    max_workers: Optional[int] = None,
 ):
     """
-    ASYNC VECTORIZED TensorStore write with queue-based pipeline:
-    - Queue buffers work between readers and writers (good for pipeline)
-    - Readers: Fast, simple reads into queue
-    - Writers: Async writes via TensorStore .write() (non-blocking)
-    - TensorStore handles actual write parallelism in C++ backend
+    Write ``array`` to a zarr array, region by region, memory-bounded.
 
-    Key insight: Queue is good for buffering. Async writes prevent blocking.
-    Writers call .write() which returns futures immediately, then TensorStore
-    does the actual parallel I/O internally.
+    The output (format, chunks, codecs, shards, backend, overwrite) and the read regions
+    are resolved first; then an execution ENGINE reads and writes the regions. Both
+    engines write exactly the same regions and produce bit-identical output.
+
+    ENGINES
+    -------
+    ``engine="fused"`` (default): `max_threads` threads each take the next region, read
+    it (running the op chain), write it and wait for the write, then take the next one.
+
+    ``engine="pipeline"``: the producer-consumer loop of dyna <= 0.0.9. Reader threads
+    put regions on a queue; writer threads submit async writes. `max_threads` is the
+    TOTAL number of regions live across the readers, the queue and the in-flight writes
+    (at least 3), split by `num_readers`.
+
+    Measured on 16 cases: fused is 1.2-1.35x faster
+    on I/O-bound writes at equal memory and ties on CPU-bound chains, reductions and
+    remote uploads; the pipeline is up to ~20% ahead on read-heavy cases (narrowing
+    casts, broadcast reductions) at low worker counts.
 
     MEMORY MODEL
     ------------
-    The pipeline has three stages that each pin whole region buffers: readers in
-    flight, the hand-off queue, and submitted-but-uncommitted TensorStore writes.
-    `max_workers` is the TOTAL number of regions allowed live across all three, so
+    Peak RAM is independent of the ARRAY size, which is the guarantee that matters:
 
-        peak RAM ~= FIXED + k * max_workers * region_bytes, with k ~= 2.5 (a region
-        in flight is held as source AND as result, plus copies) and FIXED ~= 200 MB
-        per write. Independent of the ARRAY size, which is the guarantee that
-        matters; see "What peak RAM actually is" in the README.
+        peak RAM ~= BASE + region memory
 
-    is computable from two numbers the caller already controls (`max_workers` and
-    `region_shape`/`region_size_mb`). The internal split between the three stages is
-    derived from `max_workers` and `num_readers`; the queue depth and the in-flight
-    write cap are NOT separately settable (they were, and being independent multiples
-    of the worker count they made peak memory scale with worker count while ignoring
-    region SIZE entirely - 32 live regions at the defaults, which is ~256MB at an 8MB
-    region but ~36GB at a 672^3 int32 one).
-
-    Writer threads are deliberately NOT scaled with `max_workers`: `.write()` is async
-    (it returns a future and TensorStore's C++ pool does the real I/O), so writer count
-    is measurably irrelevant to throughput (1 vs 8 writers: same wall time) while each
-    extra writer costs a live buffer. Readers are the real driver and stay tunable via
-    `num_readers`.
+    BASE is roughly 50-150 MB per write (plus the imports) and no setting changes it.
+    Region memory is what `memory_budget_mb` bounds. A region being read and
+    transformed costs ``2 * read + out``: ``read`` is the region padded by the chain's
+    deepest halo, in the widest dtype anywhere in the chain, held as source data and as
+    the chain's result; ``out`` is the region in the output dtype. Under ``"fused"``
+    every worker holds that. Under ``"pipeline"`` only the readers do; a queued region
+    holds ``out`` and an in-flight write ``2 * out`` (the data and its encoding), so the
+    same `max_threads` uses less memory there (64 MB float32 copy regions, 4 workers:
+    782 MB fused vs 479 MB pipeline).
 
     Parameters:
     -----------
-    array : DynamicArray
-        Input array to write
+    array : DynamicArray or dask.array.Array
+        Input array to write. A dask array is written by dask's own scheduler on
+        `max_threads` local threads, pushed into an output resolved exactly as for a
+        DynamicArray (chunks default to its ``chunksize``); the region-loop options
+        (`region_shape`, `region_size_mb`, `memory_budget_mb`, `num_readers`, `device`,
+        the early timeouts, ``engine="pipeline"``) are refused for it. To write it
+        through dyna's region loop instead, pass ``dyna_zarr.from_array(x)``.
     output_path : str
         Path to output Zarr array
-    max_workers : int
-        TOTAL regions that may be live at once, across readers + queue + in-flight
-        writes. Peak RAM ~= FIXED + k * max_workers * region_bytes (k ~= 2.5).
+    max_threads : int
+        Default 4; an upper limit (a memory budget can lower it). Formerly
+        ``max_workers``, which still works with a FutureWarning.
+        Dask array: the number of dask threads.
+        ``"fused"``: the number of threads, i.e. regions being read or written at once.
+        ``"pipeline"``: TOTAL regions live across readers + queue + in-flight writes
+        (raised to 3 if lower).
     num_readers : int, optional
-        How much of `max_workers` goes to reader threads (the reader/writer balance).
-        Default: about half of `max_workers`, at least 1. More readers hide read
-        latency on slow/remote stores; they also raise peak memory one region each.
+        ``"pipeline"`` only (an error with ``"fused"``, which has no readers): how much
+        of `max_threads` goes to reader threads. Default: about half of `max_threads`.
     memory_budget_mb : float, optional
-        Ceiling on pipeline memory. When given, `max_workers` is clamped to
-        `memory_budget_mb / region_bytes` (never raised above the requested value - the
-        budget is a ceiling, not a target). If even a minimal pipeline cannot fit, a
-        warning naming the culprit is emitted and the pipeline runs at its floor.
+        Ceiling on region memory, counted as in MEMORY MODEL (halo, widest dtype and
+        output dtype included; BASE is not). `max_threads` is lowered until the regions
+        fit, never raised above the requested value - the budget is a ceiling, not a
+        target. If the floor (1 thread under ``"fused"``, 3 live regions under
+        ``"pipeline"``) does not fit, a warning naming the culprit is emitted and the
+        write runs at the floor.
+    engine : {"fused", "pipeline"}
+        The execution loop; see ENGINES. Default ``"fused"``. Reshape/flatten/scan
+        outputs use their staged writers under either engine.
+    observe : callable, optional
+        ``observe(key, block)`` is called with every block as it is written - after
+        the cast to the output dtype - and its location in the output (a tuple of
+        slices), from the worker threads, concurrently. For statistics in the same
+        pass as the write, e.g. ``io.Extrema(axis)`` for per-channel min/max, instead
+        of reading the output again. Not available for an outermost
+        reshape/flatten/scan (staged writers).
     chunks : tuple of int, optional
         EXACT output chunk shape, honoured verbatim. For v3 with sharding, this is
         the inner chunk shape. **Defaults to the INPUT chunks**, so a read-modify-
@@ -2487,7 +3745,7 @@ def write_array(
         it is reported when it does. Pass `chunks=` for an exact shape.
     shard_coefficients : tuple of int, optional
         Multipliers for chunk sizes to compute shard shape (Zarr v3 only).
-        Example: chunks=(64, 64), shard_coefficients=(4, 4) â†’ shards=(256, 256)
+        Example: chunks=(64, 64), shard_coefficients=(4, 4) -> shards=(256, 256)
         If None, infers from input array. If input has no shards, writes without sharding.
     compressor : Codecs, numcodecs compressor, or None
         Compression configuration. Can be:
@@ -2496,6 +3754,13 @@ def write_array(
         - None: Infers from input array, or uses Blosc with LZ4 as default
     zarr_format : int
         Zarr format version (2 or 3, default: 3)
+    dtype : dtype, optional
+        Output dtype (default: the array's). The cast SATURATES rather than wraps (see
+        ``operations.saturate_cast``): to an integer dtype, floats are rounded to nearest
+        and NaN becomes 0, then values are clipped to the target range (uint16 4000 ->
+        uint8 255, float 254.7 -> 255, -3 -> 0). Widening casts and float targets are
+        plain casts. ``array.astype(dtype)`` in the chain keeps NumPy's wrapping
+        semantics if that is what you want.
     region_size_mb : float, optional
         Target size of read regions in MiB (default 8.0). The budget form of
         `region_shape`; passing both is an error. Approximate, and adjusted to hold
@@ -2523,11 +3788,41 @@ def write_array(
     gc_interval : float
         Seconds between GC runs (default: 15.0)
     """
+    max_threads = renamed(max_threads, max_workers, new="max_threads", old="max_workers",
+                          where="io.write", default=4, stacklevel=4)
+    if engine not in _ENGINES:
+        raise ValueError(f"engine must be one of {_ENGINES}, got {engine!r}")
+    from .dynamic_array import _is_dask, _needs_read_lock
+    if _is_dask(array) and _needs_read_lock(array):
+        # One shared file handle (bioio's ND2 reader and others): dask's threads would
+        # read it concurrently and close each other's handle or read wrong pixels. Its
+        # reads are serialised instead, behind a lock, while dyna's workers still
+        # compress and write in parallel (measured: as fast as a single-threaded read).
+        from .dynamic_array import from_array
+        _say(f"[Optimized] {type(array).__name__} reads through one shared file "
+              f"handle: reading it one region at a time (writes stay parallel)", flush=True)
+        array = from_array(array, lock=True)
+    elif _is_dask(array):
+        return _write_dask(
+            array, output_path, max_threads=max_threads, num_readers=num_readers,
+            chunks=chunks, chunk_size_mb=chunk_size_mb,
+            shard_coefficients=shard_coefficients, dtype=dtype, compressor=compressor,
+            zarr_format=zarr_format, region_size_mb=region_size_mb,
+            early_quarter_timeout=early_quarter_timeout,
+            early_tenth_timeout=early_tenth_timeout, device=device,
+            region_shape=region_shape, memory_budget_mb=memory_budget_mb,
+            overwrite=overwrite, backend=backend, storage_options=storage_options,
+            dimension_names=dimension_names, engine=engine, observe=observe)
+    if engine == "fused" and num_readers is not None:
+        raise ValueError(
+            "num_readers applies to engine='pipeline' only: the fused engine has no "
+            "separate readers (each of the max_threads threads reads and writes its own "
+            "region). Drop num_readers, or pass engine='pipeline'.")
     # Resolve and validate EVERYTHING first, for every write strategy, before any
     # storage is touched: format, chunks, codecs, shards, backend, overwrite and all
     # argument checks. A rejected write therefore leaves nothing behind.
     spec = _resolve_output(
-        array, output_path, max_workers=max_workers, num_readers=num_readers,
+        array, output_path, max_threads=max_threads, num_readers=num_readers,
         chunks=chunks, chunk_size_mb=chunk_size_mb, shard_coefficients=shard_coefficients,
         dtype=dtype, compressor=compressor, zarr_format=zarr_format,
         region_size_mb=region_size_mb, gc_interval=gc_interval, device=device,
@@ -2537,7 +3832,7 @@ def write_array(
     )
     _region_mb = spec.region_mb
     for _note in spec.notes:
-        print(f"[Alignment] {_note}")
+        _say(f"[Alignment] {_note}")
 
     # Small reductions the chain re-reads (the 0-d `level` in `x > level`, per-channel
     # stats broadcast back) are computed NOW, once, fused per input, before any region
@@ -2552,16 +3847,44 @@ def write_array(
     # kind of output, on every backend, local or remote. See _write_staged.
     _staged = _STAGED_WRITES.get(type(getattr(array, "_transform", None)).__name__)
     if _staged is not None:
-        return _write_staged(_staged, array, spec, max_workers=max_workers, device=device,
+        if observe is not None:
+            raise ValueError(
+                f"observe= is not available for an outermost {_staged}: it is written by a "
+                f"staged writer, not by the region loop. Compute the statistic on the "
+                f"input instead (e.g. operations.min / max), or write without observe.")
+        return _write_staged(_staged, array, spec, max_threads=max_threads, device=device,
                              region_shape=region_shape, memory_budget_mb=memory_budget_mb,
                              num_readers=num_readers)
+
+    # Shards larger than a region, written locally: write_levels' chunk-by-chunk mode
+    # (one full-resolution output) - whole inner chunks appended to their shards as they
+    # complete, y/x-tiled within memory_budget_mb. The region loop below would cut the
+    # regions to chunks (TensorStore then re-encodes the whole shard for every region
+    # written into it) or grow them to whole shards (zarrista: shards per thread).
+    if _big_shards_bounded(array, spec, region_shape, device, engine):
+        _say(f"[Optimized] Shards {spec.shards} are larger than a region "
+             f"({spec.region_mb:g} MB): written chunk by chunk", flush=True)
+        ndim = len(spec.shape)
+        write_levels(
+            array, [dict(path=spec.path, factors=(1,) * ndim, chunks=tuple(spec.chunks),
+                         shard_coefficients=tuple(sh // c for sh, c in
+                                                  zip(spec.shards, spec.chunks)))],
+            method="simple", max_threads=max_threads, region_size_mb=spec.region_mb,
+            dtype=spec.dtype, compressor=spec.codecs, zarr_format=3, backend=spec.backend,
+            storage_options=spec.storage_options, overwrite=spec.overwrite,
+            dimension_names=dimension_names, observe=observe,
+            memory_budget_mb=memory_budget_mb)
+        _say(f"Successfully wrote array to {output_path}")
+        return output_path
 
     # Opened BEFORE gc is disabled, so a failure to create the store cannot leave the
     # interpreter's collector switched off.
     output = _open_output(spec)
 
-    # Aggressive memory cleanup before starting
-    gc.collect()
+    # The cyclic collector is paused while regions are in flight (their buffers are freed
+    # by reference counting). No forced gc.collect() first: it cost ~45 ms per write in a
+    # process the size of eubi-bridge's (180k objects), paid once per pyramid level -
+    # measured 60 -> 17 ms per small write, and the slowdown on many-scene conversions.
     gc_was_enabled = gc.isenabled()
     gc.disable()
 
@@ -2590,7 +3913,7 @@ def write_array(
                 f"region_shape {region_shape} has {len(region_shape)} dims but array is "
                 f"{len(input_shape)}-D")
         region_shape = tuple(min(r, s) for r, s in zip(region_shape, input_shape))
-        print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape} (explicit region_shape)")
+        _say(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape} (explicit region_shape)")
     else:
         # No explicit region_shape. If the op chain carries a read-ALIGNMENT grid (a
         # map_overlap built with align=..., as tilewise-ccl's Phase B is), the producer can
@@ -2601,7 +3924,7 @@ def write_array(
         aligned = _aligned_region_shape(array, final_chunks, input_shape)
         if aligned is not None:
             region_shape = aligned
-            print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape} "
+            _say(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape} "
                   f"(from the op chain's alignment)")
         else:
             # Solved jointly with the chunks, so it is already a whole multiple of
@@ -2617,10 +3940,10 @@ def write_array(
                 array, region_shape, input_shape, final_chunks, _region_mb,
                 _widest_dtype(_chain_widest_dtype(array), final_dtype))
             if _spanned is not None and _spanned != region_shape:
-                print(f"[Optimized] Region {region_shape} -> {_spanned}: spans the axes "
+                _say(f"[Optimized] Region {region_shape} -> {_spanned}: spans the axes "
                       f"a broadcast reduction is repeated along, so it is read once")
                 region_shape = _spanned
-            print(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape}, Size: ~{_region_mb}MB")
+            _say(f"[Optimized] Output chunks: {final_chunks}, Region: {region_shape}, Size: ~{_region_mb}MB")
 
     # Report any grid that does not tile cleanly. Misalignment is legal and often
     # unavoidable (a coprime source grid, or an exact region_shape the caller chose),
@@ -2632,7 +3955,7 @@ def write_array(
                 for a, (c, s) in enumerate(zip(final_chunks, _src_grid))
                 if s and c % s and s % c]
         if _bad:
-            print(f"[Alignment] Output chunks {tuple(final_chunks)} do not tile the "
+            _say(f"[Alignment] Output chunks {tuple(final_chunks)} do not tile the "
                   f"source grid {tuple(_src_grid)} ({'; '.join(_bad)}). Reads will "
                   f"straddle stored chunks; omit chunks=/chunk_size_mb= to keep the "
                   f"source grid, or pass chunks= matching it.")
@@ -2640,7 +3963,7 @@ def write_array(
                    for a, (r, c) in enumerate(zip(region_shape, final_chunks))
                    if c and r % c and r != input_shape[a]]
     if _bad_region:
-        print(f"[Alignment] Region {tuple(region_shape)} does not tile the output "
+        _say(f"[Alignment] Region {tuple(region_shape)} does not tile the output "
               f"chunks {tuple(final_chunks)} ({'; '.join(_bad_region)}). Concurrent "
               f"region writes can then share a chunk.")
 
@@ -2649,7 +3972,7 @@ def write_array(
         # CHUNK - but on a sharded array the unit two writers must not share is the
         # SHARD. A region smaller than a shard would have concurrent writers meeting
         # inside one shard file, which zarrista 0.1.0 does not survive: it drops the
-        # overlapping data silently, with no error (see reports/zarrista_bugs/). Grow
+        # overlapping data silently, with no error. Grow
         # the region to whole shards rather than fail, since the region is an internal
         # tuning choice here, not something the caller asked for.
         unit = output.write_unit
@@ -2658,7 +3981,7 @@ def write_array(
                 min(-(-r // u) * u, s)
                 for r, u, s in zip(region_shape, unit, input_shape)
             )
-            print(f"[Optimized] Region {region_shape} would split a zarrista write unit "
+            _say(f"[Optimized] Region {region_shape} would split a zarrista write unit "
                   f"{unit}; grown to {grown} to keep concurrent writes safe")
             region_shape = grown
 
@@ -2707,50 +4030,85 @@ def write_array(
     quarter_target = max(1, total_chunks // 4)
     tenth_target = max(1, total_chunks // 10)
     
-    print(f"[Optimized] Total regions to process: {total_chunks}, Shape: {input_shape}, Region: {region_shape}", flush=True)
+    _say(f"[Optimized] Total regions to process: {total_chunks}, Shape: {input_shape}, Region: {region_shape}", flush=True)
     
-    # --- Pipeline sizing: ONE budget (max_workers = total live regions) split across the
-    # three stages that actually pin buffers (readers / queue / in-flight writes).
-    # Peak RAM ~= FIXED + k * max_workers * region_bytes (k ~= 2.5, FIXED ~= 200 MB);
-    # this budget covers the live-region term only, so the caller can reason about the two
-    # knobs they set. Previously each stage was an independent multiple of max_workers
-    # (8 + 8 + 16 = 32 live regions) with region SIZE never entering the formula: fine at
-    # the 8MB default (~256MB), ~36GB at a 672^3 int32 region.
+    # --- Memory per region in flight (what memory_budget_mb counts) ----------------------
     # Bands are cell-cut and chunk-rounded, so the widest one can exceed `region_shape`.
-    # Size the pipeline from what will ACTUALLY be read, or the budget under-counts.
+    # Size from what will ACTUALLY be read, or the budget under-counts.
     _max_extent = [0] * len(input_shape)
     for _band in chunk_indices:
         for _a, (_lo, _hi) in enumerate(_band):
             _max_extent[_a] = max(_max_extent[_a], min(_hi, input_shape[_a]) - _lo)
-    region_bytes = int(np.prod(_max_extent)) * int(np.dtype(final_dtype_obj).itemsize)
+    read_bytes, out_bytes = _region_cost(array, _max_extent, input_shape, final_dtype_obj)
+    # A region being read and transformed holds the source data and the chain's result
+    # (both in the widest dtype, over the halo-padded region) plus the output buffer.
+    # Queued and in-flight regions (pipeline) hold only the output and its encoded copy.
+    worker_bytes = 2 * read_bytes + out_bytes
+    budget_bytes = (None if memory_budget_mb is None
+                    else float(memory_budget_mb) * 1024 * 1024)
+    _mib = lambda b: f"{b / 1024**2:.0f} MiB"   # noqa: E731
 
-    requested_workers = max(1, int(max_workers))
-    if memory_budget_mb is not None:
+    requested_workers = max(1, int(max_threads))
+
+    # Everything above - output, regions, bands - is shared by both engines, so they write
+    # exactly the same regions; only the execution loop below differs.
+    if engine == "fused":
+        # max_threads = workers. A budget caps them (a ceiling, never a target); the floor
+        # is one worker.
+        workers = requested_workers
+        if budget_bytes is not None:
+            affordable = int(budget_bytes // max(1, worker_bytes))
+            if affordable < 1:
+                warnings.warn(
+                    f"memory_budget_mb={memory_budget_mb:g} cannot fit even one thread "
+                    f"(~{_mib(worker_bytes)}: the region is read as {_mib(read_bytes)} and "
+                    f"written as {_mib(out_bytes)}). Running with one thread; reduce "
+                    f"region_shape/region_size_mb or raise the budget.",
+                    RuntimeWarning, stacklevel=2)
+            workers = max(1, min(requested_workers, affordable))
+        _say(f"[Optimized] Engine: fused, {workers} threads (each reads and writes its own "
+              f"region; ~{_mib(workers * worker_bytes)} at ~{_mib(worker_bytes)}/thread)",
+              flush=True)
+        try:
+            _run_fused(chunk_indices, input_shape, input_array, output, final_dtype_obj,
+                       device, workers, early_tenth_timeout=early_tenth_timeout,
+                       early_quarter_timeout=early_quarter_timeout, observe=observe)
+        finally:
+            if gc_was_enabled:
+                gc.enable()
+        _say(f"Successfully wrote array to {output_path}")
+        return output_path
+
+    # --- engine="pipeline": readers -> queue -> async writers ------------------------------
+    # max_threads = total live regions, split across the three stages that pin buffers
+    # (readers / queue / in-flight writes). Readers are the measured memory driver (1->8
+    # readers: 507->1089 MiB, no time change), so they stay caller-tunable via num_readers.
+    def _split(n):
+        readers = max(1, n // 2) if num_readers is None else int(num_readers)
+        readers = max(1, min(readers, n - 2))               # leave >=1 queue, >=1 write
+        queue = max(1, (n - readers) // 2)
+        return readers, queue, max(1, n - readers - queue)
+
+    def _cost(split):
+        readers, queue, inflight = split
+        return readers * worker_bytes + queue * out_bytes + inflight * 2 * out_bytes
+
+    max_threads = max(_MIN_LIVE_REGIONS, requested_workers)
+    if budget_bytes is not None:
         # Ceiling, never a target: a generous budget must not RAISE concurrency above what
-        # was asked for (at an 8MB region a 2GB budget would allow ~256 live regions).
-        affordable = int((float(memory_budget_mb) * 1024 * 1024) // max(1, region_bytes))
-        if affordable < _MIN_LIVE_REGIONS:
+        # was asked for. Take the largest live-region count whose stages fit.
+        fits = [n for n in range(max_threads, _MIN_LIVE_REGIONS - 1, -1)
+                if _cost(_split(n)) <= budget_bytes]
+        if not fits:
             warnings.warn(
                 f"memory_budget_mb={memory_budget_mb:g} cannot fit even a minimal write "
-                f"pipeline: one region is {region_bytes / 1024**2:.0f} MiB and at least "
-                f"{_MIN_LIVE_REGIONS} must be live (~"
-                f"{_MIN_LIVE_REGIONS * region_bytes / 1024**2:.0f} MiB). Running at the "
+                f"pipeline: at least {_MIN_LIVE_REGIONS} regions must be live (~"
+                f"{_mib(_cost(_split(_MIN_LIVE_REGIONS)))}; a region is read as "
+                f"{_mib(read_bytes)} and written as {_mib(out_bytes)}). Running at the "
                 f"floor; reduce region_shape/region_size_mb or raise the budget.",
                 RuntimeWarning, stacklevel=2)
-        max_workers = max(_MIN_LIVE_REGIONS, min(requested_workers, affordable))
-    else:
-        max_workers = max(_MIN_LIVE_REGIONS, requested_workers)
-
-    # Split the live-region budget. Readers are the measured memory driver (1->8 readers:
-    # 507->1089 MiB, no time change), so they stay caller-tunable via num_readers; the rest
-    # goes to the queue and the in-flight write cap.
-    if num_readers is None:
-        num_readers = max(1, max_workers // 2)
-    num_readers = max(1, min(int(num_readers), max_workers - 2))  # leave >=1 queue, >=1 write
-
-    remaining = max_workers - num_readers
-    queue_size = max(1, remaining // 2)
-    max_inflight_writes = max(1, remaining - queue_size)
+        max_threads = fits[0] if fits else _MIN_LIVE_REGIONS
+    num_readers, queue_size, max_inflight_writes = _split(max_threads)
 
     # Writer THREADS are not part of the memory budget knob: .write() is async (returns a
     # future; TensorStore's C++ pool does the I/O), so writer count is measurably irrelevant
@@ -2758,9 +4116,9 @@ def write_array(
     # holds a buffer. Keep a small constant, bounded by the in-flight cap.
     n_writer_threads = max(1, min(_WRITER_THREADS, max_inflight_writes))
 
-    print(f"[Optimized] Live-region budget: {max_workers} "
-          f"(~{max_workers * region_bytes / 1024**2:.0f} MiB at "
-          f"{region_bytes / 1024**2:.0f} MiB/region) -> readers={num_readers}, "
+    _say(f"[Optimized] Live-region budget: {max_threads} "
+          f"(~{_mib(_cost((num_readers, queue_size, max_inflight_writes)))}) "
+          f"-> readers={num_readers}, "
           f"queue={queue_size}, inflight={max_inflight_writes}, "
           f"writer threads={n_writer_threads}", flush=True)
 
@@ -2793,14 +4151,14 @@ def write_array(
         try:
             while not shutdown_flag.is_set():
                 if state.get('error'):  # Check for errors
-                    print(f"[Reader] Exiting due to error", flush=True)
+                    _say(f"[Reader] Exiting due to error", flush=True)
                     break
                 
                 # Atomically get next chunk index
                 with read_idx_lock:
                     current_read_idx = state['read_idx']
                     if current_read_idx >= len(chunk_indices):
-                        print(f"[Reader] Finished - read_idx={current_read_idx} >= {len(chunk_indices)}", flush=True)
+                        _say(f"[Reader] Finished - read_idx={current_read_idx} >= {len(chunk_indices)}", flush=True)
                         break
                     chunk_start = chunk_indices[current_read_idx]
                     current_idx = current_read_idx
@@ -2808,7 +4166,7 @@ def write_array(
                     next_read_idx = state['read_idx']
                 
                 if current_idx % 10 == 0:
-                    print(f"[Reader] About to read region {current_idx+1}/{len(chunk_indices)}, next read_idx will be {next_read_idx}", flush=True)
+                    _say(f"[Reader] About to read region {current_idx+1}/{len(chunk_indices)}, next read_idx will be {next_read_idx}", flush=True)
                 
                 try:
                     chunk_slice = tuple(
@@ -2827,17 +4185,19 @@ def write_array(
                         # the concurrent reader threads (measured ~7-18% faster on GPU).
                         data = _asnumpy_pinned(data)
 
-                    # Convert dtype if needed (allows unsafe casting if explicitly requested)
+                    # Convert dtype if needed: saturating, never wrapping (see saturate_cast)
                     if data.dtype != final_dtype_obj:
-                        data = data.astype(final_dtype_obj, copy=False)
+                        data = _saturate_block(data, final_dtype_obj)
+                    if observe is not None:
+                        observe(chunk_slice, data)
 
                     chunk_queue.put((chunk_slice, data))
                     
                     if current_idx % 10 == 0:
-                        print(f"[Reader] Queued region {current_idx+1}/{len(chunk_indices)}", flush=True)
+                        _say(f"[Reader] Queued region {current_idx+1}/{len(chunk_indices)}", flush=True)
                     
                 except Exception as chunk_error:
-                    print(f"[Reader] ERROR at region {current_idx}: {chunk_error}", flush=True)
+                    _say(f"[Reader] ERROR at region {current_idx}: {chunk_error}", flush=True)
                     import traceback
                     traceback.print_exc()
                     state['error'] = chunk_error
@@ -2847,14 +4207,14 @@ def write_array(
             with sentinel_lock:
                 state['completed_readers'] += 1
                 should_send_sentinels = (state['completed_readers'] == num_readers)
-                print(f"[Reader] Normal exit - completed_readers now {state['completed_readers']}/{num_readers}", flush=True)
+                _say(f"[Reader] Normal exit - completed_readers now {state['completed_readers']}/{num_readers}", flush=True)
             
             if should_send_sentinels:
                 for _ in range(n_writer_threads):
                     chunk_queue.put(None)
                     
         except Exception as e:
-            print(f"[Reader] FATAL ERROR in outer handler: {e}", flush=True)
+            _say(f"[Reader] FATAL ERROR in outer handler: {e}", flush=True)
             import traceback
             traceback.print_exc()
             state['error'] = e
@@ -2881,7 +4241,7 @@ def write_array(
                 try:
                     item = chunk_queue.get(block=True)
                 except Exception as e:
-                    print(f"[Writer] Queue get error: {e}", flush=True)
+                    _say(f"[Writer] Queue get error: {e}", flush=True)
                     break
                 
                 if item is None:
@@ -2915,7 +4275,7 @@ def write_array(
                         n_inflight = _reap_futures()
                     
                 except Exception as e:
-                    print(f"[Writer] ERROR: {e}", flush=True)
+                    _say(f"[Writer] ERROR: {e}", flush=True)
                     if 'error' in state:  # Only set if state dict still exists
                         state['error'] = e
                     chunk_queue.task_done()
@@ -2924,21 +4284,21 @@ def write_array(
             # No final commit needed - futures are already added immediately
                     
         except Exception as e:
-            print(f"[Writer] ERROR in outer handler: {e}", flush=True)
+            _say(f"[Writer] ERROR in outer handler: {e}", flush=True)
             if 'error' in state:  # Only set if state dict still exists
                 state['error'] = e
 
-    print(f"[Optimized] Starting: {num_readers} readers, {n_writer_threads} writers (async), queue={queue_size}")
+    _say(f"[Optimized] Starting: {num_readers} readers, {n_writer_threads} writers (async), queue={queue_size}")
     
     readers = [
-        threading.Thread(target=reader_thread, daemon=True, name=f"Reader-{i}")
+        _thread(reader_thread, f"Reader-{i}")
         for i in range(num_readers)
     ]
     for r in readers:
         r.start()
     
     writers = [
-        threading.Thread(target=writer_thread, daemon=True, name=f"Writer-{i}")
+        _thread(writer_thread, f"Writer-{i}")
         for i in range(n_writer_threads)
     ]
     for w in writers:
@@ -2974,12 +4334,12 @@ def write_array(
                             f"Early tenth timeout: took {elapsed_from_start:.1f}s to write "
                             f"{tenth_target} regions (limit: {early_tenth_timeout:.1f}s). Aborting."
                         )
-                        print(f"[Monitor] {msg}", flush=True)
+                        _say(f"[Monitor] {msg}", flush=True)
                         state['error'] = TimeoutError(msg)
                         stop_monitor.set()
                         return
                     else:
-                        print(f"[Monitor] Tenth milestone reached in {elapsed_from_start:.1f}s - continuing", flush=True)
+                        _say(f"[Monitor] Tenth milestone reached in {elapsed_from_start:.1f}s - continuing", flush=True)
                 
                 if not quarter_checked and early_quarter_timeout is not None and completed_writes >= quarter_target:
                     elapsed_from_start = time.time() - state['start_time']
@@ -2989,12 +4349,12 @@ def write_array(
                             f"Early quarter timeout: took {elapsed_from_start:.1f}s to write "
                             f"{quarter_target} regions (limit: {early_quarter_timeout:.1f}s). Aborting."
                         )
-                        print(f"[Monitor] {msg}", flush=True)
+                        _say(f"[Monitor] {msg}", flush=True)
                         state['error'] = TimeoutError(msg)
                         stop_monitor.set()
                         return
                     else:
-                        print(f"[Monitor] Quarter milestone reached in {elapsed_from_start:.1f}s - continuing", flush=True)
+                        _say(f"[Monitor] Quarter milestone reached in {elapsed_from_start:.1f}s - continuing", flush=True)
                 
                 if current_read >= total_chunks:
                     break
@@ -3003,12 +4363,12 @@ def write_array(
                     q_size = chunk_queue.qsize()
                     elapsed = time.time() - state['start_time']
                     writes_proc = state.get('writes_processed', 0)
-                    print(f"[Progress] Read: {current_read}/{total_chunks} ({progress_pct:.1f}%), Q:{q_size}, Writes: {writes_proc} processed, {completed_writes}/{total_futures} done, Time: {elapsed:.1f}s")
+                    _say(f"[Progress] Read: {current_read}/{total_chunks} ({progress_pct:.1f}%), Q:{q_size}, Writes: {writes_proc} processed, {completed_writes}/{total_futures} done, Time: {elapsed:.1f}s")
                     last_read = current_read
             except (KeyError, NameError):
                 break
     
-    monitor = threading.Thread(target=monitor_progress, daemon=True, name="Monitor")
+    monitor = _thread(monitor_progress, "Monitor")
     monitor.start()
     
     # Wait for all readers to finish
@@ -3017,6 +4377,15 @@ def write_array(
         if state.get('error'):
             shutdown_flag.set()  # Signal all threads to stop
             break
+    if state.get('error'):
+        # A failed reader never sends the end-of-input sentinels, so writers waiting on an
+        # empty queue would wait forever (the write hung instead of raising). Wake them; a
+        # full queue means none is waiting, and they stop at the error after their item.
+        for _ in range(n_writer_threads):
+            try:
+                chunk_queue.put_nowait(None)
+            except Full:
+                break
     
     # Wait for all writers to finish
     for w in writers:
@@ -3035,7 +4404,7 @@ def write_array(
     if state.get('error'):
         raise state['error']
     
-    print(f"\n[Optimized] All reads/writes queued, waiting for {len(write_futures)} async writes to complete...")
+    _say(f"\n[Optimized] All reads/writes queued, waiting for {len(write_futures)} async writes to complete...")
     
     # Wait for all async writes to complete
     last_gc_time = time.time()
@@ -3055,7 +4424,7 @@ def write_array(
         
         # Timeout on waiting for futures
         if time.time() - wait_start > max_wait:
-            print(f"[Main] Timeout waiting for futures: {completed_count}/{total_futures} done", flush=True)
+            _say(f"[Main] Timeout waiting for futures: {completed_count}/{total_futures} done", flush=True)
             break
         
         # Periodic GC
@@ -3071,20 +4440,20 @@ def write_array(
     
     # Ensure all futures succeeded (only if no error)
     if not state.get('error'):
-        print(f"[Optimized] Verifying all writes succeeded...")
+        _say(f"[Optimized] Verifying all writes succeeded...")
         for i, future in enumerate(write_futures):
             try:
                 future.result()  # Will raise if write failed
             except Exception as e:
-                print(f"[Main] Write future {i} failed: {e}")
+                _say(f"[Main] Write future {i} failed: {e}")
                 raise
     
     elapsed = time.time() - state['start_time']
     throughput = total_chunks / elapsed if elapsed > 0 else 0
     
     if not state.get('error'):
-        print(f"\n[Optimized] Completed: {total_chunks} regions in {elapsed:.1f}s ({throughput:.2f} regions/s)")
-        print(f"Successfully wrote array to {output_path}")
+        _say(f"\n[Optimized] Completed: {total_chunks} regions in {elapsed:.1f}s ({throughput:.2f} regions/s)")
+        _say(f"Successfully wrote array to {output_path}")
     
     # Stop monitor thread before cleanup (if not already stopped)
     stop_monitor.set()
@@ -3106,11 +4475,9 @@ def write_array(
     # Keep shutdown_flag and state until very end to avoid NameError
     temp_error = state.get('error')
     del state
-    gc.collect()
-    
+
     if gc_was_enabled:
         gc.enable()
-        gc.collect()
     
     # Clean up shutdown flag last
     del shutdown_flag
@@ -3119,6 +4486,20 @@ def write_array(
         raise temp_error
     
     return output_path
+
+
+@functools.wraps(_write_array)
+def write_array(*args, **kwargs):
+    gc_was_enabled = gc.isenabled()
+    try:
+        return _write_array(*args, **kwargs)
+    finally:
+        # _write_array pauses the cyclic collector while regions are in flight. Its error
+        # paths (a refused region_shape, a failed region) used to leave it off for the
+        # rest of the process; whatever the exit, it is restored here.
+        if gc_was_enabled and not gc.isenabled():
+            gc.enable()
+
 
 # I/O namespace class
 class io:
@@ -3150,6 +4531,21 @@ class io:
         clear_all_caches()
 
     @staticmethod
+    def write_levels(array, outputs, **kwargs) -> int:
+        """Write ``array`` and downsampled levels of it from one read. See
+        :func:`write_levels`."""
+        return write_levels(array, outputs, **kwargs)
+
+    #: per-index min/max accumulator for ``observe=`` (see :class:`Extrema`)
+    Extrema = Extrema
+
+    @staticmethod
+    def capture_messages():
+        """Collect io's messages instead of printing them, for writes started in this
+        context (thread-safe). See :func:`capture_messages`."""
+        return capture_messages()
+
+    @staticmethod
     def create_sink(output_path, shape, dtype, *, chunks=None, chunk_size_mb=None,
                     shard_coefficients=None, compressor=None, zarr_format=None,
                     overwrite=False, backend="tensorstore", storage_options=None,
@@ -3166,7 +4562,7 @@ class io:
     def write(
         array: 'DynamicArray',
         output_path: str,
-        max_workers: int = 4,
+        max_threads: Optional[int] = None,
         num_readers: Optional[int] = None,
         chunks: Optional[Tuple[int, ...]] = None,
         chunk_size_mb: Optional[float] = None,
@@ -3185,6 +4581,9 @@ class io:
         backend: str = "tensorstore",
         storage_options: Optional[dict] = None,
         dimension_names: Optional[Tuple[str, ...]] = None,
+        engine: str = "fused",
+        observe: Optional[Any] = None,
+        max_workers: Optional[int] = None,
     ):
         """Write array to Zarr. See write_array() for details. ``device`` ('cpu'|'cuda')
         runs each region's op chain on that device (results are written from host).
@@ -3198,7 +4597,7 @@ class io:
         return write_array(
             array,
             output_path,
-            max_workers=max_workers,
+            max_threads=max_threads,
             num_readers=num_readers,
             chunks=chunks,
             chunk_size_mb=chunk_size_mb,
@@ -3217,4 +4616,7 @@ class io:
             backend=backend,
             storage_options=storage_options,
             dimension_names=dimension_names,
+            engine=engine,
+            observe=observe,
+            max_workers=max_workers,
         )

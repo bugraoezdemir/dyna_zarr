@@ -77,16 +77,20 @@ def test_region_shape_must_divide_chunks(tmp_path):
                  region_shape=(12, 12, 12), zarr_format=2)
 
 
-# --- concurrency budget ---------------------------------------------------------------
+# --- concurrency budget: pipeline engine ----------------------------------------------
 
-def test_max_workers_is_total_live_regions(tmp_path, capsys):
-    """max_workers is the TOTAL live-region budget: the derived stages must sum to it."""
-    arr = _src(tmp_path)
-    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
-             region_shape=(16, 16, 16), zarr_format=2, max_workers=8, num_readers=4)
-    line = [l for l in capsys.readouterr().out.splitlines() if "Live-region budget" in l]
+def _budget_line(out):
+    line = [l for l in out.splitlines() if "Live-region budget" in l]
     assert line, "budget line not printed"
-    text = line[0]
+    return line[0]
+
+
+def test_max_threads_is_total_live_regions(tmp_path, capsys):
+    """pipeline: max_threads is the TOTAL live-region budget; the stages sum to it."""
+    arr = _src(tmp_path)
+    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), engine="pipeline",
+             region_shape=(16, 16, 16), zarr_format=2, max_threads=8, num_readers=4)
+    text = _budget_line(capsys.readouterr().out)
     assert "budget: 8" in text
     readers = int(text.split("readers=")[1].split(",")[0])
     queue = int(text.split("queue=")[1].split(",")[0])
@@ -96,48 +100,137 @@ def test_max_workers_is_total_live_regions(tmp_path, capsys):
 
 
 def test_memory_budget_clamps_workers(tmp_path, capsys):
-    """A tight budget lowers the live-region count below what was requested."""
+    """pipeline: a tight budget lowers the live-region count below what was requested.
+
+    Region 16^3 int32: read 16 KiB, out 16 KiB. A reader holds 2*16 + 16 = 48 KiB, a
+    queued region 16 KiB, an in-flight write 32 KiB. 5 live regions = 2 readers, 1
+    queued, 2 in flight = 176 KiB; 6 = 3/1/2 = 224 KiB. A 192 KiB budget -> 5."""
     arr = _src(tmp_path)
-    # region 16^3 int32 = 16 KiB; budget 0.0625 MiB = 64 KiB -> 4 live regions
-    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
+    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), engine="pipeline",
              region_shape=(16, 16, 16), zarr_format=2,
-             max_workers=32, memory_budget_mb=0.0625)
-    line = [l for l in capsys.readouterr().out.splitlines() if "Live-region budget" in l][0]
-    assert "budget: 4" in line
+             max_threads=32, memory_budget_mb=192 / 1024)
+    line = _budget_line(capsys.readouterr().out)
+    assert "budget: 5" in line and "readers=2, queue=1, inflight=2" in line
 
 
 def test_memory_budget_is_a_ceiling_not_a_target(tmp_path, capsys):
-    """A generous budget must never RAISE concurrency above the requested max_workers."""
+    """pipeline: a generous budget must never RAISE concurrency above max_threads."""
+    arr = _src(tmp_path)
+    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), engine="pipeline",
+             region_shape=(16, 16, 16), zarr_format=2,
+             max_threads=4, memory_budget_mb=4096)
+    assert "budget: 4" in _budget_line(capsys.readouterr().out)
+
+
+# --- concurrency budget: fused engine (the default) ------------------------------------
+
+def _fused_workers(out):
+    line = [l for l in out.splitlines() if "Engine: fused" in l]
+    assert line, "fused engine line not printed"
+    return int(line[0].split("Engine: fused, ")[1].split(" threads")[0])
+
+
+def test_fused_is_the_default_and_max_threads_is_threads(tmp_path, capsys):
+    arr = _src(tmp_path)
+    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
+             region_shape=(16, 16, 16), zarr_format=2, max_threads=5)
+    out = capsys.readouterr().out
+    assert _fused_workers(out) == 5
+    assert "Live-region budget" not in out
+
+
+def test_fused_memory_budget_clamps_workers(tmp_path, capsys):
+    """A fused worker holds 2*read + out: 16^3 int32 -> 2*16 + 16 = 48 KiB, so a 192 KiB
+    budget affords exactly 4 workers, and 191 KiB only 3."""
+    arr = _src(tmp_path)
+    for budget_kib, expected in ((192, 4), (191, 3)):
+        io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), overwrite=True,
+                 region_shape=(16, 16, 16), zarr_format=2,
+                 max_threads=32, memory_budget_mb=budget_kib / 1024)
+        assert _fused_workers(capsys.readouterr().out) == expected
+
+
+def test_fused_budget_counts_the_widest_dtype(tmp_path, capsys):
+    """A narrowing chain carries its source dtype: int32 -> uint8 reads 16 KiB per region
+    and writes 4 KiB, so a worker costs 2*16 + 4 = 36 KiB, not 4 KiB."""
+    arr = _src(tmp_path).astype("uint8")
+    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
+             region_shape=(16, 16, 16), zarr_format=2,
+             max_threads=32, memory_budget_mb=72 / 1024)
+    assert _fused_workers(capsys.readouterr().out) == 2
+
+
+def test_fused_budget_counts_the_halo(tmp_path, capsys):
+    """A halo op reads the padded region, and the budget must pay for that."""
+    from dyna_zarr import operations as ops
+    arr = ops.gaussian_filter(_src(tmp_path).astype("float32"), 1.0)
+    depth = dyna_io_module._chain_halo_depth(arr, 3)
+    assert depth and min(depth) > 0
+    padded = int(np.prod([min(16 + 2 * d, 32) for d in depth])) * 4
+    worker = 2 * padded + 16 ** 3 * 4
+    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
+             region_shape=(16, 16, 16), zarr_format=2,
+             max_threads=32, memory_budget_mb=4 * worker / 2**20)
+    assert _fused_workers(capsys.readouterr().out) == 4
+
+
+def test_fused_memory_budget_is_a_ceiling_not_a_target(tmp_path, capsys):
     arr = _src(tmp_path)
     io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
              region_shape=(16, 16, 16), zarr_format=2,
-             max_workers=4, memory_budget_mb=4096)
-    line = [l for l in capsys.readouterr().out.splitlines() if "Live-region budget" in l][0]
-    assert "budget: 4" in line
+             max_threads=4, memory_budget_mb=4096)
+    assert _fused_workers(capsys.readouterr().out) == 4
 
 
-def test_impossible_budget_warns_and_floors(tmp_path):
-    """A budget too small for a minimal pipeline warns loudly instead of deadlocking."""
+def test_fused_floor_is_one_worker(tmp_path, capsys):
+    """Unlike the pipeline (floor 3 live regions), fused can run a single region."""
+    arr = _src(tmp_path)
+    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
+             region_shape=(16, 16, 16), zarr_format=2, max_threads=1)
+    assert _fused_workers(capsys.readouterr().out) == 1
+
+
+@pytest.mark.parametrize("engine", ["fused", "pipeline"])
+def test_impossible_budget_warns_and_floors(tmp_path, engine):
+    """A budget too small for the floor warns loudly instead of deadlocking."""
     arr = _src(tmp_path)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
+        io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), engine=engine,
                  region_shape=(16, 16, 16), zarr_format=2,
-                 max_workers=8, memory_budget_mb=0.001)
+                 max_threads=8, memory_budget_mb=0.001)
     msgs = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
     assert any("cannot fit" in m for m in msgs), msgs
     # and it still produced correct output
     assert zarr.open(str(tmp_path / "o.zarr"), mode="r").shape == (32, 32, 32)
 
 
-def test_write_correct_under_tight_budget(tmp_path):
-    """Data must round-trip exactly at the pipeline floor (1 reader/1 queue/1 write)."""
+@pytest.mark.parametrize("engine,workers", [("fused", 1), ("pipeline", 3)])
+def test_write_correct_at_the_floor(tmp_path, engine, workers):
+    """Data must round-trip exactly at each engine's floor."""
     src = _src(tmp_path)
     expected = np.asarray(src[:, :, :])
     out = tmp_path / "o.zarr"
     io.write(src, str(out), chunks=(8, 8, 8), region_shape=(16, 16, 16),
-             zarr_format=2, max_workers=3)
+             zarr_format=2, max_threads=workers, engine=engine)
     np.testing.assert_array_equal(zarr.open(str(out), mode="r")[...], expected)
+
+
+# --- engine selection -----------------------------------------------------------------
+
+def test_unknown_engine_raises_before_writing(tmp_path):
+    arr = _src(tmp_path)
+    with pytest.raises(ValueError, match="engine must be one of"):
+        io.write(arr, str(tmp_path / "o.zarr"), engine="fast")
+    assert not (tmp_path / "o.zarr").exists()
+
+
+def test_num_readers_refused_under_fused(tmp_path):
+    """The fused engine has no readers: refuse num_readers rather than ignore it."""
+    arr = _src(tmp_path)
+    with pytest.raises(ValueError, match="engine='pipeline' only"):
+        io.write(arr, str(tmp_path / "o.zarr"), num_readers=2)
+    assert not (tmp_path / "o.zarr").exists()
 
 
 # --- overwrite ------------------------------------------------------------------------

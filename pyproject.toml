@@ -17,7 +17,7 @@ where = ["src"]
 
 [project]
 name = "dyna-zarr"
-version = "0.0.9"
+version = "0.1.0"
 description = "A lightweight library for lazy operations on Zarr arrays without task graph overhead"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -89,14 +89,16 @@ dev = [
     # An in-process S3 emulator, so the remote-I/O tests (tests/test_remote_io.py) run
     # in CI instead of skipping; they never touch a real cloud endpoint.
     "moto[server]>=5",
+    # dask is not a dyna dependency, but io.write and from_array accept dask arrays; the
+    # tests for that skip without it, so without this line CI never ran them.
+    "dask",
 ]
 docs = [
     "sphinx>=5.0",
     "sphinx-rtd-theme>=1.0",
 ]
 # Alternative storage backend (optional): Rust-backed zarr via zarrs.
-# Faster than the default tensorstore path in every configuration benchmarked
-# (see benchmarks/ and reports/zarrista_bugs/), but PINNED to an exact version:
+# PINNED to an exact version:
 # 0.1.0 is beta, its zarr-v2 support rides on the undocumented
 # `Array.from_metadata` path, and it has two silent failure modes the backend
 # guards against. Re-run tests/test_zarrista_backend.py before moving the pin.
@@ -106,7 +108,13 @@ docs = [
 # numpy>=2.1: zarrista hands data over via DLPack and calls __dlpack__(max_version=...),
 # which NumPy gained in 2.1. zarrista declares no numpy requirement itself, so on
 # numpy<2.1 EVERY zarrista read/write fails at runtime; the floor has to live here.
-zarrista = ["zarrista==0.1.0", "obstore>=0.11", "numpy>=2.1"]
+# zarrista-bounded: zarrista 0.1.0 built against a zarrs whose FilesystemStore writes
+# partial values in place (github.com/bugraoezdemir/zarrista, branch `bounded`). Same
+# `import zarrista`, same API; with experimental_partial_encoding an inner chunk is
+# appended to a shard instead of the whole shard file being rewritten, which bounds
+# the memory of writing big shards. It provides the same `zarrista` package as
+# upstream, so the two must not be installed together.
+zarrista = ["zarrista-bounded==0.1.0", "obstore>=0.11", "numpy>=2.1"]
 # GPU execution (optional). CuPy ships CUDA-version-specific wheels and pip CANNOT
 # auto-detect your CUDA, so pick the extra that matches `nvidia-smi` (CUDA Version):
 #   pip install dyna-zarr[gpu-cu11]   # CUDA 11.x
