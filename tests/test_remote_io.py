@@ -13,8 +13,10 @@ moto server (the [dev] extra installs moto), else they skip.
 import contextlib
 import io as _stdio
 import os
+import sys
 
 import numpy as np
+
 import pytest
 
 from dyna_zarr import Codecs, DynamicArray, io, operations as ops
@@ -151,7 +153,7 @@ def test_keys_that_need_url_encoding(bucket, backend, name):
     its listing - used for the exists check and overwrite - encodes a key again, so a
     pre-encoded key would not be found. Keys are now encoded for data and the
     housekeeping goes through obstore: the object keeps its name on both backends."""
-    import obstore
+    obstore = pytest.importorskip("obstore")    # [zarrista] extra; core CI runs without it
     from dyna_zarr.backends.zarrista_backend import _obstore
     bucket_name, opts = bucket
     url = f"s3://{bucket_name}/{backend}/{name}"
@@ -165,3 +167,15 @@ def test_keys_that_need_url_encoding(bucket, backend, name):
             for o in batch}
     assert any(k.startswith(f"{backend}/{name}/") for k in keys), keys
     assert not any("%" in k for k in keys), keys
+
+
+@pytest.mark.parametrize("name", ["a b.zarr", "x+y (1).zarr"])
+def test_without_obstore_such_keys_are_refused_on_tensorstore(bucket, monkeypatch, name):
+    """TensorStore alone cannot list or delete a key that needs URL encoding, so without
+    obstore the write is refused up front, with the way out - not written under a key
+    the overwrite check could never find again."""
+    monkeypatch.setitem(sys.modules, "obstore", None)          # import obstore -> ImportError
+    bucket_name, opts = bucket
+    with pytest.raises(ValueError, match="URL-encoded"):
+        _write(DynamicArray(X), f"s3://{bucket_name}/tensorstore/{name}",
+               backend="tensorstore", storage_options=opts)
