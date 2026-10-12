@@ -3,7 +3,7 @@ name: Publish to PyPI
 # Runs when you publish a GitHub Release (Releases -> Draft a new release -> Publish),
 # OR manually via the "Run workflow" button on the Actions tab (workflow_dispatch).
 # Builds the sdist + wheel and uploads them to PyPI via Trusted Publishing (OIDC) -
-# no API token/secret required (configure the trusted publisher on PyPI once, see README).
+# no API token/secret required (configure the trusted publisher on PyPI once).
 on:
   release:
     types: [published]

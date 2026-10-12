@@ -56,6 +56,22 @@ def _reshape_read(array, new_shape, key):
     return flatbox[idx]
 
 
+def _expand_ellipsis(key, ndim):
+    """``key`` with its Ellipsis (at most one, as in NumPy) replaced by enough full
+    slices to cover the axes the other entries do not index. ``None`` (newaxis) adds
+    an axis and so does not count."""
+    n = sum(1 for k in key if k is Ellipsis)
+    if n == 0:
+        return key
+    if n > 1:
+        raise IndexError("an index can only have a single ellipsis ('...')")
+    indexed = sum(1 for k in key if k is not Ellipsis and k is not None)
+    if indexed > ndim:
+        raise IndexError("Too many indices for array")
+    i = key.index(Ellipsis)
+    return key[:i] + (slice(None),) * (ndim - indexed) + key[i + 1:]
+
+
 def _norm_key(key, shape):
     """Per output axis -> (is_int, start, stop, step) with concrete non-negative values.
     Integer indices become (True, idx, idx+1, 1); the caller squeezes those axes."""
@@ -307,6 +323,7 @@ class SliceTransform(Transform):
         # Normalize key to tuple
         if not isinstance(key, tuple):
             key = (key,)
+        key = _expand_ellipsis(key, array.ndim)
 
         # The grid is derived only when the source has one (no grid in, no grid out).
         chunks = array.chunks
@@ -362,6 +379,23 @@ class SliceTransform(Transform):
         self.chunks = tuple(new_chunks) if new_chunks is not None else None
         self.dtype = array.dtype
         self.new_axes = [i for i, k in enumerate(self.key) if k is np.newaxis]
+        # A strided slice decodes the source chunks it spans, not only the elements it
+        # keeps: per axis the cost per output element is the step, or a chunk length once
+        # the step skips whole chunks. io.write budgets regions by what they READ (see
+        # io._chain_read_amplification), so without this a pyramid level written as
+        # L0[::2, ::2, ::2] got 8x-too-large regions: few of them (workers idle) and each
+        # decoding 8x region_size_mb.
+        amp, axis = 1, 0
+        src_chunks = array.chunks
+        for k in self.key:
+            if k is np.newaxis:
+                continue
+            if isinstance(k, slice) and k.step and k.step > 1:
+                c = (int(src_chunks[axis]) if src_chunks is not None
+                     and axis < len(src_chunks) else k.step)
+                amp *= min(int(k.step), max(1, c))
+            axis += 1
+        self.read_amplification = amp
 
 
     def _derive_align(self):

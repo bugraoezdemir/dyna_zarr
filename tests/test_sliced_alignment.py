@@ -54,7 +54,7 @@ def test_sliced_write_matches_compute(tmp_path, sl):
     expected = np.asarray(sub.compute())
 
     out = str(tmp_path / "out.zarr")
-    dio.write(sub, out, chunks=(16, 16), max_workers=4, zarr_format=3, overwrite=True)
+    dio.write(sub, out, chunks=(16, 16), max_threads=4, zarr_format=3, overwrite=True)
     got = zarr.open_array(out, mode="r")[:]
 
     assert got.shape == expected.shape

@@ -124,6 +124,61 @@ def test_numpy_source_does_not_inherit_its_staging_store(tmp_path):
     assert blosc["name"] == "blosc" and blosc["configuration"]["cname"] == "lz4"
 
 
+def _ts_handle(path, zarr_format):
+    import tensorstore as ts
+    return ts.open({"driver": "zarr3" if zarr_format == 3 else "zarr",
+                    "kvstore": {"driver": "file", "path": str(path)}}).result()
+
+
+def _codec(path):
+    c = zarr.open_array(str(path)).compressors[0]
+    cfg = c.to_dict() if hasattr(c, "to_dict") else c.get_config()
+    if "configuration" in cfg:
+        cfg = {"id": cfg["name"], **cfg["configuration"]}
+    return cfg
+
+
+def test_a_tensorstore_handle_keeps_format_codecs_and_shards(tmp_path):
+    # DynamicArray(ts_array): a TensorStore handle the caller opened, not io.read
+    data, _ = _src(tmp_path, compressors=BloscCodec(cname="zstd", clevel=3), shards=(8, 32, 32))
+    _write(DynamicArray(_ts_handle(tmp_path / "src.zarr", 3)) + 1, str(tmp_path / "out.zarr"))
+    out = zarr.open_array(str(tmp_path / "out.zarr"))
+    assert out.metadata.zarr_format == 3
+    assert (out.shards, out.chunks) == ((8, 32, 32), (4, 16, 16))
+    assert (_codec(tmp_path / "out.zarr")["cname"], _codec(tmp_path / "out.zarr")["clevel"]) == ("zstd", 3)
+    np.testing.assert_allclose(out[...], data + 1)
+
+    _src(tmp_path, name="v2.zarr", zarr_format=2, compressors=numcodecs.Zstd(level=4))
+    _write(DynamicArray(_ts_handle(tmp_path / "v2.zarr", 2)), str(tmp_path / "out2.zarr"))
+    assert _fmt(tmp_path / "out2.zarr") == 2
+    assert (_codec(tmp_path / "out2.zarr")["id"], _codec(tmp_path / "out2.zarr")["level"]) == ("zstd", 4)
+
+
+def test_sources_without_a_format_get_v3_blosc_lz4(tmp_path):
+    import tensorstore as ts
+    _src(tmp_path, compressors=BloscCodec(cname="zstd", clevel=3))
+    tifffile.imwrite(str(tmp_path / "t.tif"), np.ones((4, 8, 8), "u2"))
+    view = ts.downsample(_ts_handle(tmp_path / "src.zarr", 3), [1, 2, 2], method="mean")
+    for name, arr in [("numpy", DynamicArray(np.ones((4, 8, 8), "f4"))),
+                      ("creation", ops.zeros((4, 8, 8), dtype="f4")),
+                      ("tiff", io.read(str(tmp_path / "t.tif"))),
+                      ("ts_view", DynamicArray(view))]:   # virtual: not its source's zstd
+        _write(arr, str(tmp_path / f"{name}.zarr"))
+        assert _fmt(tmp_path / f"{name}.zarr") == 3, name
+        codec = _codec(tmp_path / f"{name}.zarr")
+        assert (codec["id"], codec["cname"]) == ("blosc", "lz4"), name
+
+
+def test_each_default_can_be_overridden_for_a_source_without_a_format(tmp_path):
+    a = DynamicArray(np.ones((8, 32, 32), "f4"))
+    _write(a, str(tmp_path / "v2.zarr"), zarr_format=2)
+    assert _fmt(tmp_path / "v2.zarr") == 2
+    _write(a, str(tmp_path / "gz.zarr"), compressor=Codecs("gzip", clevel=2))
+    assert _codec(tmp_path / "gz.zarr")["id"] == "gzip"
+    _write(a, str(tmp_path / "sh.zarr"), chunks=(4, 16, 16), shard_coefficients=(2, 2, 2))
+    assert zarr.open_array(str(tmp_path / "sh.zarr")).shards == (8, 32, 32)
+
+
 def test_inherited_shards_that_no_longer_fit_are_dropped_with_a_note(tmp_path):
     _, a = _src(tmp_path, shards=(8, 32, 32))
     printed = _write(a, str(tmp_path / "out.zarr"), chunks=(8, 32, 24))   # 32 % 24 != 0
@@ -148,7 +203,7 @@ def test_explicit_compressor_and_shards_still_win(tmp_path):
     dict(chunks=(4, 16, 16), region_shape=(4, 16, 24)),    # region not a chunk multiple
     dict(zarr_format=4),
     dict(chunks=(4, 16)),                                   # wrong rank
-    dict(max_workers=0),
+    dict(max_threads=0),
     dict(device="tpu"),
     dict(zarr_format=2, shard_coefficients=(1, 1, 1)),
     dict(zarr_format=2, dimension_names=("z", "y", "x")),  # v2 has no such field

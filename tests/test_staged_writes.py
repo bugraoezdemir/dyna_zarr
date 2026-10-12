@@ -103,7 +103,7 @@ def test_staged_write_respects_overwrite(tmp_path, src, kind):
 
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("knob", [dict(region_shape=(1,)), dict(memory_budget_mb=64),
-                                  dict(num_readers=2)])
+                                  dict(num_readers=2, engine="pipeline")])
 def test_region_pipeline_knobs_are_refused_not_ignored(tmp_path, src, kind, knob):
     _, a = src
     lazy = _lazy(kind, a)

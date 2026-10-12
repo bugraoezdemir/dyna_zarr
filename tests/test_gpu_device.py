@@ -174,7 +174,7 @@ def test_write_with_cuda_multiple_regions(tmp_path, source, data):
     out = tmp_path / "gpu_regions.zarr"
     io.write(
         (io.read(source) * 2.0), out, zarr_format=3, chunks=CHUNKS,
-        region_size_mb=0.01, max_workers=4, device="cuda",
+        region_size_mb=0.01, max_threads=4, device="cuda",
     )
     assert np.allclose(zarr.open(str(out), mode="r")[:], data * 2.0)
 

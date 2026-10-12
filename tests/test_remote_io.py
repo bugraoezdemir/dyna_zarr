@@ -138,3 +138,30 @@ def test_kvstore_mapping():
     else:
         with pytest.raises(UnsupportedByBackend, match="needs tensorstore"):
             _ts_kvstore("s3://my-bucket/p", {"skip_signature": True})
+
+
+# --------------------------------------------------------------------------- #
+# keys that need URL encoding (an output named after "MDL4 S549 framescan 4.czi")
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("backend", BACKENDS)
+@pytest.mark.parametrize("name", ["a b.zarr", "x+y (1).zarr"])
+def test_keys_that_need_url_encoding(bucket, backend, name):
+    """TensorStore put the key into the request URL unencoded (curl rejected a space), and
+    its listing - used for the exists check and overwrite - encodes a key again, so a
+    pre-encoded key would not be found. Keys are now encoded for data and the
+    housekeeping goes through obstore: the object keeps its name on both backends."""
+    import obstore
+    from dyna_zarr.backends.zarrista_backend import _obstore
+    bucket_name, opts = bucket
+    url = f"s3://{bucket_name}/{backend}/{name}"
+    _write(DynamicArray(X), url, backend=backend, storage_options=opts)
+    with pytest.raises(FileExistsError):
+        _write(DynamicArray(X), url, backend=backend, storage_options=opts)
+    _write(DynamicArray(X) + 1, url, backend=backend, storage_options=opts, overwrite=True)
+    np.testing.assert_array_equal(io.read(url, backend=backend, storage_options=opts).compute(),
+                                  X + 1)
+    keys = {o["path"] for batch in obstore.list(_obstore(f"s3://{bucket_name}/", opts))
+            for o in batch}
+    assert any(k.startswith(f"{backend}/{name}/") for k in keys), keys
+    assert not any("%" in k for k in keys), keys

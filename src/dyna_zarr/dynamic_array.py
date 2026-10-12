@@ -11,6 +11,7 @@ import itertools
 from pathlib import Path
 import gc
 import time
+import sys
 import threading
 import json
 from queue import Queue, Empty
@@ -75,13 +76,29 @@ def _reject_dask(source) -> None:
         raise TypeError(
             f"DynamicArray() cannot wrap a {type(source).__module__}.{type(source).__name__} "
             "directly: it would hand back dask slices and dask-style .chunks. Use "
-            "dyna_zarr.from_array(x), which computes each region's slice on read, or push "
-            "the dask array into io.create_sink(...) with dask.array.store."
+            "dyna_zarr.from_array(x), which computes each region's slice on read. To write "
+            "a dask array, pass it to io.write(x, path) directly."
         )
 
 
 def _is_dask(source) -> bool:
+    """A dask array, subclasses included (bioio's ND2 reader returns a
+    ``resource_backed_dask_array.ResourceBackedDaskArray``). dask is never imported
+    here: an array of it can only exist once it is."""
+    da = sys.modules.get("dask.array")
+    if da is not None and isinstance(source, da.Array):
+        return True
     return type(source).__module__.split(".")[0] == "dask"
+
+
+def _needs_read_lock(source) -> bool:
+    """A dask array whose graph reads through ONE shared file handle that is not safe
+    to use from several threads: ``ResourceBackedDaskArray`` (bioio-nd2 and others),
+    which opens the file around a compute and closes it after - concurrent computes
+    close each other's handle ("Attempt to read from closed nd2 file") or read wrong
+    pixels. Its reads must be serialised."""
+    return any(c.__module__.split(".")[0] == "resource_backed_dask_array"
+               for c in type(source).__mro__)
 
 
 class _SourceAdapter:
@@ -1211,7 +1228,7 @@ _REGION_BUFFER_POOL = RegionBufferPool(max_size=64)
 
 
 
-def from_array(source, chunks=None, *, lock=False) -> DynamicArray:
+def from_array(source, chunks=None, *, lock=None) -> DynamicArray:
     """Wrap an array-like ``source`` as a lazy DynamicArray. Nothing is read until the
     array is.
 
@@ -1221,8 +1238,8 @@ def from_array(source, chunks=None, *, lock=False) -> DynamicArray:
     - a ``dask.array.Array``: each region's slice is computed when dyna reads it (with
       dask's synchronous scheduler - dyna's worker threads are the parallelism). Correct
       and memory-bounded, but work the graph shares between regions (an overlap filter,
-      a rechunk) is redone per region; to WRITE a dask array, pushing it into
-      ``io.create_sink`` is usually faster;
+      a rechunk) is redone per region; to WRITE a dask array, ``io.write(x, path)``
+      on the dask array itself is faster (dask schedules its own graph);
     - a ``micro_reader.Image``, or any object with ``shape``, ``dtype`` and
       ``__getitem__`` returning a NumPy array for a tuple of slices (e.g. a reader's own
       region source).
@@ -1237,7 +1254,10 @@ def from_array(source, chunks=None, *, lock=False) -> DynamicArray:
     lock : bool or lock, optional
         Serialise every read, for a source that is not safe to read from several
         threads at once (``True``: a new lock; or pass a lock to share it between
-        sources). Refused for numpy, zarr, TensorStore and dask, which are safe already.
+        sources; ``False``: never). Default (None): only for a dask array known to read
+        through one shared file handle (a ``ResourceBackedDaskArray``, e.g. bioio's ND2
+        reader). Refused for numpy, zarr and TensorStore, which are safe already. A dask
+        array may need it: its graph can wrap any reader.
 
     Only zarr and TensorStore sources carry a storage format and codec for io.write to
     keep; anything else is written with its defaults (zarr v3, blosc-lz4). A source must
@@ -1245,14 +1265,16 @@ def from_array(source, chunks=None, *, lock=False) -> DynamicArray:
     does not).
     """
     is_dask = _is_dask(source)
-    safe = is_dask or isinstance(source, (DynamicArray, np.ndarray, zarr.Array)) or (
+    safe = isinstance(source, (DynamicArray, np.ndarray, zarr.Array)) or (
         hasattr(source, 'read') and hasattr(source, 'spec'))           # TensorStore
+    if lock is None:
+        lock = is_dask and _needs_read_lock(source)
     if lock and safe:
         raise ValueError(
             f"lock= is for sources that are not thread-safe; a {type(source).__name__} "
             f"is safe to read from several threads already. Drop lock=.")
 
-    if safe and not is_dask:
+    if safe:
         # the constructor's own paths: they keep the storage settings (format, codecs,
         # shards) that zarr and TensorStore sources carry
         if isinstance(source, np.ndarray):

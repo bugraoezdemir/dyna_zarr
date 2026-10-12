@@ -329,7 +329,7 @@ def test_sharded_write_regions_never_split_a_shard(tmp_path):
     out = tmp_path / "sout"
     io.write(io.read(src), out, chunks=chunks, zarr_format=3,
              shard_coefficients=(2, 2, 2), region_size_mb=0.05,
-             max_workers=8, backend="zarrista")
+             max_threads=8, backend="zarrista")
     assert np.array_equal(zarr.open(str(out), mode="r")[:], d)
 
 
@@ -585,7 +585,7 @@ def test_installed_version_matches_the_tested_pin():
     """If this fails, the guards in this backend are running unverified.
 
     Re-run the whole file against the new zarrista, re-check the two upstream bugs
-    in reports/zarrista_bugs/, then move TESTED_VERSION and the pyproject pin
+    described in zarrista_backend's module docstring, then move TESTED_VERSION and the pyproject pin
     together -- do not just bump one.
     """
     assert installed_version() == TESTED_VERSION
@@ -614,7 +614,8 @@ def test_pyproject_pin_agrees_with_tested_version():
 
     pins = [r for r in extra if re.match(r"^zarrista\b", r)]
     assert pins, "the [zarrista] extra no longer declares zarrista"
-    match = re.match(r"^zarrista==([0-9][^;\s]*)$", pins[0])
+    # zarrista-bounded: the fork with in-place shard appends (same package, same API)
+    match = re.match(r"^zarrista(?:-bounded)?==([0-9][^;\s]*)$", pins[0])
     assert match, f"the [zarrista] extra is no longer an exact pin: {pins[0]!r}"
     assert match.group(1) == TESTED_VERSION
 
@@ -631,7 +632,7 @@ def test_distribution_metadata_pin_agrees_with_tested_version():
     reqs = distribution("dyna_zarr").requires or []
     pins = [r for r in reqs if r.startswith("zarrista")]
     assert pins, "the installed distribution declares no zarrista requirement"
-    match = re.search(r"zarrista==([0-9][^;\s]*)", pins[0])
+    match = re.search(r"zarrista(?:-bounded)?==([0-9][^;\s]*)", pins[0])
     assert match, f"the zarrista requirement is not an exact pin: {pins[0]!r}"
     assert match.group(1) == TESTED_VERSION
 

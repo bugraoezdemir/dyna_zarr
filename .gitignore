@@ -65,3 +65,5 @@ _archive/
 # Non-shipped / local-only (bench + perf report; tests ARE tracked and CI-run)
 benchmarks/
 reports/
+# the detailed guide, until it becomes proper documentation
+docs/
