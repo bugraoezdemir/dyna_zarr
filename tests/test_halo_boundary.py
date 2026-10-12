@@ -1,4 +1,4 @@
-﻿"""The halo is capped PER SIDE at the real data that side can supply.
+"""The halo is capped PER SIDE at the real data that side can supply.
 
 Uncapped, a depth-4 halo pads a length-2 axis out to 10, and scipy's separable
 passes multiply that again (17.7 GB peak measured on a 162 MB 5D array). The cap

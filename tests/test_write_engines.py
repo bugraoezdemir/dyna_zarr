@@ -1,4 +1,4 @@
-﻿"""io.write's two execution engines: ``"fused"`` (default) and ``"pipeline"``.
+"""io.write's two execution engines: ``"fused"`` (default) and ``"pipeline"``.
 
 Everything before the execution loop (output, regions, bands) is shared, so the two
 engines must write BIT-IDENTICAL output for every kind of chain. The fused engine's own

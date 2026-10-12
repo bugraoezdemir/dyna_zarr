@@ -1,4 +1,4 @@
-﻿"""
+"""
 I/O utilities for reading and writing array formats.
 
 Provides unified interfaces for:
@@ -21,6 +21,7 @@ import json
 import math
 import time
 import threading
+import functools
 import gc
 import shutil
 import warnings
@@ -28,7 +29,7 @@ import warnings
 from ._compat import renamed
 
 from .operations.pointwise import _saturate_block
-from queue import Queue
+from queue import Full, Queue
 
 from .tiff_reader import open_tiff_zarr, read_tiff_lazy
 from .codecs import Codecs
@@ -716,10 +717,17 @@ def read_array(source: Union[str, Path], backend: Optional[str] = None,
             dyn_array._chunks = dyn_array._zarr_array.chunks
             dyn_array._extract_zarr_metadata(dyn_array._zarr_array)
             return dyn_array
-        except Exception:
-            # Fall back to zarr if read_file fails
-            pass
-    
+        except Exception as exc:
+            # An explicit backend='tensorstore' fails loudly. The default falls back to
+            # zarr-python, which reads a few stores TensorStore cannot (unusual dtypes or
+            # codecs), and says so rather than switching readers silently.
+            if explicit_backend:
+                raise
+            warnings.warn(
+                f"TensorStore could not open {str(source)!r} ({type(exc).__name__}: "
+                f"{exc}); reading it with zarr-python instead. Pass backend='tensorstore' "
+                f"to make this an error.", RuntimeWarning, stacklevel=2)
+
     # Remote URL or fallback to regular zarr opening
     if '://' in str(source):  # Likely a remote URL
         ts_array = read_file(source, storage_options)
@@ -1781,7 +1789,7 @@ def _compute_region_shape(input_shape, final_chunks, region_size_mb, dtype=None,
     Algorithm:
     1. Start with a single output chunk
     2. Identify dimensions needing expansion (region < input_shape)
-    3. Expand dimensions in reverse order (last â†’ first) until region_size_mb reached
+    3. Expand dimensions in reverse order (last -> first) until region_size_mb reached
     4. For each dimension: expand until covered OR budget exhausted
     
     Example:
@@ -1830,7 +1838,7 @@ def _compute_region_shape(input_shape, final_chunks, region_size_mb, dtype=None,
         lcm = (input_chunk_arr[i] * output_chunk_arr[i]) // gcd
         expansion_increments[i] = lcm
     
-    # STEP 3: Expand dimensions in reverse order (last â†’ first)
+    # STEP 3: Expand dimensions in reverse order (last -> first)
     for dim in reversed(range(len(region_arr))):
         # Expand this dimension until complete or budget exhausted
         while region_arr[dim] < input_arr[dim]:
@@ -3620,7 +3628,7 @@ def _write_staged(kind, array, spec: _OutputSpec, *, max_threads, device,
     return spec.path
 
 
-def write_array(
+def _write_array(
     array: 'DynamicArray',
     output_path: str,
     max_threads: Optional[int] = None,
@@ -3737,7 +3745,7 @@ def write_array(
         it is reported when it does. Pass `chunks=` for an exact shape.
     shard_coefficients : tuple of int, optional
         Multipliers for chunk sizes to compute shard shape (Zarr v3 only).
-        Example: chunks=(64, 64), shard_coefficients=(4, 4) â†’ shards=(256, 256)
+        Example: chunks=(64, 64), shard_coefficients=(4, 4) -> shards=(256, 256)
         If None, infers from input array. If input has no shards, writes without sharding.
     compressor : Codecs, numcodecs compressor, or None
         Compression configuration. Can be:
@@ -4369,6 +4377,15 @@ def write_array(
         if state.get('error'):
             shutdown_flag.set()  # Signal all threads to stop
             break
+    if state.get('error'):
+        # A failed reader never sends the end-of-input sentinels, so writers waiting on an
+        # empty queue would wait forever (the write hung instead of raising). Wake them; a
+        # full queue means none is waiting, and they stop at the error after their item.
+        for _ in range(n_writer_threads):
+            try:
+                chunk_queue.put_nowait(None)
+            except Full:
+                break
     
     # Wait for all writers to finish
     for w in writers:
@@ -4469,6 +4486,20 @@ def write_array(
         raise temp_error
     
     return output_path
+
+
+@functools.wraps(_write_array)
+def write_array(*args, **kwargs):
+    gc_was_enabled = gc.isenabled()
+    try:
+        return _write_array(*args, **kwargs)
+    finally:
+        # _write_array pauses the cyclic collector while regions are in flight. Its error
+        # paths (a refused region_shape, a failed region) used to leave it off for the
+        # rest of the process; whatever the exit, it is restored here.
+        if gc_was_enabled and not gc.isenabled():
+            gc.enable()
+
 
 # I/O namespace class
 class io:

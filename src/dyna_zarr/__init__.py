@@ -47,3 +47,10 @@ except ImportError:
 from . import backends  # noqa: E402
 
 __all__ = __all__ + ["backends", "from_array"]
+
+# The exceptions and warning io raises, importable from the package itself. As attributes
+# of `dyna_zarr.io` they are unreachable: that name is the `io` namespace class.
+from .io import OutputExistsError, RepeatedReductionWarning  # noqa: E402
+from .backends.zarrista_backend import UnsupportedByBackend  # noqa: E402
+
+__all__ = __all__ + ["OutputExistsError", "RepeatedReductionWarning", "UnsupportedByBackend"]
