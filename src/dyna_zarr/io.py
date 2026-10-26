@@ -294,6 +294,8 @@ def _local_path_from_file_url(path):
 
 #: TensorStore only accepts anonymous S3 credentials ({"type": "anonymous"}) from here on.
 _TS_ANONYMOUS_S3_MIN = (0, 1, 72)
+#: from this tensorstore on, the S3 driver percent-encodes object keys itself
+_TS_ENCODES_S3_KEYS = (0, 1, 86)
 
 
 def _ts_version():
@@ -344,12 +346,15 @@ def _ts_kvstore(url, storage_options=None, *, write=False):
 
     if storage_type in ("s3", "gcs"):
         bucket, _, key = text.split("://", 1)[1].partition("/")
-        # TensorStore puts the key into the request URL as given, so a space (an
-        # eubi-bridge output named after "MDL4 S549 framescan 4.czi") made curl reject
-        # the URL. Percent-encoded, the object store decodes it and stores the key
+        # TensorStore before 0.1.86 puts the key into the request URL as given, so a
+        # space (an eubi-bridge output named after "MDL4 S549 framescan 4.czi") made curl
+        # reject the URL. Percent-encoded, the object store decodes it and stores the key
         # unchanged - the same key zarrista writes (verified on S3). '/' stays a separator.
-        from urllib.parse import quote
-        key = quote(key, safe="/~-._")
+        # 0.1.86 encodes S3 keys itself: encoding here too stored "a%20b.zarr" literally
+        # (verified on moto), so an S3 key goes as it is there. GCS: not verified, as before.
+        if storage_type == "gcs" or _ts_version() < _TS_ENCODES_S3_KEYS:
+            from urllib.parse import quote
+            key = quote(key, safe="/~-._")
         kv = {"driver": "s3" if storage_type == "s3" else "gcs", "bucket": bucket,
               "path": key.rstrip("/") + "/" if key else ""}
         if storage_type == "s3":
