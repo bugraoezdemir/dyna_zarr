@@ -1715,6 +1715,17 @@ class RepeatedReductionWarning(UserWarning):
     still correct; ``.persist()`` on the reduced array computes it once instead."""
 
 
+class LimitedReaderSupportWarning(UserWarning):
+    """The output uses a codec that dyna's backends write and read, but that common
+    OME-Zarr readers cannot decode (blosc ``snappy``: numcodecs, and so zarr-python,
+    ome-zarr-py and napari-ome-zarr, ship blosc without it since numcodecs 0.9.0)."""
+
+
+# blosc compressor names that BOTH write backends encode and decode: TensorStore and
+# zarrista each bundle their own c-blosc, snappy included.
+_BACKEND_BLOSC_CNAMES = frozenset({"blosclz", "lz4", "lz4hc", "snappy", "zlib", "zstd"})
+
+
 def _span_repeated_axes(array, region, shape, chunk, region_mb, widest_dtype):
     """Region that spans, whole, every axis a broadcast reduction is repeated along.
 
@@ -2413,27 +2424,35 @@ def _resolve_output(array, output_path, *, max_threads, num_readers, chunks, chu
         # Assume it's a numcodecs compressor - convert it
         final_codecs = Codecs.from_numcodecs(compressor)
 
-    # blosc cnames are limited by what THIS numcodecs build has compiled in - the
-    # same list for v2 and v3, since zarr's v3 BloscCodec also goes through
-    # numcodecs. zarr-python rejects an unavailable cname at array creation on both
-    # formats, but dyna's TensorStore path does not go through zarr, so
-    # `cname='snappy'` wrote a store that then raised "blosc decompression: -5" on
-    # read. Check it here so every backend and format behaves like zarr-python.
+    # blosc cnames: TensorStore and zarrista bundle their own c-blosc and both write
+    # AND read every name in _BACKEND_BLOSC_CNAMES, snappy included. numcodecs (so
+    # zarr-python and the OME-Zarr readers built on it) has shipped blosc without
+    # snappy since 0.9.0 and fails on those chunks with "blosc decompression: -5".
+    # So an unknown cname is refused, and one only numcodecs lacks is written with a
+    # loud warning: dyna reads it back, many other readers do not.
     _requested = compressor if isinstance(compressor, Codecs) else None
     if _requested is not None:
         _name = getattr(_requested, "compressor", None)
         if _name == "blosc":
             _cname = getattr(_requested, "cname", "lz4")
+            if _cname not in _BACKEND_BLOSC_CNAMES:
+                raise ValueError(
+                    f"unknown blosc cname={_cname!r}; choose from "
+                    f"{', '.join(sorted(_BACKEND_BLOSC_CNAMES))}."
+                )
             try:
                 import numcodecs.blosc as _blosc
                 _available = set(_blosc.list_compressors())
             except Exception:
                 _available = None
             if _available is not None and _cname not in _available:
-                raise ValueError(
-                    f"blosc cname={_cname!r} is not available in this blosc build "
-                    f"(have: {', '.join(sorted(_available))}). Writing it produces a "
-                    f"store that cannot be read back."
+                warnings.warn(
+                    f"blosc cname={_cname!r}: support for this compressor is LIMITED in "
+                    f"OME-Zarr readers. dyna (TensorStore and zarrista) writes and reads "
+                    f"it, but zarr-python and the tools built on it (ome-zarr-py, "
+                    f"napari-ome-zarr) cannot decode it. Use 'lz4' (similar speed) or "
+                    f"'zstd' for outputs others will open.",
+                    LimitedReaderSupportWarning, stacklevel=3,
                 )
         elif _name in ("lz4", "bz2") and final_format == 3:
             raise ValueError(

@@ -10,7 +10,7 @@ The result is a simple read → transform → write workflow for large images an
 
 - **Memory-bounded streaming.** `io.write` processes the result region by region, so peak working memory is controlled mainly by the region size and number of threads, and not by the total array size.
 - **Lazy operation chains.** Compose transformations without reading the data until you compute or write a result.
-- **Image-processing operations.** About 140 operations, including pointwise math, reductions, neighborhood filters, reshaping, scans, and downsampling.
+- **Image-processing operations.** About 150 operations, including pointwise math, reductions, neighborhood filters, reshaping, scans, and downsampling.
 - **NumPy-like interface.** Use operators, array methods, broadcasting, and NumPy ufuncs such as `np.sqrt` on a `DynamicArray`.
 - **Flexible storage.** Read TIFF and Zarr v2/v3; work with local or remote Zarr stores; choose output chunking, compression, and Zarr v3 sharding.
 - **Optional GPU and storage backend.** Run operation chains on CUDA with CuPy, or read and write Zarr through the alternative Rust-based `zarrista` backend.
@@ -226,7 +226,7 @@ io.write(result, "filtered.zarr", device="cuda")  # streamed GPU processing
 
 ## Available operations
 
-The operation set contains around **140 operations**, available as `dyna_zarr.operations` (often imported as `ops`) and grouped into category submodules. The table below shows several examples.
+The operation set contains around **150 operations**, available as `dyna_zarr.operations` (often imported as `ops`) and grouped into category submodules. The table below shows several examples.
 
 | Category | Examples |
 |---|---|
@@ -263,12 +263,12 @@ For new processing chains that fit dyna-zarr's slice-based model, using dyna-zar
 ## Core API
 
 - **`io.read(source, ...)`** — read TIFF or Zarr into a lazy `DynamicArray`.
-- **`from_array(source, chunks=None, lock=False)`** — wrap an array-like object or reader.
+- **`from_array(source, chunks=None, *, lock=None)`** — wrap an array-like object or reader.
 - **`io.write(array, path, ...)`** — stream an array to Zarr v2/v3, with controls for chunking, sharding, compression, regions, memory budget, threads, backend, and device.
 - **`io.write_levels(array, outputs, ...)`** — write multiscale outputs from a shared source read when possible.
 - **`io.create_sink(path, shape, dtype, ...)`** — create a Zarr destination and return a sink for pushing blocks from an external producer.
 - **`io.clear_cache()`** — clear cached small reduction results.
-- **`operations`** (`from dyna_zarr import operations as ops`) — about 140 lazy operations: pointwise math, reductions, neighborhood filters, structural and scan operations, downsampling, array creation, and `map_blocks` / `map_overlap` / `reduce` for your own; see [Available operations](#available-operations).
+- **`operations`** (`from dyna_zarr import operations as ops`) — about 150 lazy operations: pointwise math, reductions, neighborhood filters, structural and scan operations, downsampling, array creation, and `map_blocks` / `map_overlap` / `reduce` for your own; see [Available operations](#available-operations).
 - **`DynamicArray`** — lazy slicing, `.compute()`, `.persist()`, NumPy-like operators and ufuncs, broadcasting, and reductions.
 - **`Codecs`** — configure compression for Zarr v2 and v3.
 
