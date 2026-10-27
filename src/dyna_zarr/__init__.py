@@ -8,7 +8,7 @@ large-scale (terabyte+) Zarr datasets.
 Includes efficient TIFF reading via tifffile's zarr bridge with concurrent access support.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __author__ = "Bugra Oezdemir"
 
 # Import core classes
