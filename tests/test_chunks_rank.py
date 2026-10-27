@@ -96,3 +96,18 @@ def test_reshape_roundtrip_is_exact(source, tmp_path):
     io.write(source.reshape((64, 16384)), str(out))
     expected = np.arange(64 * 128 * 128, dtype="uint16").reshape(64, 16384)
     np.testing.assert_array_equal(zarr.open_array(str(out), mode="r")[:], expected)
+
+
+def test_shards_follow_the_rank_like_chunks(tmp_path):
+    # the source's shard tuple was copied down the chain too: an integer index that drops
+    # an axis reported the rank-3 shards on a 2-D array (ozp's table showed them, and the
+    # writer could not derive the sharding from them)
+    path = tmp_path / "sharded.zarr"
+    z = zarr.create_array(store=str(path), shape=(4, 64, 64), chunks=(1, 16, 16),
+                          shards=(2, 32, 32), dtype="uint8")
+    z[:] = 1
+    a = DynamicArray(z)
+    assert a.shards == (2, 32, 32)
+    assert a[0].shards is None                       # rank 2 now: no stale rank-3 tuple
+    assert a[1:3].shards == (2, 32, 32)              # the same rank: kept
+    assert a[:, 0:32, :].ndim == 3 and a[:, 0:32, :].shards == (2, 32, 32)

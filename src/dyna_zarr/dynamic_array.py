@@ -586,8 +586,13 @@ class DynamicArray:
 
     @property
     def shards(self):
-        """Shards for Zarr v3."""
-        return self._shards
+        """Shards for Zarr v3, or None when the rank no longer matches: the source's tuple
+        is copied along a transform chain, so an op that drops an axis (an integer index)
+        would otherwise report the source's rank, as ``chunks`` guards against."""
+        shards = self._shards
+        if shards is not None and len(shards) != self.ndim:
+            return None
+        return shards
 
     @property
     def codecs(self):
