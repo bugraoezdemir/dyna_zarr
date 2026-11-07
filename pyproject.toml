@@ -17,7 +17,7 @@ where = ["src"]
 
 [project]
 name = "dyna-zarr"
-version = "0.1.1"
+version = "0.1.2"
 description = "A lightweight library for lazy operations on Zarr arrays without task graph overhead"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -65,12 +65,17 @@ classifiers = [
 #     exits with a failure code, breaking scripts and CI. Reproduced with tensorstore
 #     alone (no dyna) against an S3 emulator; 0.1.62, 0.1.71-0.1.76 and 0.1.85 exit
 #     cleanly. Excluded on every platform (Linux/macOS not verified either way).
+#   tensorstore != 0.1.85 - that release keeps memory while the levels below full
+#     resolution are built from the stored full-resolution level: one 959-plane well of
+#     14040 x 24551 climbed from 2.4 GB to 115 GB in 13 minutes on a cluster node (Linux);
+#     at that plane size 2.5 -> 7.9 GB in 50 s with 0.1.85, flat at 1.1-1.9 GB with
+#     0.1.86, every other package the same. 0.1.62-0.1.76 not measured for this.
 # (The unpinned `tensorstore`/`tifffile` used to resolve to 0.1.0 / 0.1.0 at the floor.)
 dependencies = [
     "zarr>=3.1.5",
     "numpy>=1.26",
     "scipy>=1.10",
-    "tensorstore>=0.1.62,!=0.1.77,!=0.1.78,!=0.1.79,!=0.1.80,!=0.1.81,!=0.1.82,!=0.1.83,!=0.1.84",
+    "tensorstore>=0.1.62,!=0.1.77,!=0.1.78,!=0.1.79,!=0.1.80,!=0.1.81,!=0.1.82,!=0.1.83,!=0.1.84,!=0.1.85",
     "tifffile>=2025.5.21",
 ]
 
