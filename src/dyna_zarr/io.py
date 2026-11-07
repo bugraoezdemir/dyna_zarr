@@ -41,6 +41,35 @@ from .operations._backend import (
     new_stream as _new_stream, use_stream as _use_stream,
 )
 
+#: tensorstore releases that keep memory while lower levels are built from the stored
+#: level 0 (pyproject excludes them; this catches an install that bypassed the pins:
+#: --no-deps, conda, an environment pip left alone).
+_LEAKING_TENSORSTORE = ("0.1.85",)
+
+
+def _warn_leaking_tensorstore(version) -> bool:
+    """Warn when *version* is a tensorstore in ``_LEAKING_TENSORSTORE``; True when it is."""
+    if version not in _LEAKING_TENSORSTORE:
+        return False
+    warnings.warn(
+        f"tensorstore {version} keeps memory while the coarser levels of a pyramid are "
+        f"built: one 959-plane image of 14040 x 24551 climbed from 2.4 GB to 115 GB. "
+        f'Upgrade it: pip install --upgrade "tensorstore>=0.1.86"', UserWarning,
+        stacklevel=3)
+    return True
+
+
+def _tensorstore_version():
+    """The installed tensorstore's version (it has no ``__version__``), or None."""
+    try:
+        from importlib.metadata import version
+        return version("tensorstore")
+    except Exception:                                  # noqa: BLE001 - unknown: no warning
+        return None
+
+
+_warn_leaking_tensorstore(_tensorstore_version())
+
 
 #: Smallest workable pipeline: 1 reader + 1 queued region + 1 in-flight write. `max_threads`
 #: (the total live-region budget) is never taken below this, even by `memory_budget_mb` -
@@ -77,6 +106,39 @@ def capture_messages():
         yield messages
     finally:
         _MESSAGES.reset(token)
+
+
+#: The memory share a caller handed to ``write_levels`` (:func:`memory_share`): None, or
+#: ``(share, memory MB on entry, threads on entry)``.
+_SHARE = contextvars.ContextVar("dyna_zarr_io_share", default=None)
+#: How often a pass looks at its memory share, in seconds.
+_SHARE_POLL_S = 5.0
+
+
+@contextlib.contextmanager
+def memory_share(share):
+    """Let the ``write_levels`` calls in this context use memory and threads that become
+    free while they run (e.g. freed by other conversions that have finished).
+
+    ``share()`` returns ``(memory MB, threads)`` this caller may use NOW. Its value when
+    the context is entered is what the caller planned with; ``write_levels`` takes only
+    what it GREW by since then, on top of its own ``memory_budget_mb`` / ``max_threads``:
+
+    - at the start of every pass (a later pass of a pyramid, from a stored level, plans
+      with the grown share: larger tiles or slabs, more threads);
+    - during a pass, every few seconds: it starts more worker threads, within the grown
+      memory (the blocks, tiles and slabs planned at the start stay as they are).
+
+    It never takes less than it was asked for: a share that shrinks does nothing. An
+    error in ``share()`` keeps the write as planned. ``io.write`` and the TensorStore
+    transaction mode of ``write_levels`` (big shards on a remote store) do not follow it.
+    """
+    base_mb, base_threads = share()
+    token = _SHARE.set((share, float(base_mb), int(base_threads)))
+    try:
+        yield
+    finally:
+        _SHARE.reset(token)
 
 
 class Extrema:
@@ -3052,6 +3114,8 @@ def _plan_xy_tiles(shape, factors, inner, level_shapes, itemsize, budget, unit, 
             need_units = total(n, cy, cx, z_step(n), w, Z)
     ay, ax = align(n)
     return dict(n=n, tile=(ty, tx), bz=bz, workers=w, slab=D, block=block(n, ty, tx, bz),
+                # memory with w_ workers and this tile / slab (a grown memory share)
+                cost=lambda w_: total(n, ty, tx, bz, w_, D),
                 chunks=chunks_bytes(n, ty, tx, bz, w, D),
                 blocks=w * block_cost(block(n, ty, tx, bz)), fits=fits, amp=amp,
                 need_units=need_units, minimal=(ay, ax),
@@ -3106,6 +3170,10 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
 
     Compared with one io.write per level from the stored level above, it saves the
     re-read of every level but the last one written and a write setup per level.
+
+    Inside :func:`memory_share` (``io.memory_share``), the pass plans with what the
+    caller's share has grown by, and starts more threads while it runs when the share
+    grows further (memory and threads freed elsewhere, e.g. by finished conversions).
     """
     import itertools as _it
     from math import lcm
@@ -3123,6 +3191,33 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
         raise ValueError("write_levels needs at least one output")
     max_threads = renamed(max_threads, max_workers, new="max_threads", old="max_workers",
                           where="write_levels", default=4)
+    # a memory share (memory_share): the pass plans with what it has grown by since the
+    # caller planned, and adds threads while it runs
+    shared = _SHARE.get()
+    asked_mb, asked_threads = memory_budget_mb, max(1, int(max_threads))
+
+    def share_now():
+        """``(memory_budget_mb, max_threads)`` with what the share grew by (never less
+        than asked)."""
+        fn, base_mb, base_threads = shared
+        try:
+            mb, threads = fn()
+            d_mb = max(0.0, float(mb) - base_mb)
+            d_threads = max(0, int(threads) - base_threads)
+        except Exception:                          # noqa: BLE001 - keep the plan
+            d_mb, d_threads = 0.0, 0
+        return (None if asked_mb is None else float(asked_mb) + d_mb,
+                asked_threads + d_threads)
+
+    if shared is not None:
+        memory_budget_mb, max_threads = share_now()
+        if (memory_budget_mb, max_threads) != (asked_mb, asked_threads):
+            _say(f"[Levels] memory share grew: "
+                 + (f"{memory_budget_mb:.0f} MB (asked {asked_mb:.0f}), "
+                    if asked_mb is not None else "")
+                 + f"{max_threads} threads (asked {asked_threads})", flush=True)
+    grow_to = None              # (memory MB, threads, threads now) -> threads to run
+    pace = {"ahead": None}      # the chunk-appending mode's window, grown with threads
     from .dynamic_array import DynamicArray, from_array
     if not isinstance(array, DynamicArray):
         array = from_array(array)                  # numpy / zarr / TensorStore
@@ -3262,6 +3357,12 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
                 _say(f"[Levels] WARNING: {msg}", flush=True)
                 warnings.warn(msg, RuntimeWarning, stacklevel=2)
             max_threads = max(1, min(int(max_threads), affordable))
+
+            def grow_to(mb, threads, now):
+                return max(now, min(int(threads), int(float(mb) * 2**20 // per_thread)))
+        else:
+            def grow_to(mb, threads, now):
+                return max(now, int(threads))
         handles = [_open_output(spec) for spec in specs[:n]]
         items = [(origin, tuple(min(o + g, s) for o, g, s in zip(origin, region, shape)))
                  for origin in _it.product(*[range(0, s, r) for s, r in zip(shape, region)])]
@@ -3391,16 +3492,27 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
         # block is finished only once the chunks it completed are appended: otherwise the
         # others race ahead while one thread appends a completed row (128 chunks) and
         # open rows without bound (measured 4 tile rows where 2 were planned).
-        ahead = _AHEAD_PER_THREAD * max(1, int(max_threads))
+        pace["ahead"] = _AHEAD_PER_THREAD * max(1, int(max_threads))
         window = {"low": 0, "finished": set()}
         room = threading.Condition(lock)
+        cost_of = plan["cost"] if planned_block is not None else None
+
+        def grow_to(mb, threads, now):
+            """More threads only while the planned tile's memory with them (open chunks
+            follow the window, which follows the threads) stays within ``mb``."""
+            if cost_of is None:
+                return max(now, int(threads)) if memory_budget_mb is None else now
+            w = now
+            while w < int(threads) and cost_of(w + 1) <= float(mb) * 2**20:
+                w += 1
+            return w
 
         def worker():
             try:
                 while True:
                     with room:
                         while (state["error"] is None and state["next"] < len(items)
-                               and state["next"] >= window["low"] + ahead):
+                               and state["next"] >= window["low"] + pace["ahead"]):
                             room.wait(0.1)
                         if state["error"] is not None or state["next"] >= len(items):
                             return
@@ -3581,6 +3693,31 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
                    for i in range(max(1, int(max_threads)))]
         for t in threads:
             t.start()
+        while shared is not None and grow_to is not None:
+            # a memory share: look at it every few seconds while blocks are left, and
+            # start more workers when it has grown (they take the next blocks)
+            alive = [t for t in threads if t.is_alive()]
+            if not alive:
+                break
+            alive[0].join(_SHARE_POLL_S)
+            with lock:
+                left = state["error"] is None and state["next"] < len(items)
+            if not left:
+                continue
+            mb, most = share_now()
+            want = grow_to(mb if mb is not None else 0.0, most, len(threads))
+            if want > len(threads):
+                _say(f"[Levels] memory share grew"
+                     + (f" to {mb:.0f} MB" if mb is not None else "")
+                     + f": {len(threads)} -> {want} threads", flush=True)
+                if pace["ahead"] is not None:
+                    with lock:
+                        pace["ahead"] = _AHEAD_PER_THREAD * want
+                        room.notify_all()
+                for i in range(len(threads), want):
+                    t = _thread(worker, f"LevelsWorker-{i}")
+                    threads.append(t)
+                    t.start()
         for t in threads:
             t.join()
     finally:
@@ -4568,6 +4705,13 @@ class io:
         """Collect io's messages instead of printing them, for writes started in this
         context (thread-safe). See :func:`capture_messages`."""
         return capture_messages()
+
+    @staticmethod
+    def memory_share(share):
+        """Let ``write_levels`` in this context take memory and threads that become free
+        while it runs: ``share()`` returns ``(memory MB, threads)`` usable now. See
+        :func:`memory_share`."""
+        return memory_share(share)
 
     @staticmethod
     def create_sink(output_path, shape, dtype, *, chunks=None, chunk_size_mb=None,

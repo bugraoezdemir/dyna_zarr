@@ -191,6 +191,18 @@ io.write_levels(arr, outputs, method="mean")
 
 Factors are per-axis and relative to the input. Each output can specify its own `chunks` or `chunk_size_mb`; other write options apply to all outputs. If all requested levels cannot be produced in one pass, the return value indicates how many were written.
 
+A caller that runs several writes at once can hand over memory and threads that become free while one runs (for example, when other writes have finished):
+
+```python
+def share():                      # what this write may use now: (memory MB, threads)
+    return my_budget_mb(), my_threads()
+
+with io.memory_share(share):
+    io.write_levels(arr, outputs, memory_budget_mb=1024, max_threads=4)
+```
+
+`write_levels` takes only what the share has grown by since the `with` began. Each pass plans with it, and during a pass it starts more threads every few seconds when the share has grown (the blocks and tiles planned at the pass start stay as they are). A share that shrinks changes nothing.
+
 ## Remote storage
 
 The default TensorStore backend reads and writes Zarr on S3-compatible stores and Google Cloud Storage, and reads HTTP(S) stores. For a non-AWS S3 service such as MinIO or Ceph, pass endpoint options as needed:
@@ -277,6 +289,7 @@ For new processing chains that fit dyna-zarr's slice-based model, using dyna-zar
 - Python 3.11 or newer.
 - Core dependencies include Zarr, NumPy, SciPy, TensorStore, and tifffile. The optional `zarrista` extra also requires NumPy 2.1 or newer.
 - TensorStore versions 0.1.77–0.1.84 are excluded because they have a known process-exit crash after S3 access in affected environments. The package dependency constraints enforce the supported range.
+- TensorStore 0.1.85 is excluded because it keeps memory while the coarser levels are built from the stored full-resolution level: a 959-plane image of 14040 x 24551 climbed from 2.4 GB to 115 GB in 13 minutes. 0.1.86 stays flat. If an environment already has 0.1.85, upgrade it: `pip install --upgrade "tensorstore>=0.1.86"`.
 
 Run the core tests locally:
 
