@@ -15,9 +15,19 @@ io_module = sys.modules["dyna_zarr.io"]
 
 
 def _tensorstore_requirement():
+    """tensorstore's requirement: from pyproject.toml in a source checkout, else from the
+    installed package's metadata (the wheel and dependency-floor jobs copy the tests away
+    from the checkout, and there the installed pins are the ones that matter)."""
     pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
-    deps = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["dependencies"]
-    return next(Requirement(d) for d in deps if Requirement(d).name == "tensorstore")
+    if pyproject.is_file():
+        deps = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["dependencies"]
+    else:
+        from importlib.metadata import requires
+        deps = requires("dyna-zarr") or []
+    found = [Requirement(d) for d in deps if Requirement(d).name == "tensorstore"
+             and Requirement(d).marker is None]
+    assert found, "dyna-zarr declares no tensorstore requirement"
+    return found[0]
 
 
 @pytest.mark.parametrize("version", ["0.1.77", "0.1.84", "0.1.85"])
