@@ -234,10 +234,16 @@ def test_micro_reader_image(tmp_path):
     path = tmp_path / "img.tif"
     tifffile.imwrite(str(path), plane, tile=(64, 64), compression="zlib")   # a compressed tile
     img = micro_reader.open(str(path)).images[0]
+    # the image's own axes: y x up to micro-reader 0.3, t c z y x from 0.4.0 (axes="canonical"
+    # by default); either way the plane, with length-1 axes ahead of it
+    shape = tuple(img.shape)
+    assert shape[-2:] == plane.shape and all(s == 1 for s in shape[:-2])
+    expected = plane.reshape(shape)
     a = from_array(img)
-    assert a.shape == plane.shape
+    assert a.shape == shape
     if img.read_unit is not None:                       # the smallest block it decodes
-        assert a.chunks == tuple(min(u, s) for u, s in zip(img.read_unit, plane.shape))
-    np.testing.assert_array_equal(np.asarray(a[10:70, 5:80]), plane[10:70, 5:80])
+        assert a.chunks == tuple(min(u, s) for u, s in zip(img.read_unit, shape))
+    window = (0,) * (len(shape) - 2) + (slice(10, 70), slice(5, 80))
+    np.testing.assert_array_equal(np.asarray(a[window]), expected[window])
     _write(a, tmp_path / "out.zarr")
-    np.testing.assert_array_equal(zarr.open_array(str(tmp_path / "out.zarr"))[...], plane)
+    np.testing.assert_array_equal(zarr.open_array(str(tmp_path / "out.zarr"))[...], expected)
