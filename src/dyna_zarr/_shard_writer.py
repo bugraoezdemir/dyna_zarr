@@ -16,13 +16,16 @@ refused by :func:`supported` (the caller then keeps TensorStore's own writer).
 
 Chunks equal to the fill value are not written (their index entry says "missing"),
 and a shard with no data gets no file - as TensorStore and zarrs do.
+
+For an array written into a zip (dyna_zarr._zip), the shard files go to a temporary
+folder and ``on_finish(key, file)`` hands each one over when it is complete.
 """
 from __future__ import annotations
 
 import json
 import os
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -98,10 +101,16 @@ class _Shard:
 
 class ShardAssembler:
     """``append_chunk(region, data)`` writes one whole inner chunk into its shard's file;
-    the shard is finished (index written, file closed) when its last chunk is in."""
+    the shard is finished (index written, file closed) when its last chunk is in.
 
-    def __init__(self, path: str):
-        meta = _metadata(path)
+    ``meta``: the array's metadata (default: read from ``path/zarr.json``). ``on_finish``:
+    called with ``(key, file path)`` for each finished shard file (``key`` relative to the
+    array, e.g. ``"c/0/1/2"``)."""
+
+    def __init__(self, path: str, meta: Optional[dict] = None,
+                 on_finish: Optional[Callable[[str, str], None]] = None):
+        meta = _metadata(path) if meta is None else meta
+        self._on_finish = on_finish
         why = _why_not(meta)
         if why is not None:
             raise ValueError(f"{path!r}: cannot write its shards chunk by chunk: {why}")
@@ -128,11 +137,14 @@ class ShardAssembler:
     def write_unit(self):
         return self.shard
 
-    def _file_path(self, shard_idx) -> str:
+    def _key(self, shard_idx) -> str:
         key = self._sep.join(str(i) for i in shard_idx)
         if not self._v2_keys:
             key = "c" + self._sep + key if key else "c"
-        return os.path.join(self.path, *key.split("/"))
+        return key
+
+    def _file_path(self, shard_idx) -> str:
+        return os.path.join(self.path, *self._key(shard_idx).split("/"))
 
     def _state(self, shard_idx) -> _Shard:
         with self._lock:
@@ -181,6 +193,8 @@ class ShardAssembler:
             state.file.write(bytes(np.asarray(self._crc.encode(state.index.tobytes()))))
             state.file.close()
             state.file = None
+            if self._on_finish is not None:
+                self._on_finish(self._key(shard_idx), self._file_path(shard_idx))
         with self._lock:
             self._shards.pop(shard_idx, None)
 
