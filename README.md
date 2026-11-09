@@ -203,6 +203,26 @@ with io.memory_share(share):
 
 `write_levels` takes only what the share has grown by since the `with` began. Each pass plans with it, and during a pass it starts more threads every few seconds when the share has grown (the blocks and tiles planned at the pass start stay as they are). A share that shrinks changes nothing.
 
+### Write straight into a zip
+
+Arrays can be written into a zip file directly, with no folder first. Open the zip, then use paths inside it as outputs and inputs:
+
+```python
+from dyna_zarr import io
+
+with io.open_zip("image.ome.zarr.zip") as z:          # holds the folder image.ome.zarr
+    io.write_levels(arr, [{"path": z / "0", "factors": (1, 1, 1)},
+                          {"path": z / "1", "factors": (1, 2, 2)}])
+    level0 = io.read(z / "0")                          # readable before the zip is closed
+    z.write("zarr.json", group_metadata_bytes)         # your own metadata files
+```
+
+- `image.ome.zarr.zip` holds the folder `image.ome.zarr`, as the BioImage Archive asks. `image.ozx` follows NGFF RFC-9 instead: the store at the top of the zip, Zarr v3 only.
+- Every chunk or shard goes into the zip once, as soon as it is complete. Shards larger than the memory budget are assembled in temporary files next to the zip first.
+- The zip is called `image.ome.zarr.zip.part` until it is complete and checked. An error inside the `with` block deletes it.
+- A closed zip is read like a folder: `io.read("image.ome.zarr.zip/0")`.
+- Arrays already in the zip cannot be replaced, and only the default TensorStore backend writes into a zip.
+
 ## Remote storage
 
 The default TensorStore backend reads and writes Zarr on S3-compatible stores and Google Cloud Storage, and reads HTTP(S) stores. For a non-AWS S3 service such as MinIO or Ceph, pass endpoint options as needed:

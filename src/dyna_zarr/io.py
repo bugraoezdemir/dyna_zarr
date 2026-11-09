@@ -710,6 +710,16 @@ def read_array(source: Union[str, Path], backend: Optional[str] = None,
             f"unknown backend {backend!r}; expected 'tensorstore' (default) or 'zarrista'"
         )
 
+    # A Zarr array inside a zip: one open for writing (io.open_zip; read through the
+    # writer, finished entries only) or a finished zip file
+    from . import _zip
+    in_zip = _zip.zarr_array(source) if '://' not in str(source) else None
+    if in_zip is not None:
+        if backend != "tensorstore":
+            raise ValueError(f"{str(source)!r} is inside a zip, which dyna reads with "
+                             f"zarr-python; backend={backend!r} does not apply. Drop it.")
+        return DynamicArray(in_zip)
+
     source_path = Path(source) if not isinstance(source, Path) else source
     
     is_tiff = str(source_path).lower().endswith(('.tif', '.tiff'))
@@ -2122,8 +2132,17 @@ def _chunk_output(spec, handle):
     chunks through TensorStore."""
     if spec.shards is None:
         return _WholeChunkOutput(handle)
+    if spec.zip_target is not None:
+        return handle.chunk_output()             # shards in temporary files, then the zip
     from ._shard_writer import ShardAssembler
     return ShardAssembler(spec.path)
+
+
+def _finish_output(handle) -> None:
+    """Move what an output into a zip still holds in memory into the zip."""
+    from ._zip import ZipOutput
+    if isinstance(handle, ZipOutput):
+        handle.finish()
 
 
 def _bounded_partial_writes():
@@ -2311,6 +2330,8 @@ class _OutputSpec:
     notes: List[str] = field(default_factory=list)
     existing: Optional[str] = None   # what _existing_output found there
     dimension_names: Optional[Tuple[str, ...]] = None   # v3 only
+    zip_target: Any = None           # an open zip (dyna_zarr._zip) the output goes into
+    zip_key: str = ""                # the output's path inside it
 
 
 def _resolve_output(array, output_path, *, max_threads, num_readers, chunks, chunk_size_mb,
@@ -2352,6 +2373,18 @@ def _resolve_output(array, output_path, *, max_threads, num_readers, chunks, chu
         )
     output_path = _local_path_from_file_url(output_path)
     remote = '://' in str(output_path)
+    from . import _zip
+    zip_hit = _zip.open_target(output_path)
+    if zip_hit is None:
+        _zip.refuse_unopened(output_path)
+    else:
+        if backend != "tensorstore":
+            raise ValueError(
+                f"{str(output_path)!r} is inside a zip, which dyna writes with "
+                f"backend='tensorstore' only (got {backend!r}).")
+        if storage_options:
+            raise ValueError(f"storage_options are for remote stores; {str(output_path)!r} "
+                             f"is inside a local zip. Drop storage_options.")
     if backend == "tensorstore":
         if remote:
             # Remote output through TensorStore's own stores (s3/gcs), with the same
@@ -2478,6 +2511,10 @@ def _resolve_output(array, output_path, *, max_threads, num_readers, chunks, chu
     # --- format: explicit, else the input's own, else v3 ------------------------
     final_format = (int(zarr_format) if zarr_format is not None
                     else (getattr(array, "zarr_format", None) or 3))
+    if zip_hit is not None and zip_hit[0].layout == "rfc9" and final_format != 3:
+        raise ValueError(
+            f"{str(output_path)!r}: an RFC-9 zip (.ozx) holds Zarr v3 only; this output is "
+            f"Zarr v{final_format}. Pass zarr_format=3, or write into X.ome.zarr.zip.")
 
     # --- codecs: explicit, else the input's, else blosc-lz4 --------------------
     if compressor is None:
@@ -2612,9 +2649,17 @@ def _resolve_output(array, output_path, *, max_threads, num_readers, chunks, chu
     # Last, once every argument is known to be valid: what is already at the output.
     # The overwrite rule is applied here, the same for every backend, write path and
     # location; _open_output only carries out the deletion it allows.
-    existing = _existing_output(output_path, remote=remote, backend=backend,
-                                storage_options=storage_options)
-    _check_existing_output(output_path, overwrite, existing)
+    if zip_hit is not None:
+        existing = _zip.existing(*zip_hit)
+        if existing is not None:
+            raise OutputExistsError(
+                f"{output_path} already holds a zarr {existing} in a zip being written; a "
+                f"zip cannot replace what it holds (overwrite=True does not apply). Choose "
+                f"another path inside it.")
+    else:
+        existing = _existing_output(output_path, remote=remote, backend=backend,
+                                    storage_options=storage_options)
+        _check_existing_output(output_path, overwrite, existing)
 
     return _OutputSpec(
         existing=existing,
@@ -2625,6 +2670,7 @@ def _resolve_output(array, output_path, *, max_threads, num_readers, chunks, chu
         storage_options=storage_options, overwrite=bool(overwrite), remote=remote,
         region_mb=region_mb, solved_region=tuple(int(r) for r in solved_region),
         notes=list(notes), dimension_names=final_dim_names,
+        zip_target=zip_hit[0] if zip_hit else None, zip_key=zip_hit[1] if zip_hit else "",
     )
 
 
@@ -2632,7 +2678,8 @@ def _ts_output_spec(spec: _OutputSpec) -> dict:
     """TensorStore create-spec for a resolved output: the local ``file`` store, or a
     remote s3/gcs store built from the URL and storage_options (see _ts_kvstore)."""
     kvstore = (_ts_kvstore(spec.path, spec.storage_options, write=True) if spec.remote
-               else {'driver': 'file', 'path': str(Path(spec.path).absolute())})
+               else {'driver': 'file', 'path': str(Path(spec.path).absolute())}
+               if spec.zip_target is None else {'driver': 'memory', 'path': 'a/'})
     ts_spec = {
         'driver': 'zarr3' if spec.zarr_format == 3 else 'zarr',
         'kvstore': kvstore,
@@ -2685,6 +2732,15 @@ def _open_output(spec: _OutputSpec):
     region pipeline) on every backend. An existing store that overwrite=True replaces
     is deleted here, once, for every write strategy.
     """
+    if spec.zip_target is not None:
+        # created by TensorStore in memory; each write unit moves into the zip when done
+        import tensorstore as ts
+        from ._zip import ZipOutput
+        ts_spec = _ts_output_spec(spec)
+        ts_spec['kvstore'] = {'driver': 'memory', 'path': 'a/'}
+        handle = ts.open(ts_spec, create=True, context=ts.Context()).result()
+        return ZipOutput(spec.zip_target, spec.zip_key, handle, shape=spec.shape,
+                         chunks=spec.chunks, shards=spec.shards, zarr_format=spec.zarr_format)
     if spec.existing is not None:
         # _resolve_output already refused everything but a zarr store with overwrite=True
         _delete_output(spec)
@@ -2771,6 +2827,12 @@ class Sink(_SyncSink):
     def write_unit(self) -> Tuple[int, ...]:
         """The block shape concurrent writers must not share: shards, else chunks."""
         return tuple(self.shards) if self.shards is not None else tuple(self.chunks)
+
+    def finish(self) -> None:
+        """For an output inside a zip (io.open_zip): move what is not yet in the zip into
+        it (write units written only in part; the rest reads as the fill value). Closing
+        the zip does it too. Nothing to do for other outputs."""
+        _finish_output(self._handle)
 
 
 def create_sink(output_path, shape, dtype, *, chunks=None, chunk_size_mb=None,
@@ -2868,6 +2930,7 @@ def _write_dask(x, output_path, *, max_threads, num_readers, chunks, chunk_size_
           f"{int(max_threads)} threads", flush=True)
     with dask.config.set(scheduler="threads", num_workers=int(max_threads)):
         da.store(x.rechunk(sink.write_unit), sink, lock=False)
+    sink.finish()
     _say(f"Successfully wrote array to {output_path}")
     return output_path
 
@@ -3266,13 +3329,18 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
     from ._read_cost import read_overhead
     read_factor = read_overhead(array)
 
+    # an output inside a zip holds each written unit encoded in memory, and a copy of it
+    # while it is appended to the zip: up to twice the output again
+    zip_extra = 2 if any(spec.zip_target is not None for spec in specs) else 0
+
     def worker_cost(region):
         """A write_levels worker's memory for one block: the block read (with what the
         reader holds on top: 1.25x for zarrista / micro-reader, 2x for TensorStore,
-        ``_read_cost.read_overhead``), and every level's output computed from it."""
+        ``_read_cost.read_overhead``), and every level's output computed from it (with,
+        for an output into a zip, the encoded unit and its copy on the way in)."""
         read_bytes, out_bytes = _region_cost(array, region, shape, final_dtype)
         levels_out = sum(out_bytes / float(np.prod(f)) for f in factors)
-        return int(read_factor * read_bytes + levels_out)
+        return int(read_factor * read_bytes + levels_out * (1 + zip_extra))
 
     def grown(start, limit):
         """``start`` grown to the budget, innermost axis first (contiguous reads), in
@@ -3364,6 +3432,7 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
             def grow_to(mb, threads, now):
                 return max(now, int(threads))
         handles = [_open_output(spec) for spec in specs[:n]]
+        zip_outputs = [h for h in handles if hasattr(h, "unit_written")]
         items = [(origin, tuple(min(o + g, s) for o, g, s in zip(origin, region, shape)))
                  for origin in _it.product(*[range(0, s, r) for s, r in zip(shape, region)])]
         _say(f"[Levels] {n} of {len(specs)} outputs in one pass: {len(items)} regions of "
@@ -3457,6 +3526,7 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
                 first.append(lim if c == lim else (u if u <= lim else min(w, lim)))
             block = grown(tuple(first), tile)
         handles = [_open_output(spec) for spec in specs[:n]]
+        zip_outputs = [h for h in handles if hasattr(h, "unit_written")]
         if backend == "tensorstore":
             # TensorStore created each array; dyna writes the shard files chunk by chunk
             handles = [_chunk_output(spec, h) for spec, h in zip(specs[:n], handles)]
@@ -3608,6 +3678,7 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
             block = grown(tuple(min(w, sz) for w, sz in zip(window, shape)), limit)
             flush_bytes = float("inf")
         handles = [_open_output(spec) for spec in specs]
+        zip_outputs = [h for h in handles if hasattr(h, "unit_written")]
         level_shapes = [tuple(int(v) for v in spec.shape) for spec in specs]
 
         def dst_of(origin, stop, level):
@@ -3631,6 +3702,7 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
             items.append((order, origin, stop))
         items.sort()
         open_txns = {}                        # (level, shard) -> its open transaction
+        uncommitted = {}                      # (level, shard) -> transactions not committed
         _say(f"[Levels] {n} of {len(specs)} outputs in one pass: {len(items)} blocks of "
              f"{block} ({'whole source chunks' if planar else 'within one shard'}, whole "
              f"windows of every level), {max_threads} threads; {len(pending)} shards, each "
@@ -3663,6 +3735,7 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
                                     entry = open_txns[key] = {
                                         "txn": txn, "view": handles[level].with_transaction(txn),
                                         "bytes": 0, "writing": 0, "closed": False}
+                                    uncommitted[key] = uncommitted.get(key, 0) + 1
                                 entry["writing"] += 1
                             data = np.ascontiguousarray(out[local])
                             entry["view"][piece].write(data).result()
@@ -3670,17 +3743,35 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
                                 entry["writing"] -= 1
                                 entry["bytes"] += data.nbytes
                                 pending[key] -= 1
-                                if not entry["closed"] and (pending[key] == 0
-                                                            or entry["bytes"] >= flush_bytes):
+                                touched = [entry]
+                                if not entry["closed"] and entry["bytes"] >= flush_bytes:
                                     entry["closed"] = True         # later pieces: a new one
                                     if open_txns.get(key) is entry:
                                         del open_txns[key]
-                                if entry["closed"] and entry["writing"] == 0 \
-                                        and not entry.get("committing"):
-                                    entry["committing"] = True
-                                    commit.append(entry["txn"])
-                    for txn in commit:
+                                if pending[key] == 0:
+                                    # the unit's last piece is in. It may have gone into a
+                                    # transaction closed earlier (a straggler) while a newer
+                                    # one is open with pieces of its own: close that too, or
+                                    # it is never committed and its pieces are lost (seen:
+                                    # 1 run in 60, a planar source)
+                                    current = open_txns.pop(key, None)
+                                    for e in (entry, current):
+                                        if e is not None:
+                                            e["closed"] = True
+                                            touched.append(e)
+                                for e in touched:
+                                    if e["closed"] and e["writing"] == 0 \
+                                            and not e.get("committing"):
+                                        e["committing"] = True
+                                        commit.append((key, e["txn"]))
+                    for key, txn in commit:
                         txn.commit_sync()
+                        with lock:
+                            uncommitted[key] -= 1
+                            whole = pending[key] == 0 and uncommitted[key] == 0
+                        if whole and hasattr(handles[key[0]], "unit_written"):
+                            # an output into a zip: the shard is complete, move it in
+                            handles[key[0]].unit_written(key[1])
             except BaseException as exc:          # first error wins; the others stop
                 with lock:
                     if state["error"] is None:
@@ -3732,6 +3823,8 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
                 finish()
         _say(f"[Levels] open chunk buffers peaked at {held['peak'] / 2**20:.1f} MiB",
              flush=True)
+    for h in zip_outputs:                         # into a zip: what memory still holds
+        h.finish()
     return n
 
 
@@ -3786,6 +3879,7 @@ def _write_staged(kind, array, spec: _OutputSpec, *, max_threads, device,
             reshape_write(source, spec.shape, sink, max_threads=max_threads, **common)
         else:
             scan_write(source, transform.op, transform.axis, sink, **common)
+    _finish_output(sink._handle)
     return spec.path
 
 
@@ -4041,6 +4135,7 @@ def _write_array(
     # Opened BEFORE gc is disabled, so a failure to create the store cannot leave the
     # interpreter's collector switched off.
     output = _open_output(spec)
+    zip_output = output if spec.zip_target is not None else None
 
     # The cyclic collector is paused while regions are in flight (their buffers are freed
     # by reference counting). No forced gc.collect() first: it cost ~45 ms per write in a
@@ -4645,7 +4740,7 @@ def _write_array(
     
     if temp_error:
         raise temp_error
-    
+    _finish_output(zip_output)
     return output_path
 
 
@@ -4696,6 +4791,34 @@ class io:
         """Write ``array`` and downsampled levels of it from one read. See
         :func:`write_levels`."""
         return write_levels(array, outputs, **kwargs)
+
+    @staticmethod
+    def open_zip(path, *, layout=None, root=None, overwrite=False):
+        """Open a zip to write Zarr straight into it: ``with io.open_zip("x.ome.zarr.zip")
+        as z: io.write(arr, z / "0")``. See :func:`dyna_zarr._zip.open_zip`."""
+        from ._zip import open_zip
+        return open_zip(path, layout=layout, root=root, overwrite=overwrite)
+
+    @staticmethod
+    def zip_file_of(path):
+        """The zip file ``path`` is or is inside (``x.ome.zarr.zip/0`` -> ``x.ome.zarr.zip``),
+        or None: for callers that open a zip around a write to such a path."""
+        from ._zip import zip_file_of
+        return zip_file_of(path)
+
+    @staticmethod
+    def zip_is_open(path) -> bool:
+        """True when ``path`` is inside a zip open for writing (:meth:`open_zip`)."""
+        from ._zip import open_target
+        return open_target(path) is not None
+
+    @staticmethod
+    def zip_zarr_store(path, write=False):
+        """``(zarr-python store, path inside it)`` for a path inside a zip open for
+        writing (``write=True``: zarr may append metadata to it) or, read-only, a finished
+        zip; None for any other path. For the caller's groups and metadata."""
+        from ._zip import store_at
+        return store_at(path, write=write)
 
     #: per-index min/max accumulator for ``observe=`` (see :class:`Extrema`)
     Extrema = Extrema
