@@ -1525,7 +1525,7 @@ def _snap_to_input_chunks(chunk, shape, input_chunks, max_elements):
             best = max((d for d in range(c, 0, -1) if ic % d == 0), default=0)
             snapped[axis] = best if best * 2 >= c else c
     # The snap can only shrink or hold each axis, but guard the product anyway.
-    while int(np.prod(snapped)) > max_elements:
+    while int(np.prod(snapped, dtype=np.int64)) > max_elements:
         widest = int(np.argmax(snapped))
         if snapped[widest] <= 1:
             break
@@ -1585,7 +1585,7 @@ def _default_chunks(shape, dtype, target_mb=_DEFAULT_CHUNK_MB, input_chunks=None
         if grown == chunk[i]:
             done.add(i)
             continue
-        if int(np.prod([grown if a == i else chunk[a] for a in spatial])) > max_elements:
+        if int(np.prod([grown if a == i else chunk[a] for a in spatial], dtype=np.int64)) > max_elements:
             done.add(i)
             continue
         chunk[i] = grown
@@ -1783,8 +1783,8 @@ def _region_cost(array, extent, shape, out_dtype):
     widest = _widest_dtype(_chain_widest_dtype(array), out_dtype)
     read_itemsize = int(_as_np_dtype(widest).itemsize) if widest is not None else out_itemsize
     # a downsampling chain reads `amplification` input elements per output element
-    return (int(np.prod(padded)) * read_itemsize * _chain_read_amplification(array),
-            int(np.prod([int(e) for e in extent])) * out_itemsize)
+    return (int(np.prod(padded, dtype=np.int64)) * read_itemsize * _chain_read_amplification(array),
+            int(np.prod([int(e) for e in extent], dtype=np.int64)) * out_itemsize)
 
 
 class RepeatedReductionWarning(UserWarning):
@@ -1914,7 +1914,7 @@ def _compute_region_shape(input_shape, final_chunks, region_size_mb, dtype=None,
     region_arr = output_chunk_arr.copy()
     region_arr = np.minimum(region_arr, input_arr)  # Clamp to array size
     
-    current_bytes = np.prod(region_arr) * element_size
+    current_bytes = np.prod(region_arr, dtype=np.int64) * element_size
     
     # If single output chunk exceeds target, use it anyway (can't split chunks)
     if current_bytes >= target_bytes:
@@ -1952,7 +1952,7 @@ def _compute_region_shape(input_shape, final_chunks, region_size_mb, dtype=None,
             # Test if this fits in budget
             test_region = region_arr.copy()
             test_region[dim] = new_size
-            new_bytes = np.prod(test_region) * element_size
+            new_bytes = np.prod(test_region, dtype=np.int64) * element_size
             
             if new_bytes <= target_bytes:
                 # Fits in budget - accept it
@@ -3008,7 +3008,7 @@ def _decode_aware_region(aligned, shape, src_unit, fits, today):
     for region in _it.product(*options):
         if not fits(region):
             continue
-        key = (_decodes_per_unit(region, unit, shape), int(np.prod(region)))
+        key = (_decodes_per_unit(region, unit, shape), int(np.prod(region, dtype=np.int64)))
         if best is None or key < best[0]:
             best = (key, tuple(int(r) for r in region))
     if best is None or best[0][0] >= now - 1e-9:
@@ -3049,7 +3049,7 @@ def _plan_xy_tiles(shape, factors, inner, level_shapes, itemsize, budget, unit, 
     def ceil_div(p_, q_):
         return -(-p_ // q_)
 
-    level_bytes = [int(np.prod(L)) * itemsize for L in level_shapes]
+    level_bytes = [int(np.prod(L, dtype=np.int64)) * itemsize for L in level_shapes]
 
     # the pass's first output is the source itself (factors all 1) in a first pass; in a
     # later pass (the rest of a pyramid, from a stored level) it is a smaller level
@@ -3065,7 +3065,7 @@ def _plan_xy_tiles(shape, factors, inner, level_shapes, itemsize, budget, unit, 
         out, used = set(), 0
         for k in range(n - 1, 0 if first_is_source else -1, -1):
             c, L = inner[k], level_shapes[k]
-            lead = int(np.prod([min(int(c[a_]), int(L[a_])) for a_ in range(z)]))
+            lead = int(np.prod([min(int(c[a_]), int(L[a_])) for a_ in range(z)], dtype=np.int64))
             rows_full = 2 * lead * min(int(c[z]), int(L[z])) * L[ya] * L[xa] * itemsize
             if (level_bytes[k] > max(rows_full, budget / 16)
                     or used + level_bytes[k] > budget / 4):
@@ -3126,7 +3126,7 @@ def _plan_xy_tiles(shape, factors, inner, level_shapes, itemsize, budget, unit, 
             if k in keep:
                 total += level_bytes[k]                # held whole: at most the level
                 continue
-            lead = int(np.prod([min(int(c[a_]), int(L[a_])) for a_ in range(z)]))
+            lead = int(np.prod([min(int(c[a_]), int(L[a_])) for a_ in range(z)], dtype=np.int64))
             S = int(c[z]) * int(f[z])                  # a chunk row, in source planes
             ly = min(L[ya], ceil_div(ceil_div(min(ty, Y), f[ya]), c[ya]) * c[ya])
             lx = min(L[xa], ceil_div(ceil_div(min(tx, X), f[xa]), c[xa]) * c[xa])
@@ -3406,7 +3406,7 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
         ``_read_cost.read_overhead``), and every level's output computed from it (with,
         for an output into a zip, the encoded unit and its copy on the way in)."""
         read_bytes, out_bytes = _region_cost(array, region, shape, final_dtype)
-        levels_out = sum(out_bytes / float(np.prod(f)) for f in factors)
+        levels_out = sum(out_bytes / float(np.prod(f, dtype=np.int64)) for f in factors)
         return int(read_factor * read_bytes + levels_out * (1 + zip_extra))
 
     def grown(start, limit):
@@ -3433,7 +3433,7 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
     if memory_budget_mb is not None and streamed and not assembled:
         # whole write units are assembled in memory (a TensorStore transaction per shard,
         # or a whole unit read): the budget cannot be kept by tiling
-        unit_mib = float(np.prod(aligned(1))) * np.dtype(final_dtype).itemsize / 2**20
+        unit_mib = float(np.prod(aligned(1), dtype=np.int64)) * np.dtype(final_dtype).itemsize / 2**20
         msg = (f"memory_budget_mb={memory_budget_mb:g} cannot bound this write: a whole "
                f"write unit of {aligned(1)} (~{unit_mib:.0f} MiB) is assembled in memory per "
                f"thread. Big shards are appended chunk by chunk within a budget for local "
@@ -3711,13 +3711,13 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
                                     entry = buffers[key] = [
                                         np.empty(tuple(b.stop - b.start for b in box),
                                                  dtype=final_dtype),
-                                        int(np.prod([b.stop - b.start for b in box]))]
+                                        int(np.prod([b.stop - b.start for b in box], dtype=np.int64))]
                                     held["now"] += entry[0].nbytes
                                     held["peak"] = max(held["peak"], held["now"])
                             # disjoint parts of one buffer: filled without the lock
                             entry[0][into] = out[src]
                             with lock:
-                                entry[1] -= int(np.prod([q.stop - q.start for q in part]))
+                                entry[1] -= int(np.prod([q.stop - q.start for q in part], dtype=np.int64))
                                 done = entry[1] == 0
                                 if done:
                                     del buffers[key]

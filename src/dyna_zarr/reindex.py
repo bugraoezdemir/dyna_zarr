@@ -44,7 +44,7 @@ def reindex_write(input_array, out_shape, output, output_chunks,
     from .rechunk import _source_grid, _target
     in_shape = tuple(int(s) for s in input_array.shape)
     out_shape = tuple(int(s) for s in out_shape)
-    if int(np.prod(in_shape)) != int(np.prod(out_shape)):
+    if int(np.prod(in_shape, dtype=np.int64)) != int(np.prod(out_shape, dtype=np.int64)):
         raise ValueError(f"reindex needs equal size: {in_shape} vs {out_shape}")
     dt = parse_dtype(dtype if dtype is not None else input_array.dtype)[0]
     in_chunks = _source_grid(input_array, in_shape, dt)     # grid-less -> bounded default

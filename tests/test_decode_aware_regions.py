@@ -43,7 +43,7 @@ ALIGNED = (1, 384, 384, 768)       # level 0 + 1 in one pass: twice his (192, 19
 
 
 def _within(mb):
-    return lambda r: int(np.prod(r)) * 2 <= mb * 2**20      # uint16
+    return lambda r: int(np.prod(r, dtype=np.int64)) * 2 <= mb * 2**20      # uint16; int64: numpy<2 on Windows multiplies in int32
 
 
 @pytest.mark.parametrize("mb, expect, decodes", [
