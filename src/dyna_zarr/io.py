@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import itertools
 import json
 import math
+import os
 import time
 import threading
 import functools
@@ -2949,6 +2950,72 @@ def _morton(ty, tx):
 _AHEAD_PER_THREAD = 2
 
 
+#: write_levels writes fewer levels in a pass only for at most this share of the decodes
+#: per input read unit (the levels left need one more, small, pass)
+_FEWER_LEVELS_GAIN = 0.8
+
+
+def _reads_per_unit(region, unit, size):
+    """How many regions of ``region`` (laid from 0) read each read unit of ``unit`` along
+    an axis of ``size``, on average over the axis's units (the last, partial ones
+    included). 1.0: every unit is read by one region only."""
+    region, unit, size = max(1, int(region)), max(1, int(unit)), max(1, int(size))
+    if unit == 1 or region >= size:
+        return 1.0
+    starts = range(0, size, unit)
+    touched = sum((min(s + unit, size) - 1) // region - s // region + 1 for s in starts)
+    return touched / len(starts)
+
+
+def _decodes_per_unit(region, unit, shape):
+    """How many times a region-wise read decodes each of the source's read units: the
+    product over the axes (a unit is read by every region its y and x ranges touch)."""
+    out = 1.0
+    for r, u, s in zip(region, unit, shape):
+        out *= _reads_per_unit(r, u, s)
+    return out
+
+
+def _decode_aware_region(aligned, shape, src_unit, fits, today):
+    """The region write_levels reads, chosen by how often it decodes each input read unit
+    (Workplan D9). ``aligned`` is the smallest region that spans whole write units of
+    every level in the pass; ``today`` is it grown to the budget innermost axis first.
+
+    Candidates are whole multiples of ``aligned`` per axis, up to its common multiple with
+    the read unit (where the regions' edges meet the units' again) or the whole axis;
+    ``fits(region)`` keeps the ones within the budget. The fewest decodes per unit wins,
+    the smaller region on a tie; ``today`` stays unless a candidate decodes fewer times,
+    so a source without a read unit, and a budget too small for any other shape, are
+    planned as before. Returns ``(region, decodes, today's decodes)``."""
+    from math import lcm
+    if src_unit is None or len(src_unit) != len(shape):
+        return today, None, None
+    unit = tuple(max(1, int(u)) for u in src_unit)
+    now = _decodes_per_unit(today, unit, shape)
+    if now <= 1.0:
+        return today, now, now
+    options = []
+    for a, u, s in zip(aligned, unit, shape):
+        a = max(1, int(a))
+        if _reads_per_unit(a, u, s) <= 1.0:
+            options.append([min(a, s)])            # already read once per unit: smallest
+            continue
+        top = min(s, lcm(a, u))
+        axis = sorted({min(m * a, s) for m in range(1, -(-top // a) + 1)} | {s})
+        options.append(axis)
+    import itertools as _it
+    best = None
+    for region in _it.product(*options):
+        if not fits(region):
+            continue
+        key = (_decodes_per_unit(region, unit, shape), int(np.prod(region)))
+        if best is None or key < best[0]:
+            best = (key, tuple(int(r) for r in region))
+    if best is None or best[0][0] >= now - 1e-9:
+        return today, now, now
+    return best[1], best[0][0], now
+
+
 def _plan_xy_tiles(shape, factors, inner, level_shapes, itemsize, budget, unit, *,
                    workers, block_cost, read_cost, region_bytes, src_chunks):
     """The tiled pass that fits ``budget`` bytes: how many leading levels, how many workers,
@@ -3414,6 +3481,43 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
             n += 1
         unit = aligned(n)
         region = grown(unit, shape)
+        decode_note = ""
+        if os.environ.get("DYNA_ZARR_DECODE_AWARE_REGIONS", "1") != "0":
+            # D9: a shape within the budget that decodes each input tile fewer times
+            from ._read_cost import read_unit as _read_unit
+            src_unit = _read_unit(array)
+
+            def fits(r):
+                if cost(r) > budget:
+                    return False
+                return (memory_budget_mb is None or worker_cost(r) * max(1, int(max_threads))
+                        <= float(memory_budget_mb) * 2**20)
+
+            first_n = n
+            region, decodes, before = _decode_aware_region(unit, shape, src_unit, fits,
+                                                           region)
+            # Fewer levels in this pass when their smaller write units let a region hold
+            # whole read units (an RGB slide's JPEG tiles hold all three channels: regions
+            # one channel deep on the grid of 5 levels decoded every tile ~3x). The levels
+            # left are written from the last stored one, which is small: never fewer than
+            # 2 levels here (1 would re-read the whole first output), and only for at
+            # least _FEWER_LEVELS_GAIN fewer decodes.
+            if decodes is not None and decodes > 1.0:
+                for m in range(n - 1, 1, -1):
+                    unit_m = aligned(m)
+                    reg_m, dec_m, _ = _decode_aware_region(unit_m, shape, src_unit, fits,
+                                                           grown(unit_m, shape))
+                    if dec_m is not None and dec_m <= decodes * _FEWER_LEVELS_GAIN:
+                        n, unit, region, decodes = m, unit_m, reg_m, dec_m
+                        if decodes <= 1.0:
+                            break
+            if decodes is not None:
+                decode_note = (f", input read unit {tuple(int(u) for u in src_unit)}: "
+                               f"{decodes:.2f} decodes per unit"
+                               + (f" (memory-first shape: {before:.2f})"
+                                  if decodes < before else "")
+                               + (f"; {n} levels instead of {first_n} so that regions "
+                                  f"hold whole read units" if n < first_n else ""))
         if memory_budget_mb is not None:
             # as in io.write: the budget caps the threads (a ceiling, never a target)
             per_thread = max(1, int(worker_cost(region)))
@@ -3436,7 +3540,7 @@ def write_levels(array, outputs, *, method="simple", max_threads=None, region_si
         items = [(origin, tuple(min(o + g, s) for o, g, s in zip(origin, region, shape)))
                  for origin in _it.product(*[range(0, s, r) for s, r in zip(shape, region)])]
         _say(f"[Levels] {n} of {len(specs)} outputs in one pass: {len(items)} regions of "
-             f"{region} (aligned to {unit}), {max_threads} threads", flush=True)
+             f"{region} (aligned to {unit}), {max_threads} threads{decode_note}", flush=True)
 
         def worker():
             try:
