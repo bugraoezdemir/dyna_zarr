@@ -44,9 +44,9 @@ def _ndarray_to_memory_zarr(arr: np.ndarray, chunks=None) -> zarr.Array:
         target = 32 * 1024 * 1024 // max(1, arr.dtype.itemsize)
         chunks = list(arr.shape)
         for axis in range(arr.ndim):                      # shrink leading axes first
-            if int(np.prod(chunks)) <= target:
+            if int(np.prod(chunks, dtype=np.int64)) <= target:
                 break
-            others = int(np.prod(chunks[axis + 1:])) or 1
+            others = int(np.prod(chunks[axis + 1:], dtype=np.int64)) or 1
             chunks[axis] = max(1, min(chunks[axis], target // others))
         # a zero-length axis still needs a chunk side of at least 1: zarr >= 3.4 refuses 0
         chunks = tuple(max(1, int(c)) for c in chunks)
@@ -934,7 +934,7 @@ class DynamicArray:
 
     # --- scalar conversion: compute on demand, NumPy's rules -----------------------
     def _one_element(self, what):
-        size = int(np.prod(self._shape)) if self._shape else 1
+        size = int(np.prod(self._shape, dtype=np.int64)) if self._shape else 1
         if size != 1:
             raise TypeError(
                 f"only an array with exactly one element can be converted to {what}; "
@@ -960,7 +960,7 @@ class DynamicArray:
     def __bool__(self):
         # NumPy refuses to guess for more than one element, and so does this. It is
         # checked from the shape, so an ambiguous `if arr:` raises WITHOUT reading data.
-        size = int(np.prod(self._shape)) if self._shape else 1
+        size = int(np.prod(self._shape, dtype=np.int64)) if self._shape else 1
         if size != 1:
             raise ValueError(
                 "the truth value of a DynamicArray with more than one element is "
@@ -1329,7 +1329,7 @@ def _read_unit_grid(source, shape):
     if unit is None:
         return None
     itemsize = np.dtype(source.dtype).itemsize
-    nbytes = int(np.prod([min(u, s) for u, s in zip(unit, shape)])) * itemsize
+    nbytes = int(np.prod([min(u, s) for u, s in zip(unit, shape)], dtype=np.int64)) * itemsize
     return unit if nbytes <= _READ_UNIT_MAX_BYTES else None
 
 

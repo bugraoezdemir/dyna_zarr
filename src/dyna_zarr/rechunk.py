@@ -336,11 +336,11 @@ def reshape_write(source, target_shape, output, output_chunks=None,
 
     target_shape = tuple(int(s) for s in target_shape)
     src_shape = tuple(int(s) for s in source.shape)
-    if int(np.prod(src_shape)) != int(np.prod(target_shape)):
+    if int(np.prod(src_shape, dtype=np.int64)) != int(np.prod(target_shape, dtype=np.int64)):
         raise ValueError(f"reshape needs equal size: {src_shape} -> {target_shape}")
     dt = parse_dtype(dtype if dtype is not None else source.dtype)[0]
 
-    N = int(np.prod(target_shape))
+    N = int(np.prod(target_shape, dtype=np.int64))
     if output_chunks is None:
         output_chunks = ((min(N, 1 << 20),) if len(target_shape) == 1
                          else tuple(min(s, 256) for s in target_shape))

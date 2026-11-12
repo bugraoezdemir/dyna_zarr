@@ -697,8 +697,8 @@ class ReshapeTransform(Transform):
         self.new_shape = shape
         
         # Validate reshape is possible
-        if np.prod(array.shape) != np.prod(shape):
-            raise ValueError(f"Cannot reshape array of size {np.prod(array.shape)} into shape {shape}")
+        if np.prod(array.shape, dtype=np.int64) != np.prod(shape, dtype=np.int64):
+            raise ValueError(f"Cannot reshape array of size {np.prod(array.shape, dtype=np.int64)} into shape {shape}")
         
         self.shape = tuple(shape)
         self.chunks = None  # Reshaping invalidates chunk alignment
@@ -810,7 +810,7 @@ class FlattenTransform(Transform):
         # int(), not the np.int64 np.prod returns: the shape tuple is compared and
         # formatted all over the writer, and a numpy scalar there prints as
         # "np.int64(1048576)".
-        self.shape = (int(np.prod(array.shape)),)
+        self.shape = (int(np.prod(array.shape, dtype=np.int64)),)
         self.chunks = None
         self.dtype = array.dtype
     
