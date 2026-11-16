@@ -203,15 +203,7 @@ class ConcatenateTransform(Transform):
             # Single array - no concatenation needed
             result = arrays_to_read[0][0]._read_direct(arrays_to_read[0][1])
         else:
-            # Multiple arrays - concatenate
-            # Collect data from all arrays in order
-            result_parts = []
-            for arr, local_key, _ in arrays_to_read:
-                # Use _read_direct to avoid creating more SliceTransforms
-                data = arr._read_direct(local_key)
-                result_parts.append(data)
-            
-            result = np.concatenate(result_parts, axis=self.axis)
+            result = self._read_parts(arrays_to_read, normalized_key)
 
         # Re-apply the step on the concat axis (routing above read the contiguous span).
         if step != 1:
@@ -224,6 +216,78 @@ class ConcatenateTransform(Transform):
             result = np.squeeze(result, axis=ax)
 
         return result
+
+
+    def _read_parts(self, parts, key):
+        """The parts ``(array, local key, length on the axis)`` read into one array,
+        each into its slice: no second copy (``np.concatenate`` held every part
+        and the result at once), and, where the sources allow, one ``read_many``
+        call for all of them (``_read_many``)."""
+        axis = self.axis
+
+        def place(out, at, n):
+            index = [slice(None)] * out.ndim
+            index[axis] = slice(at, at + n)
+            return out[tuple(index)]
+
+        total = sum(n for _, _, n in parts)
+        dtype = np.result_type(*(arr.dtype for arr, _, _ in parts))
+        # unit-step slices of the concat axis; the other axes as the key asks
+        shape = [total if i == axis else len(range(*k.indices(size)))
+                 for i, (k, size) in enumerate(zip(key, self.shape))]
+        out = np.empty(shape, dtype=dtype)
+        places, at = [], 0
+        for arr, local_key, n in parts:
+            places.append((arr, local_key, place(out, at, n)))
+            at += n
+        if _read_many(places):
+            return out
+        # one part at a time, into an array of the first part's kind (numpy or cupy)
+        first = places[0][0]._read_direct(places[0][1])
+        xp = array_namespace(first)
+        if xp is not np:
+            out = xp.empty(first.shape[:axis] + (total,) + first.shape[axis + 1:], dtype=dtype)
+        elif first.shape != places[0][2].shape:
+            out = np.empty(first.shape[:axis] + (total,) + first.shape[axis + 1:], dtype=dtype)
+        place(out, 0, parts[0][2])[...] = first
+        del first
+        at = parts[0][2]
+        for k, (arr, local_key, n) in enumerate(parts[1:], 1):
+            data = arr._read_direct(local_key)
+            if array_namespace(data) is not xp:
+                # parts on different devices: joined as np.concatenate joins them
+                rest = [data] + [a._read_direct(lk) for a, lk, _ in parts[k + 1:]]
+                head = place(out, 0, at)
+                return array_namespace(head, *rest).concatenate([head] + rest, axis=axis)
+            place(out, at, n)[...] = data
+            at += n
+        return out
+
+
+def _read_many(places) -> bool:
+    """Read ``(array, key, out)`` *places* in one call when every array is a plain
+    source (no transform, no lock, not dask) read with unit steps, whose type
+    offers ``read_many(requests)`` -- the same one for all, taking
+    ``(source, key, out)`` triples and filling each *out* with ``source[key]``
+    (``micro_reader.Image.read_many``: the strips and tiles of many files read
+    and decoded together, with the GIL released). False when not."""
+    from ..dynamic_array import _SourceAdapter
+    sources = []
+    for arr, key, out in places:
+        adapter = arr._zarr_array if arr._transform is None else None
+        if (not isinstance(adapter, _SourceAdapter) or adapter._lock is not None
+                or adapter._dask or adapter._is_plain_strided(key)):
+            return False
+        source = adapter._source
+        if out.dtype != source.dtype:
+            return False
+        sources.append(source)
+    reader = getattr(type(sources[0]), "read_many", None)
+    if not callable(reader) or any(getattr(type(s), "read_many", None) is not reader
+                                   for s in sources[1:]):
+        return False
+    reader([(source, key, out) for source, (_, key, out) in zip(sources, places)])
+    return True
 
 
 class StackTransform(Transform):
