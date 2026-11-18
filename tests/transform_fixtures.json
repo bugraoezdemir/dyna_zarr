@@ -1,0 +1,1724 @@
+{
+ "about": "Expected values from ome_zarr_pyramid's spatial model (and the NGFF 0.6 text for rotation / mapAxis), written by core/scripts/make_transform_fixtures.py",
+ "ozp_version": "0.6.1",
+ "cases": [
+  {
+   "json": {
+    "type": "identity"
+   },
+   "ndim": 3,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "identity"
+   },
+   "matrix": [
+    [
+     1.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     1.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": [
+    [
+     1.0,
+     1.0,
+     1.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "inverse": {
+    "json": {
+     "type": "identity"
+    },
+    "matrix": [
+     [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      1.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": {
+    "type": "translation",
+    "translation": [
+     1.5,
+     -2.0,
+     30.0
+    ]
+   },
+   "ndim": 3,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "translation",
+    "translation": [
+     1.5,
+     -2.0,
+     30.0
+    ]
+   },
+   "matrix": [
+    [
+     1.0,
+     0.0,
+     0.0,
+     1.5
+    ],
+    [
+     0.0,
+     1.0,
+     0.0,
+     -2.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0,
+     30.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": [
+    [
+     1.0,
+     1.0,
+     1.0
+    ],
+    [
+     1.5,
+     -2.0,
+     30.0
+    ]
+   ],
+   "inverse": {
+    "json": {
+     "type": "translation",
+     "translation": [
+      -1.5,
+      2.0,
+      -30.0
+     ]
+    },
+    "matrix": [
+     [
+      1.0,
+      0.0,
+      0.0,
+      -1.5
+     ],
+     [
+      0.0,
+      1.0,
+      0.0,
+      2.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0,
+      -30.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": {
+    "type": "scale",
+    "scale": [
+     2.0,
+     0.65,
+     0.65
+    ]
+   },
+   "ndim": 3,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "scale",
+    "scale": [
+     2.0,
+     0.65,
+     0.65
+    ]
+   },
+   "matrix": [
+    [
+     2.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.65,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.65,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": [
+    [
+     2.0,
+     0.65,
+     0.65
+    ],
+    [
+     0.0,
+     0.0,
+     0.0
+    ]
+   ],
+   "inverse": {
+    "json": {
+     "type": "scale",
+     "scale": [
+      0.5,
+      1.5384615384615383,
+      1.5384615384615383
+     ]
+    },
+    "matrix": [
+     [
+      0.5,
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      1.5384615384615383,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.5384615384615383,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": {
+    "type": "scale",
+    "scale": [
+     0.0,
+     1.0
+    ]
+   },
+   "ndim": 2,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "scale",
+    "scale": [
+     0.0,
+     1.0
+    ]
+   },
+   "matrix": [
+    [
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     1.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": [
+    [
+     0.0,
+     1.0
+    ],
+    [
+     0.0,
+     0.0
+    ]
+   ],
+   "inverse_error": "scale : singular, it has no inverse"
+  },
+  {
+   "json": {
+    "type": "affine",
+    "affine": [
+     [
+      0.8,
+      -0.6,
+      5.0
+     ],
+     [
+      0.6,
+      0.8,
+      -3.0
+     ]
+    ]
+   },
+   "ndim": 2,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "affine",
+    "affine": [
+     [
+      0.8,
+      -0.6,
+      5.0
+     ],
+     [
+      0.6,
+      0.8,
+      -3.0
+     ]
+    ]
+   },
+   "matrix": [
+    [
+     0.8,
+     -0.6,
+     5.0
+    ],
+    [
+     0.6,
+     0.8,
+     -3.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": null,
+   "inverse": {
+    "json": {
+     "type": "affine",
+     "affine": [
+      [
+       0.7999999999999998,
+       0.6,
+       -2.1999999999999997
+      ],
+      [
+       -0.6000000000000001,
+       0.8,
+       5.4
+      ]
+     ]
+    },
+    "matrix": [
+     [
+      0.7999999999999998,
+      0.6,
+      -2.1999999999999997
+     ],
+     [
+      -0.6000000000000001,
+      0.8,
+      5.4
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": {
+    "type": "affine",
+    "affine": [
+     0.8,
+     -0.6,
+     5.0,
+     0.6,
+     0.8,
+     -3.0
+    ]
+   },
+   "ndim": 2,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "affine",
+    "affine": [
+     0.8,
+     -0.6,
+     5.0,
+     0.6,
+     0.8,
+     -3.0
+    ]
+   },
+   "matrix": [
+    [
+     0.8,
+     -0.6,
+     5.0
+    ],
+    [
+     0.6,
+     0.8,
+     -3.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": null,
+   "inverse": {
+    "json": {
+     "type": "affine",
+     "affine": [
+      [
+       0.7999999999999998,
+       0.6,
+       -2.1999999999999997
+      ],
+      [
+       -0.6000000000000001,
+       0.8,
+       5.4
+      ]
+     ]
+    },
+    "matrix": [
+     [
+      0.7999999999999998,
+      0.6,
+      -2.1999999999999997
+     ],
+     [
+      -0.6000000000000001,
+      0.8,
+      5.4
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": {
+    "type": "affine",
+    "affine": [
+     [
+      2.0,
+      0.0,
+      1.0
+     ],
+     [
+      0.0,
+      3.0,
+      4.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   },
+   "ndim": 2,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "affine",
+    "affine": [
+     [
+      2.0,
+      0.0,
+      1.0
+     ],
+     [
+      0.0,
+      3.0,
+      4.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   },
+   "matrix": [
+    [
+     2.0,
+     0.0,
+     1.0
+    ],
+    [
+     0.0,
+     3.0,
+     4.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": [
+    [
+     2.0,
+     3.0
+    ],
+    [
+     1.0,
+     4.0
+    ]
+   ],
+   "inverse": {
+    "json": {
+     "type": "sequence",
+     "transformations": [
+      {
+       "type": "scale",
+       "scale": [
+        0.5,
+        0.3333333333333333
+       ]
+      },
+      {
+       "type": "translation",
+       "translation": [
+        -0.5,
+        -1.3333333333333333
+       ]
+      }
+     ]
+    },
+    "matrix": [
+     [
+      0.5,
+      0.0,
+      -0.5
+     ],
+     [
+      0.0,
+      0.3333333333333333,
+      -1.3333333333333333
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": {
+    "type": "affine",
+    "affine": [
+     [
+      1.0,
+      0.3,
+      0.0,
+      -7.2
+     ],
+     [
+      0.0,
+      1.0,
+      0.1,
+      11.6
+     ],
+     [
+      0.2,
+      0.0,
+      1.0,
+      0.5
+     ]
+    ]
+   },
+   "ndim": 3,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "affine",
+    "affine": [
+     [
+      1.0,
+      0.3,
+      0.0,
+      -7.2
+     ],
+     [
+      0.0,
+      1.0,
+      0.1,
+      11.6
+     ],
+     [
+      0.2,
+      0.0,
+      1.0,
+      0.5
+     ]
+    ]
+   },
+   "matrix": [
+    [
+     1.0,
+     0.3,
+     0.0,
+     -7.2
+    ],
+    [
+     0.0,
+     1.0,
+     0.1,
+     11.6
+    ],
+    [
+     0.2,
+     0.0,
+     1.0,
+     0.5
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": null,
+   "inverse": {
+    "json": {
+     "type": "affine",
+     "affine": [
+      [
+       0.9940357852882704,
+       -0.2982107355864811,
+       0.02982107355864811,
+       10.601391650099403
+      ],
+      [
+       0.01988071570576541,
+       0.9940357852882704,
+       -0.09940357852882704,
+       -11.33797216699801
+      ],
+      [
+       -0.1988071570576541,
+       0.05964214711729622,
+       0.9940357852882704,
+       -2.620278330019881
+      ]
+     ]
+    },
+    "matrix": [
+     [
+      0.9940357852882704,
+      -0.2982107355864811,
+      0.02982107355864811,
+      10.601391650099403
+     ],
+     [
+      0.01988071570576541,
+      0.9940357852882704,
+      -0.09940357852882704,
+      -11.33797216699801
+     ],
+     [
+      -0.1988071570576541,
+      0.05964214711729622,
+      0.9940357852882704,
+      -2.620278330019881
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": {
+    "type": "affine",
+    "affine": [
+     [
+      1.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      1.0,
+      0.0
+     ],
+     [
+      0.0,
+      1.0,
+      0.0
+     ]
+    ]
+   },
+   "ndim": 3,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "affine",
+    "affine": [
+     [
+      1.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      1.0,
+      0.0
+     ],
+     [
+      0.0,
+      1.0,
+      0.0
+     ]
+    ]
+   },
+   "error": "affine of shape (3, 3): ozp models an affine that keeps the number of axes (3 x 4); one that changes it is carried as read"
+  },
+  {
+   "json": {
+    "type": "affine",
+    "path": "coefficients"
+   },
+   "ndim": 2,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "affine",
+    "path": "coefficients"
+   },
+   "error": "affine : its parameters are in the Zarr array 'coefficients'; ozp carries such an edge as read and does not model it"
+  },
+  {
+   "json": {
+    "type": "sequence",
+    "input": {
+     "path": "0"
+    },
+    "output": {
+     "name": "physical"
+    },
+    "transformations": [
+     {
+      "type": "scale",
+      "scale": [
+       1.0,
+       0.5,
+       0.5
+      ]
+     },
+     {
+      "type": "translation",
+      "translation": [
+       0.0,
+       10.0,
+       -4.0
+      ]
+     }
+    ]
+   },
+   "ndim": 3,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "sequence",
+    "input": {
+     "name": "None",
+     "path": "0"
+    },
+    "output": {
+     "name": "physical"
+    },
+    "transformations": [
+     {
+      "type": "scale",
+      "scale": [
+       1.0,
+       0.5,
+       0.5
+      ]
+     },
+     {
+      "type": "translation",
+      "translation": [
+       0.0,
+       10.0,
+       -4.0
+      ]
+     }
+    ]
+   },
+   "matrix": [
+    [
+     1.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.5,
+     0.0,
+     10.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.5,
+     -4.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": [
+    [
+     1.0,
+     0.5,
+     0.5
+    ],
+    [
+     0.0,
+     10.0,
+     -4.0
+    ]
+   ],
+   "inverse": {
+    "json": {
+     "type": "sequence",
+     "input": {
+      "name": "physical"
+     },
+     "output": {
+      "name": "None",
+      "path": "0"
+     },
+     "transformations": [
+      {
+       "type": "scale",
+       "scale": [
+        1.0,
+        2.0,
+        2.0
+       ]
+      },
+      {
+       "type": "translation",
+       "translation": [
+        0.0,
+        -20.0,
+        8.0
+       ]
+      }
+     ]
+    },
+    "matrix": [
+     [
+      1.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      2.0,
+      0.0,
+      -20.0
+     ],
+     [
+      0.0,
+      0.0,
+      2.0,
+      8.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": {
+    "type": "sequence",
+    "name": "reg",
+    "input": {
+     "name": "a"
+    },
+    "output": {
+     "name": "b"
+    },
+    "transformations": [
+     {
+      "type": "translation",
+      "translation": [
+       3.0,
+       4.0
+      ]
+     },
+     {
+      "type": "affine",
+      "affine": [
+       [
+        0.0,
+        -1.0,
+        0.0
+       ],
+       [
+        1.0,
+        0.0,
+        0.0
+       ]
+      ]
+     },
+     {
+      "type": "scale",
+      "scale": [
+       2.0,
+       2.0
+      ]
+     }
+    ]
+   },
+   "ndim": 2,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": true,
+   "round_trip": {
+    "type": "sequence",
+    "input": {
+     "name": "a"
+    },
+    "output": {
+     "name": "b"
+    },
+    "name": "reg",
+    "transformations": [
+     {
+      "type": "translation",
+      "translation": [
+       3.0,
+       4.0
+      ]
+     },
+     {
+      "type": "affine",
+      "affine": [
+       [
+        0.0,
+        -1.0,
+        0.0
+       ],
+       [
+        1.0,
+        0.0,
+        0.0
+       ]
+      ]
+     },
+     {
+      "type": "scale",
+      "scale": [
+       2.0,
+       2.0
+      ]
+     }
+    ]
+   },
+   "matrix": [
+    [
+     0.0,
+     -2.0,
+     -8.0
+    ],
+    [
+     2.0,
+     0.0,
+     6.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": null,
+   "inverse": {
+    "json": {
+     "type": "affine",
+     "input": {
+      "name": "b"
+     },
+     "output": {
+      "name": "a"
+     },
+     "name": "reg",
+     "affine": [
+      [
+       0.0,
+       0.5,
+       -3.0
+      ],
+      [
+       -0.5,
+       -0.0,
+       -4.0
+      ]
+     ]
+    },
+    "matrix": [
+     [
+      0.0,
+      0.5,
+      -3.0
+     ],
+     [
+      -0.5,
+      -0.0,
+      -4.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": {
+    "type": "displacements",
+    "path": "field",
+    "interpolation": "linear"
+   },
+   "ndim": 2,
+   "source": "ome_zarr_pyramid 0.6.1",
+   "modelled": false,
+   "round_trip": {
+    "type": "displacements",
+    "path": "field",
+    "interpolation": "linear"
+   },
+   "error": "transformation type 'displacements': ozp carries it as read and does not model it (modelled: identity, translation, scale, affine, sequence)"
+  },
+  {
+   "json": {
+    "type": "rotation",
+    "rotation": [
+     [
+      0.0,
+      -1.0
+     ],
+     [
+      1.0,
+      0.0
+     ]
+    ]
+   },
+   "ndim": 2,
+   "source": "spec",
+   "matrix": [
+    [
+     0.0,
+     -1.0,
+     0.0
+    ],
+    [
+     1.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": null,
+   "inverse_matrix": [
+    [
+     0.0,
+     1.0,
+     0.0
+    ],
+    [
+     -1.0,
+     -0.0,
+     -0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ]
+  },
+  {
+   "json": {
+    "type": "rotation",
+    "rotation": [
+     [
+      0.955336489125606,
+      -0.29552020666133955,
+      0.0
+     ],
+     [
+      0.29552020666133955,
+      0.955336489125606,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   },
+   "ndim": 3,
+   "source": "spec",
+   "matrix": [
+    [
+     0.955336489125606,
+     -0.29552020666133955,
+     0.0,
+     0.0
+    ],
+    [
+     0.29552020666133955,
+     0.955336489125606,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": null,
+   "inverse_matrix": [
+    [
+     0.955336489125606,
+     0.29552020666133955,
+     0.0,
+     0.0
+    ],
+    [
+     -0.29552020666133955,
+     0.9553364891256061,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ]
+  },
+  {
+   "json": {
+    "type": "rotation",
+    "rotation": [
+     [
+      1.0,
+      1.0
+     ],
+     [
+      0.0,
+      1.0
+     ]
+    ]
+   },
+   "ndim": 2,
+   "source": "spec",
+   "error": "not a rotation"
+  },
+  {
+   "json": {
+    "type": "mapAxis",
+    "mapAxis": [
+     1,
+     0
+    ]
+   },
+   "ndim": 2,
+   "source": "spec",
+   "matrix": [
+    [
+     0.0,
+     1.0,
+     0.0
+    ],
+    [
+     1.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": null,
+   "inverse_matrix": [
+    [
+     0.0,
+     1.0,
+     0.0
+    ],
+    [
+     1.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ]
+  },
+  {
+   "json": {
+    "type": "mapAxis",
+    "mapAxis": [
+     2,
+     0,
+     1
+    ]
+   },
+   "ndim": 3,
+   "source": "spec",
+   "matrix": [
+    [
+     0.0,
+     0.0,
+     1.0,
+     0.0
+    ],
+    [
+     1.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     1.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": null,
+   "inverse_matrix": [
+    [
+     0.0,
+     1.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0,
+     0.0
+    ],
+    [
+     1.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     0.0,
+     1.0
+    ]
+   ]
+  },
+  {
+   "json": {
+    "type": "mapAxis",
+    "mapAxis": [
+     0,
+     0,
+     1
+    ]
+   },
+   "ndim": 3,
+   "source": "spec",
+   "error": "not a permutation"
+  },
+  {
+   "json": {
+    "type": "sequence",
+    "transformations": [
+     {
+      "type": "mapAxis",
+      "mapAxis": [
+       1,
+       0
+      ]
+     },
+     {
+      "type": "scale",
+      "scale": [
+       2.0,
+       3.0
+      ]
+     }
+    ]
+   },
+   "ndim": 2,
+   "source": "spec",
+   "matrix": [
+    [
+     0.0,
+     2.0,
+     0.0
+    ],
+    [
+     3.0,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ],
+   "scale_translation": null,
+   "inverse_matrix": [
+    [
+     0.0,
+     0.3333333333333333,
+     0.0
+    ],
+    [
+     0.5,
+     0.0,
+     0.0
+    ],
+    [
+     0.0,
+     0.0,
+     1.0
+    ]
+   ]
+  }
+ ],
+ "compose": [
+  {
+   "json": [
+    {
+     "type": "scale",
+     "scale": [
+      2.0,
+      2.0
+     ]
+    },
+    {
+     "type": "scale",
+     "scale": [
+      0.5,
+      0.5
+     ]
+    }
+   ],
+   "ndim": 2,
+   "expected": {
+    "json": {
+     "type": "identity"
+    },
+    "matrix": [
+     [
+      1.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      1.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": [
+    {
+     "type": "scale",
+     "scale": [
+      2.0,
+      3.0
+     ]
+    },
+    {
+     "type": "translation",
+     "translation": [
+      1.0,
+      1.0
+     ]
+    }
+   ],
+   "ndim": 2,
+   "expected": {
+    "json": {
+     "type": "sequence",
+     "transformations": [
+      {
+       "type": "scale",
+       "scale": [
+        2.0,
+        3.0
+       ]
+      },
+      {
+       "type": "translation",
+       "translation": [
+        1.0,
+        1.0
+       ]
+      }
+     ]
+    },
+    "matrix": [
+     [
+      2.0,
+      0.0,
+      1.0
+     ],
+     [
+      0.0,
+      3.0,
+      1.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": [
+    {
+     "type": "translation",
+     "translation": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "type": "scale",
+     "scale": [
+      2.0,
+      3.0
+     ]
+    }
+   ],
+   "ndim": 2,
+   "expected": {
+    "json": {
+     "type": "sequence",
+     "transformations": [
+      {
+       "type": "scale",
+       "scale": [
+        2.0,
+        3.0
+       ]
+      },
+      {
+       "type": "translation",
+       "translation": [
+        2.0,
+        3.0
+       ]
+      }
+     ]
+    },
+    "matrix": [
+     [
+      2.0,
+      0.0,
+      2.0
+     ],
+     [
+      0.0,
+      3.0,
+      3.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": [
+    {
+     "type": "affine",
+     "affine": [
+      [
+       0.8,
+       -0.6,
+       5.0
+      ],
+      [
+       0.6,
+       0.8,
+       -3.0
+      ]
+     ]
+    },
+    {
+     "type": "affine",
+     "affine": [
+      [
+       0.8,
+       0.6,
+       0.0
+      ],
+      [
+       -0.6,
+       0.8,
+       0.0
+      ]
+     ]
+    }
+   ],
+   "ndim": 2,
+   "expected": {
+    "json": {
+     "type": "affine",
+     "affine": [
+      [
+       1.0,
+       2.6645352591003756e-17,
+       2.2
+      ],
+      [
+       2.6645352591003756e-17,
+       1.0,
+       -5.4
+      ]
+     ]
+    },
+    "matrix": [
+     [
+      1.0,
+      2.6645352591003756e-17,
+      2.2
+     ],
+     [
+      2.6645352591003756e-17,
+      1.0,
+      -5.4
+     ],
+     [
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  },
+  {
+   "json": [
+    {
+     "type": "translation",
+     "translation": [
+      0.0,
+      1.0,
+      2.0
+     ]
+    },
+    {
+     "type": "scale",
+     "scale": [
+      4.0,
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "type": "translation",
+     "translation": [
+      0.0,
+      -1.0,
+      -2.0
+     ]
+    }
+   ],
+   "ndim": 3,
+   "expected": {
+    "json": {
+     "type": "scale",
+     "scale": [
+      4.0,
+      1.0,
+      1.0
+     ]
+    },
+    "matrix": [
+     [
+      4.0,
+      0.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      1.0,
+      0.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+     ],
+     [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+     ]
+    ]
+   }
+  }
+ ]
+}
