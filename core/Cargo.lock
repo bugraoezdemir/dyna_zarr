@@ -275,11 +275,15 @@ dependencies = [
  "dyna-zarr-arrays",
  "dyna-zarr-transforms",
  "pyo3",
+ "serde_json",
 ]
 
 [[package]]
 name = "dyna-zarr-transforms"
 version = "0.0.1"
+dependencies = [
+ "serde_json",
+]
 
 [[package]]
 name = "either"

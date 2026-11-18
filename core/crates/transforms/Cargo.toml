@@ -8,3 +8,5 @@ publish = false
 description = "Coordinate transformations for dyna-zarr's engine: pure maths, no I/O (Workplan DR2)"
 
 [dependencies]
+# NGFF transformation objects in and out (MIT / Apache-2.0)
+serde_json = "1"

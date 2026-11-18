@@ -7,6 +7,8 @@
 //! (lazy arrays over zarrs, DR3-DR5). This crate only binds them. dyna keeps its
 //! Python path as the reference the tests compare with.
 
+mod transforms;
+
 use std::path::PathBuf;
 
 use pyo3::exceptions::PyValueError;
@@ -35,5 +37,13 @@ fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("TRANSFORMS_VERSION", dyna_zarr_transforms::VERSION)?;
     m.add("ARRAYS_VERSION", dyna_zarr_arrays::VERSION)?;
     m.add_function(wrap_pyfunction!(array_info, m)?)?;
+    // dyna_zarr_core.transforms (DR2): an attribute, so `from dyna_zarr_core import
+    // transforms` works; registered in sys.modules too, for `import dyna_zarr_core.transforms`
+    let sub = transforms::module(m.py())?;
+    m.add_submodule(&sub)?;
+    m.py()
+        .import("sys")?
+        .getattr("modules")?
+        .set_item("dyna_zarr_core.transforms", &sub)?;
     Ok(())
 }
