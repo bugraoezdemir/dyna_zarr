@@ -25,8 +25,40 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'release' }}
 
 jobs:
+  # dyna's native engine (core/, dyna-zarr-core; Workplan WP15): its wheels, built
+  # once per run. The test job below installs exactly these wheels, so the engine is
+  # tested on every OS and Python. install-check and floors do NOT install it: dyna
+  # does not require it yet, and they keep testing the Python path.
+  core:
+    uses: ./.github/workflows/build-core.yml
+
+  rust:
+    name: core crates (cargo test, clippy, fmt)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: test, lint and format check (toolchain from core/rust-toolchain.toml)
+        working-directory: core
+        run: |
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo fmt --all -- --check
+
+  licences:
+    name: core licence notices current
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: regenerate core/THIRD_PARTY_LICENSES.txt and compare
+        working-directory: core
+        run: |
+          cargo fetch --locked
+          python3 scripts/third_party_licenses.py
+          git diff --exit-code THIRD_PARTY_LICENSES.txt
+
   test:
     name: pytest (py${{ matrix.python-version }}, ${{ matrix.os }})
+    needs: core
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -49,10 +81,26 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-wheel-*
+          merge-multiple: true
+          path: wheels
+
+      - name: Install, with the engine wheels just built
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
+          # exactly the wheel of this run, even if PyPI has the same version
+          python -m pip install --no-index --find-links wheels --force-reinstall --no-deps dyna-zarr-core
+
+      - name: Fail if the engine is not available
+        # The engine tests (marker `engine`) SKIP without it; this makes a broken
+        # wheel a failed job instead of a green run that tested nothing native.
+        # DYNA_ZARR_ENGINE=1 requires it: _engine raises, naming why, if it is missing.
+        env:
+          DYNA_ZARR_ENGINE: "1"
+        run: python -c "from dyna_zarr import _engine; assert _engine.enabled(); print('dyna-zarr-core', _engine.version())"
 
       - name: Run tests
         # Core suite only: the optional backends get their own jobs below, so a

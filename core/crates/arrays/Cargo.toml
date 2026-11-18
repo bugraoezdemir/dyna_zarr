@@ -1,0 +1,17 @@
+[package]
+name = "dyna-zarr-arrays"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Lazy arrays over zarrs for dyna-zarr's engine (Workplan DR3-DR5)"
+
+[dependencies]
+# Zarr v2 / v3 reading and writing. Default features (filesystem, blosc, gzip, zstd,
+# crc32c, sharding, transpose, ndarray) plus zlib, which dyna writes too.
+zarrs = { version = "0.23", features = ["zlib"] }
+dyna-zarr-transforms = { path = "../transforms" }
+
+[dev-dependencies]
+tempfile = "3"

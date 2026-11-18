@@ -2,17 +2,25 @@ name: Publish to PyPI
 
 # Runs when you publish a GitHub Release (Releases -> Draft a new release -> Publish):
 #
-#   1. the release tag must equal the version in pyproject.toml (vX.Y.Z);
-#   2. the full test suite runs on the release's commit (tests.yml); nothing is
-#      published unless it passes;
-#   3. the sdist + wheel are built and uploaded to PyPI via Trusted Publishing (OIDC),
-#      no API token/secret required.
+#   1. the release tag must equal the version in pyproject.toml (vX.Y.Z), and if
+#      core/ changed since the previous release, the engine's version
+#      (core/Cargo.toml) must have been bumped;
+#   2. the full test suite runs on the release's commit (tests.yml, which also builds
+#      the engine's wheels and sdist); nothing is published unless it passes;
+#   3. dyna-zarr-core (the native engine, core/) is uploaded first, skipped when its
+#      version is already on PyPI;
+#   4. then dyna-zarr's sdist + wheel, via Trusted Publishing (OIDC), no API
+#      token/secret required.
 #
-# If only the upload failed, "Re-run failed jobs" on the run retries it. If the tests
+# If only an upload failed, "Re-run failed jobs" on the run retries it. If the tests
 # failed: fix, delete the release and its tag, and release again.
 #
-# Keep this file's name: the PyPI trusted publisher is registered for publish.yml
-# with environment pypi.
+# Keep this file's name: the PyPI trusted publishers are registered for publish.yml,
+# dyna-zarr with environment pypi and dyna-zarr-core with environment pypi-core.
+# One-time setup before the first release that contains core/: a PyPI pending
+# publisher for the project dyna-zarr-core (workflow publish.yml, environment
+# pypi-core) and the GitHub environment pypi-core. The environments must differ:
+# a pending publisher is matched by repository, workflow and environment only.
 on:
   release:
     types: [published]
@@ -26,12 +34,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0                  # every tag: the previous release
 
       - name: Release tag equals pyproject.toml's version
         run: |
           version=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
           test "v$version" = "${{ github.event.release.tag_name }}" \
             || { echo "::error::release tag ${{ github.event.release.tag_name }} != v$version (pyproject.toml)"; exit 1; }
+
+      - name: Engine version bumped if core/ changed since the previous release
+        run: |
+          previous=$(git tag --list 'v*' --sort=-v:refname | grep -vx "${{ github.event.release.tag_name }}" | head -n1)
+          if [ -z "$previous" ]; then echo "first release: nothing to compare"; exit 0; fi
+          if ! git cat-file -e "$previous:core/Cargo.toml" 2>/dev/null; then echo "core is new since $previous"; exit 0; fi
+          if git diff --quiet "$previous" HEAD -- core/; then echo "core unchanged since $previous"; exit 0; fi
+          now=$(python3 -c "import tomllib; print(tomllib.load(open('core/Cargo.toml', 'rb'))['package']['version'])")
+          before=$(git show "$previous:core/Cargo.toml" | python3 -c "import sys, tomllib; print(tomllib.loads(sys.stdin.read())['package']['version'])")
+          test "$now" != "$before" \
+            || { echo "::error::core/ changed since $previous but the engine's version is still $now: bump core/Cargo.toml"; exit 1; }
 
   tests:
     needs: checks
@@ -63,9 +84,45 @@ jobs:
           name: dist
           path: dist/
 
+  publish-core:
+    name: Publish dyna-zarr-core
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi-core                     # its own: see the setup note above
+      url: https://pypi.org/project/dyna-zarr-core/
+    permissions:
+      contents: read                      # a permissions block drops the defaults: keep read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      # skip-existing alone is not enough: it compares file names, and a newer maturin
+      # may order a wheel's platform tags differently, so a rebuilt unchanged version
+      # looks new (micro-reader, v0.4.0)
+      - name: Is this engine version already on PyPI?
+        id: pypi
+        run: |
+          version=$(python3 -c "import tomllib; print(tomllib.load(open('core/Cargo.toml', 'rb'))['package']['version'])")
+          status=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/dyna-zarr-core/$version/json")
+          case "$status" in
+            200) echo "dyna-zarr-core $version is on PyPI: not published again"; echo "exists=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "dyna-zarr-core $version is new: publishing"; echo "exists=false" >> "$GITHUB_OUTPUT" ;;
+            *)   echo "::error::PyPI answered $status for dyna-zarr-core $version"; exit 1 ;;
+          esac
+      - uses: actions/download-artifact@v4
+        if: steps.pypi.outputs.exists == 'false'
+        with:
+          pattern: core-*                 # every wheel and the sdist, built by tests.yml
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        if: steps.pypi.outputs.exists == 'false'
+        with:
+          skip-existing: true
+
   publish:
     name: Publish to PyPI
-    needs: build
+    needs: [build, publish-core]
     runs-on: ubuntu-latest
     # The GitHub environment must match the one set on the PyPI trusted publisher.
     environment:
