@@ -7,7 +7,15 @@
 //! (lazy arrays over zarrs, DR3-DR5). This crate only binds them. dyna keeps its
 //! Python path as the reference the tests compare with.
 
+mod arrays;
 mod transforms;
+
+/// mimalloc for everything Rust allocates in this module (Python's own memory is not
+/// affected). Decoding a chunk allocates a buffer of the chunk's size; the system
+/// allocators map such blocks fresh each time (page faults on every chunk), which made
+/// reads 2-3.5x slower on Windows (Cargo.toml).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::path::PathBuf;
 
@@ -37,6 +45,11 @@ fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("TRANSFORMS_VERSION", dyna_zarr_transforms::VERSION)?;
     m.add("ARRAYS_VERSION", dyna_zarr_arrays::VERSION)?;
     m.add_function(wrap_pyfunction!(array_info, m)?)?;
+    // lazy arrays (DR3)
+    m.add_class::<arrays::Array>()?;
+    m.add("ReadError", m.py().get_type::<arrays::ReadError>())?;
+    m.add_function(wrap_pyfunction!(arrays::concatenate, m)?)?;
+    m.add_function(wrap_pyfunction!(arrays::stack, m)?)?;
     // dyna_zarr_core.transforms (DR2): an attribute, so `from dyna_zarr_core import
     // transforms` works; registered in sys.modules too, for `import dyna_zarr_core.transforms`
     let sub = transforms::module(m.py())?;

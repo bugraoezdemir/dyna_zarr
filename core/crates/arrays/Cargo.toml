@@ -11,7 +11,24 @@ description = "Lazy arrays over zarrs for dyna-zarr's engine (Workplan DR3-DR5)"
 # Zarr v2 / v3 reading and writing. Default features (filesystem, blosc, gzip, zstd,
 # crc32c, sharding, transpose, ndarray) plus zlib, which dyna writes too.
 zarrs = { version = "0.23", features = ["zlib"] }
+# Zarr inside a finished zip (zarr-zip / dyna's io.open_zip output), read-only
+zarrs_zip = "0.5"
+# the destination buffer shared by disjoint writers, as zarrs' decode-into takes it
+unsafe_cell_slice = "0.2"
+# thread pools per read (zarrs decodes chunks in parallel on the current pool)
+rayon = "1"
+# element conversion between types; float16 (both already used by zarrs)
+num-traits = "0.2"
+half = "2"
+# the stored metadata out as JSON
+serde_json = "1"
 dyna-zarr-transforms = { path = "../transforms" }
 
 [dev-dependencies]
 tempfile = "3"
+# examples/read_bench.rs allocates as the Python module does
+mimalloc = "0.1"
+
+[lints.rust]
+# `--cfg system_alloc` (examples/read_bench.rs) measures the system allocator
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_alloc)"] }
