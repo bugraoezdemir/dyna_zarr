@@ -13,9 +13,11 @@ mod transforms;
 /// mimalloc for everything Rust allocates in this module (Python's own memory is not
 /// affected). Decoding a chunk allocates a buffer of the chunk's size; the system
 /// allocators map such blocks fresh each time (page faults on every chunk), which made
-/// reads 2-3.5x slower on Windows (Cargo.toml).
+/// reads 2-3.5x slower on Windows (Cargo.toml). Counted (decision DR-5), so tests and
+/// writes can compare a read's real peak with its cost.
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: dyna_zarr_arrays::memory::Counting<mimalloc::MiMalloc> =
+    dyna_zarr_arrays::memory::Counting(mimalloc::MiMalloc);
 
 use std::path::PathBuf;
 
@@ -41,12 +43,19 @@ fn array_info<'py>(py: Python<'py>, path: PathBuf) -> PyResult<Bound<'py, PyDict
 
 #[pymodule]
 fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // reads run on the engine's own pools; anything reaching for rayon's global pool
+    // gets one thread, not one per core (Workplan decision DR-5)
+    dyna_zarr_arrays::pool::limit_global_pool();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("TRANSFORMS_VERSION", dyna_zarr_transforms::VERSION)?;
     m.add("ARRAYS_VERSION", dyna_zarr_arrays::VERSION)?;
     m.add_function(wrap_pyfunction!(array_info, m)?)?;
     // lazy arrays (DR3)
     m.add_class::<arrays::Array>()?;
+    m.add_class::<arrays::Pool>()?;
+    m.add_function(wrap_pyfunction!(arrays::memory_in_use, m)?)?;
+    m.add_function(wrap_pyfunction!(arrays::memory_peak, m)?)?;
+    m.add_function(wrap_pyfunction!(arrays::reset_memory_peak, m)?)?;
     m.add("ReadError", m.py().get_type::<arrays::ReadError>())?;
     m.add_function(wrap_pyfunction!(arrays::concatenate, m)?)?;
     m.add_function(wrap_pyfunction!(arrays::stack, m)?)?;

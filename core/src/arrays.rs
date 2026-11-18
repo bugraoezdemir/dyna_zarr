@@ -21,6 +21,58 @@ fn err(e: ar::ReadError) -> PyErr {
     ReadError::new_err(e.message)
 }
 
+/// A fixed set of threads that reads run on (Workplan decision DR-5). A write makes one
+/// with its max_threads and runs every region's read on it: the threads busy at once
+/// never exceed `threads`, however many reads share it. A read's own `threads` caps its
+/// memory (how many of its pieces are open at once), not the pool.
+#[pyclass(frozen, module = "dyna_zarr_core")]
+pub struct Pool {
+    pool: Arc<ar::pool::ThreadPool>,
+    threads: usize,
+}
+
+#[pymethods]
+impl Pool {
+    #[new]
+    fn new(threads: usize) -> PyResult<Self> {
+        if threads < 1 {
+            return Err(PyValueError::new_err("a pool needs at least 1 thread"));
+        }
+        Ok(Self {
+            pool: ar::pool::new_pool(threads).map_err(err)?,
+            threads,
+        })
+    }
+
+    #[getter]
+    fn threads(&self) -> usize {
+        self.threads
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<dyna_zarr_core.Pool {} threads>", self.threads)
+    }
+}
+
+/// Bytes the engine has allocated now (Rust's heap; NumPy arrays are not included).
+#[pyfunction]
+pub fn memory_in_use() -> usize {
+    ar::memory::in_use()
+}
+
+/// The most bytes the engine had allocated at once since `reset_memory_peak()`.
+#[pyfunction]
+pub fn memory_peak() -> usize {
+    ar::memory::peak()
+}
+
+/// Start a new peak from what is allocated now; returns that. The counts are
+/// process-wide: measure one read at a time.
+#[pyfunction]
+pub fn reset_memory_peak() -> usize {
+    ar::memory::reset_peak()
+}
+
 /// A lazy array read by dyna's engine: a Zarr array, or a view over arrays.
 #[pyclass(frozen, module = "dyna_zarr_core")]
 pub struct Array {
@@ -45,6 +97,7 @@ impl Array {
     }
 
     /// Read `start .. stop` into `out` (or a new array) at `at`.
+    #[allow(clippy::too_many_arguments)]
     fn read_region(
         &self,
         py: Python<'_>,
@@ -53,7 +106,11 @@ impl Array {
         out: Option<Bound<'_, PyAny>>,
         at: Option<Vec<u64>>,
         threads: usize,
+        pool: Option<Arc<ar::pool::ThreadPool>>,
     ) -> PyResult<Py<PyAny>> {
+        if threads < 1 {
+            return Err(PyValueError::new_err("threads must be >= 1"));
+        }
         let region = ar::region(self.src.shape(), &start, &stop).map_err(err)?;
         let dtype = self.src.dtype();
         let np = py.import("numpy")?;
@@ -91,11 +148,17 @@ impl Array {
         let (ptr, len) = (buf.buf_ptr() as usize, buf.len_bytes());
         let src = self.src.clone();
         py.detach(move || {
-            // SAFETY: the buffer export above keeps the memory alive and in place for the
-            // call; the region written lies inside it (Out::new and read_into check).
-            let bytes = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len) };
-            let dst = ar::Out::new(bytes, &shape, &at, dtype)?;
-            src.read_into(&start, &stop, &dst, threads)
+            let run = move || {
+                // SAFETY: the buffer export above keeps the memory alive and in place for
+                // the call; the region written lies inside it (Out::new and read_into
+                // check).
+                let bytes = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+                let dst = ar::Out::new(bytes, &shape, &at, dtype)?;
+                src.read_into(&start, &stop, &dst, threads)
+            };
+            // the given pool; else the shared pool of `threads`; else this thread's own
+            // one-thread pool
+            ar::pool::enter(threads, pool.as_deref(), run)?
         })
         .map_err(err)?;
         drop(buf);
@@ -140,7 +203,8 @@ impl Array {
         self.src.dtype().name()
     }
 
-    /// The storage grid underneath (the chunk or shard shape), or None.
+    /// The storage grid underneath (the chunk or shard shape); for a view, that grid in
+    /// the view's elements (a downsampled level: divided by the factors), or None.
     #[getter]
     fn chunks<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
         self.src.grid().map(|g| PyTuple::new(py, g)).transpose()
@@ -176,9 +240,15 @@ impl Array {
     }
 
     /// Read the region `start .. stop` into `out` at `at` (a writable C-contiguous NumPy
-    /// array of this dtype; a new one of the region's shape when None), on `threads`
-    /// threads, without the GIL. Returns `out`.
-    #[pyo3(signature = (start, stop, out = None, at = None, threads = 1))]
+    /// array of this dtype; a new one of the region's shape when None), without the GIL.
+    /// Returns `out`.
+    ///
+    /// `threads` caps the read's memory: at most that many of its buffer-holding pieces
+    /// at once, which `cost(start, stop, threads)` bounds. It runs on `pool` (a
+    /// `Pool`: a write's threads, shared by all its reads); without one, on the shared
+    /// pool of `threads` threads, and with `threads=1` on the calling thread.
+    #[pyo3(signature = (start, stop, out = None, at = None, threads = 1, pool = None))]
+    #[allow(clippy::too_many_arguments)]
     fn read(
         &self,
         py: Python<'_>,
@@ -187,8 +257,20 @@ impl Array {
         out: Option<Bound<'_, PyAny>>,
         at: Option<Vec<u64>>,
         threads: usize,
+        pool: Option<PyRef<'_, Pool>>,
     ) -> PyResult<Py<PyAny>> {
-        self.read_region(py, start, stop, out, at, threads)
+        let pool = pool.map(|p| p.pool.clone());
+        self.read_region(py, start, stop, out, at, threads, pool)
+    }
+
+    /// The most bytes reading `start .. stop` with `threads` holds at once, beyond the
+    /// destination: an upper bound for planning memory (Workplan decision DR-5).
+    #[pyo3(signature = (start, stop, threads = 1))]
+    fn cost(&self, start: Vec<u64>, stop: Vec<u64>, threads: usize) -> PyResult<u64> {
+        if threads < 1 {
+            return Err(PyValueError::new_err("threads must be >= 1"));
+        }
+        ar::read_cost(self.src.as_ref(), &start, &stop, threads).map_err(err)
     }
 
     /// NumPy-style basic indexing (ints, slices with a positive step, Ellipsis, None),
@@ -196,7 +278,7 @@ impl Array {
     fn __getitem__(&self, py: Python<'_>, key: &Bound<'_, PyAny>) -> PyResult<Py<PyAny>> {
         let view = self.index(key)?;
         let shape = view.src.shape().to_vec();
-        view.read_region(py, vec![0; shape.len()], shape, None, None, 1)
+        view.read_region(py, vec![0; shape.len()], shape, None, None, 1, None)
     }
 
     /// The lazy view `self[key]` (basic indexing as __getitem__, nothing read).
@@ -312,6 +394,61 @@ impl Array {
         Ok(Self::view(
             ar::Cast::new(self.src.clone(), to).map_err(err)?,
         ))
+    }
+
+    /// The array downsampled by integer `factors` (one per axis), ceil-sized as ozp's
+    /// levels. `method`: "mean" (exactly tensorstore.downsample's), "stride" (every
+    /// f-th element; ozp's "simple") or "gaussian" (a Gaussian low-pass, then every
+    /// f-th sample; `sigma` per axis, default f / 3 on downscaled axes; `mode`
+    /// "reflect", "mirror", "nearest" or "constant" with `cval`; `truncate` in sigmas,
+    /// as scipy.ndimage.gaussian_filter). Lazy: nothing is read until asked.
+    #[pyo3(signature = (factors, method = "mean", sigma = None, mode = "reflect", cval = 0.0, truncate = 4.0, max_read_mb = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn downsample(
+        &self,
+        factors: Vec<u64>,
+        method: &str,
+        sigma: Option<Vec<f64>>,
+        mode: &str,
+        cval: f64,
+        truncate: f64,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let bytes = max_read_mb.map(|mb| (mb * 1048576.0) as u64);
+        match method {
+            "stride" | "simple" => Ok(Self::view(
+                ar::stride(self.src.clone(), &factors).map_err(err)?,
+            )),
+            "mean" => {
+                let mut m = ar::Mean::new(self.src.clone(), &factors).map_err(err)?;
+                if let Some(b) = bytes {
+                    m = m.with_max_read(b);
+                }
+                Ok(Self::view(m))
+            }
+            "gaussian" => {
+                let boundary = ar::Boundary::parse(mode, cval).ok_or_else(|| {
+                    ReadError::new_err(format!(
+                        "mode {mode:?}: use \"reflect\", \"mirror\", \"nearest\" or \"constant\""
+                    ))
+                })?;
+                let mut g = ar::Gaussian::new(
+                    self.src.clone(),
+                    &factors,
+                    sigma.as_deref(),
+                    boundary,
+                    truncate,
+                )
+                .map_err(err)?;
+                if let Some(b) = bytes {
+                    g = g.with_max_read(b);
+                }
+                Ok(Self::view(g))
+            }
+            other => Err(ReadError::new_err(format!(
+                "method {other:?}: use \"mean\", \"stride\" or \"gaussian\""
+            ))),
+        }
     }
 
     /// The array resampled onto a grid of `shape`: output index o takes the value at

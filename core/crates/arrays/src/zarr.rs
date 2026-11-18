@@ -1,11 +1,15 @@
 //! Zarr v2 / v3 arrays read with zarrs: in a local folder, or inside a finished zip.
-//! A region is decoded straight into the destination (zarrs' decode-into), chunks in
-//! parallel on the read's thread pool.
+//! A region is decoded straight into the destination (zarrs' decode-into), at most
+//! `threads` chunks (inner chunks, when sharded) at once.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use zarrs::array::{Array, ArrayBytesFixedDisjointView, ArrayMetadata, ArraySubset, CodecOptions};
+use zarrs::array::concurrency::concurrency_chunks_and_codec;
+use zarrs::array::{
+    Array, ArrayBytesFixedDisjointView, ArrayCodecTraits, ArrayMetadata, ArrayShardedExt,
+    ArraySubset, CodecOptions,
+};
 use zarrs::filesystem::FilesystemStore;
 use zarrs::plugin::{ExtensionName, ZarrVersion};
 use zarrs::storage::{ReadableStorage, StoreKey};
@@ -13,9 +17,13 @@ use zarrs_zip::ZipStorageAdapter;
 
 use crate::dtype::DType;
 use crate::out::Out;
-use crate::pool::pool;
-use crate::source::{region, Source};
+use crate::pool::{install, new_pool};
+use crate::source::{bytes_of, region, Source, SMALL};
 use crate::ReadError;
+
+/// Small allocations per chunk decoded (keys, subsets, codec state), on top of its
+/// encoded and decoded bytes.
+const PER_CHUNK_EXTRA: u64 = 16 << 10;
 
 /// A Zarr array, opened read-only.
 pub struct ZarrArray {
@@ -24,6 +32,9 @@ pub struct ZarrArray {
     shape: Vec<u64>,
     dtype: DType,
     chunks: Vec<u64>,
+    /// What is decoded at once: the inner chunk when sharded, else the chunk.
+    unit: Vec<u64>,
+    sharded: bool,
     zarr_format: u8,
 }
 
@@ -81,7 +92,7 @@ impl ZarrArray {
             .map_or_else(|| array.data_type().to_string(), |n| n.into_owned());
         let dtype =
             DType::parse(&name).map_err(|e| ReadError::new(format!("{label}: {}", e.message)))?;
-        let chunks = array
+        let chunks: Vec<u64> = array
             .chunk_shape(&vec![0u64; shape.len()])
             .map_err(|e| ReadError::new(format!("{label}: no chunk shape: {e}")))?
             .iter()
@@ -91,14 +102,58 @@ impl ZarrArray {
             ArrayMetadata::V2(_) => 2,
             ArrayMetadata::V3(_) => 3,
         };
+        let sharded = array.is_sharded();
+        let unit = match array.effective_subchunk_shape() {
+            Some(s) if sharded => s.iter().map(|c| c.get()).collect(),
+            _ => chunks.clone(),
+        };
         Ok(Self {
             array,
             label,
             shape,
             dtype,
             chunks,
+            unit,
+            sharded,
             zarr_format,
         })
+    }
+
+    /// zarrs' options for a read with `threads`: exactly `threads` as the target, and
+    /// no minimum of chunks at once (zarrs' default of 4 would run 4 chunks, on rayon's
+    /// global pool, even for one thread).
+    fn options(threads: usize) -> CodecOptions {
+        // CodecOptions::default() asks rayon for its thread count, which outside a pool
+        // starts rayon's global pool: made once, on a pool's thread
+        static BASE: OnceLock<CodecOptions> = OnceLock::new();
+        let base = *BASE.get_or_init(|| {
+            if rayon::current_thread_index().is_some() {
+                CodecOptions::default()
+            } else {
+                new_pool(1)
+                    .map(|p| p.install(CodecOptions::default))
+                    .unwrap_or_default()
+            }
+        });
+        base.with_concurrent_target(threads.max(1))
+            .with_chunk_concurrent_minimum(1)
+    }
+
+    /// Whether the region `start .. start + r` contains a whole chunk (an edge chunk
+    /// counts as whole up to the array's end).
+    fn covers_a_chunk(&self, start: &[u64], r: &[u64]) -> bool {
+        (0..r.len()).all(|i| {
+            let (a, b, c) = (start[i], start[i] + r[i], self.chunks[i]);
+            let first = a.div_ceil(c) * c;
+            first < self.shape[i] && (first + c).min(self.shape[i]) <= b
+        })
+    }
+
+    /// Chunks of `grid` the region `start .. start + r` touches.
+    fn touched(start: &[u64], r: &[u64], grid: &[u64]) -> u64 {
+        (0..r.len())
+            .map(|i| (start[i] + r[i] - 1) / grid[i] - start[i] / grid[i] + 1)
+            .product()
     }
 
     /// The shape of the first chunk (the read grid; with sharding, the shard).
@@ -152,12 +207,71 @@ impl Source for ZarrArray {
             ArrayBytesFixedDisjointView::new(out.buf, self.dtype.size(), &out.shape, target_subset)
         }
         .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
-        let options = CodecOptions::default().with_concurrent_target(threads.max(1));
-        pool(threads)?
-            .install(|| {
+        let options = Self::options(threads);
+        // one thread: on the calling thread, with no rayon work at all
+        let result = if threads <= 1 {
+            self.array
+                .retrieve_array_subset_into_opt(&subset, (&mut view).into(), &options)
+        } else {
+            install(threads, || {
                 self.array
                     .retrieve_array_subset_into_opt(&subset, (&mut view).into(), &options)
-            })
-            .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))
+            })?
+        };
+        result.map_err(|e| ReadError::new(format!("{}: {e}", self.label)))
+    }
+
+    /// Per unit decoded at once: its encoded bytes (at most about its decoded size), its
+    /// decoded bytes and, for a partly read unit, the part taken out of it (measured:
+    /// zarrs' partial decoders extract into a new buffer). Sharded: per shard open its
+    /// index and, when the region covers a whole shard, the whole encoded shard (zarrs
+    /// then reads it at once). How many are open at once is zarrs' own split of
+    /// `threads` into chunks x codec.
+    fn cost(&self, start: &[u64], stop: &[u64], threads: usize) -> Result<u64, ReadError> {
+        let r = region(&self.shape, start, stop)?;
+        if r.contains(&0) {
+            return Ok(0);
+        }
+        let n_units = Self::touched(start, &r, &self.unit);
+        let n_chunks = Self::touched(start, &r, &self.chunks);
+        let t = threads.max(1);
+        let (shards_open, units_open) = if t <= 1 {
+            (1, 1)
+        } else if n_chunks == 1 {
+            (1, if self.sharded { t as u64 } else { 1 })
+        } else {
+            let first = vec![0u64; r.len()];
+            let chunk_shape = self
+                .array
+                .chunk_shape(&first)
+                .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
+            let codec = self
+                .array
+                .codecs()
+                .recommended_concurrency(&chunk_shape, self.array.data_type())
+                .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
+            let (outer, inner) =
+                concurrency_chunks_and_codec(t, n_chunks as usize, &Self::options(t), &codec);
+            let outer = outer.max(1) as u64;
+            let inner = inner.concurrent_target().max(1) as u64;
+            (outer, if self.sharded { outer * inner } else { outer })
+        };
+        let units_open = units_open.min(n_units);
+        let unit_bytes = bytes_of(&self.unit, self.dtype.size());
+        let mut cost = units_open * (3 * unit_bytes + PER_CHUNK_EXTRA);
+        if self.sharded {
+            let shards_open = shards_open.min(n_chunks);
+            // the index: two u64 per inner chunk, read and decoded
+            let per_shard: u64 = (0..r.len())
+                .map(|i| self.chunks[i].div_ceil(self.unit[i]))
+                .product();
+            cost += shards_open * per_shard * 16 * 2;
+            if self.covers_a_chunk(start, &r) {
+                // encoded, at most about its decoded size plus a header per inner chunk
+                let shard = bytes_of(&self.chunks, self.dtype.size());
+                cost += shards_open * (shard + shard / 64 + per_shard * 64);
+            }
+        }
+        Ok(cost + SMALL)
     }
 }

@@ -218,14 +218,29 @@ impl<'a> Out<'a> {
             let dst = unsafe { self.buf.index_mut(d0..d0 + inner * item) };
             if contiguous {
                 dst.copy_from_slice(&src[s0..s0 + inner * item]);
-            } else {
+            } else if let Some(f) = convert {
                 let step = src_strides[n - 1];
                 for k in 0..inner {
                     let s = &src[s0 + k * step..s0 + k * step + src_item];
-                    let d = &mut dst[k * item..(k + 1) * item];
-                    match convert {
-                        Some(f) => f(s, d),
-                        None => d.copy_from_slice(s),
+                    f(s, &mut dst[k * item..(k + 1) * item]);
+                }
+            } else {
+                // a strided copy of whole elements: moved as integers of their size
+                // (a byte copy per element costs a call each)
+                let step = src_strides[n - 1];
+                let need = s0 + (inner - 1) * step + item;
+                assert!(need <= src.len(), "strided copy beyond its source");
+                match item {
+                    1 => strided::<u8>(src, s0, step, dst, inner),
+                    2 => strided::<u16>(src, s0, step, dst, inner),
+                    4 => strided::<u32>(src, s0, step, dst, inner),
+                    8 => strided::<u64>(src, s0, step, dst, inner),
+                    16 => strided::<u128>(src, s0, step, dst, inner),
+                    _ => {
+                        for k in 0..inner {
+                            dst[k * item..(k + 1) * item]
+                                .copy_from_slice(&src[s0 + k * step..s0 + k * step + item]);
+                        }
                     }
                 }
             }
@@ -241,6 +256,22 @@ impl<'a> Out<'a> {
                 }
                 idx[ax] = 0;
             }
+        }
+    }
+}
+
+/// `n` elements of type `T` from `src` (bytes, the first at byte `s0`, then every `step`
+/// bytes) into `dst` (contiguous). The caller checked that every element lies in `src`.
+fn strided<T: Copy>(src: &[u8], s0: usize, step: usize, dst: &mut [u8], n: usize) {
+    let size = std::mem::size_of::<T>();
+    debug_assert!(dst.len() >= n * size && s0 + (n - 1) * step + size <= src.len());
+    let sp = src.as_ptr();
+    let dp = dst.as_mut_ptr();
+    for k in 0..n {
+        // SAFETY: both ranges were checked above; unaligned reads and writes
+        unsafe {
+            let v = (sp.add(s0 + k * step) as *const T).read_unaligned();
+            (dp.add(k * size) as *mut T).write_unaligned(v);
         }
     }
 }

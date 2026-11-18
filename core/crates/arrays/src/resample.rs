@@ -25,8 +25,8 @@ use dyna_zarr_transforms::{input_region, snap, Interpolation, Matrix};
 
 use crate::dtype::DType;
 use crate::out::Out;
-use crate::pool::pool;
-use crate::source::{c_strides, region, Source, SourceRef};
+use crate::pool::install;
+use crate::source::{bytes_of, c_strides, read_vec, region, Source, SourceRef, SMALL};
 use crate::ReadError;
 
 /// How points near and beyond the image's edge are treated (scipy's modes).
@@ -194,6 +194,38 @@ impl Resample {
         }
     }
 
+    /// The cost of `read_part`: the same halving, then each piece's typed input box and
+    /// what reading it costs (pieces one after another).
+    fn part_cost(&self, start: &[u64], r: &[u64], threads: usize) -> Result<u64, ReadError> {
+        if r.contains(&0) {
+            return Ok(0);
+        }
+        let n = r.len();
+        let stop: Vec<u64> = (0..n).map(|i| start[i] + r[i]).collect();
+        let need = input_region(&self.m, start, &stop, self.interp, self.src.shape())
+            .map_err(|e| ReadError::new(e.message))?;
+        let Some((s, e)) = need else {
+            // all fill: only the bookkeeping
+            return Ok(SMALL);
+        };
+        let box_shape: Vec<u64> = (0..n).map(|i| e[i] - s[i]).collect();
+        let bytes = bytes_of(&box_shape, self.src.dtype().size());
+        if bytes > self.max_read && r.iter().any(|x| *x > 1) {
+            let ax = (0..n).max_by_key(|&i| r[i]).unwrap_or(0);
+            let half = r[ax] / 2;
+            let mut r1 = r.to_vec();
+            r1[ax] = half;
+            let mut s2 = start.to_vec();
+            s2[ax] += half;
+            let mut r2 = r.to_vec();
+            r2[ax] -= half;
+            return Ok(self
+                .part_cost(start, &r1, threads)?
+                .max(self.part_cost(&s2, &r2, threads)?));
+        }
+        Ok(bytes + SMALL + self.src.cost(&s, &e, threads)?)
+    }
+
     /// The input box `s .. e` read straight into a vector of `T` (the element type, or
     /// an unsigned integer of its size).
     fn read_typed<T: Copy + Default>(
@@ -202,21 +234,7 @@ impl Resample {
         e: &[u64],
         threads: usize,
     ) -> Result<Vec<T>, ReadError> {
-        let shape: Vec<u64> = (0..s.len()).map(|i| e[i] - s[i]).collect();
-        let count = shape.iter().product::<u64>() as usize;
-        let mut v = vec![T::default(); count];
-        {
-            // SAFETY: the vector's memory as bytes, of the element type's size, written by
-            // the read and not used otherwise until it returns
-            let bytes = unsafe {
-                std::slice::from_raw_parts_mut(
-                    v.as_mut_ptr() as *mut u8,
-                    count * std::mem::size_of::<T>(),
-                )
-            };
-            let out = Out::new(bytes, &shape, &vec![0; shape.len()], self.src.dtype())?;
-            self.src.read_into(s, e, &out, threads)?;
-        }
+        let v = read_vec::<T>(self.src.as_ref(), s, e, threads)?;
         Ok(v)
     }
 
@@ -289,12 +307,13 @@ impl Resample {
         let min_rows = (4096 / inner.max(1)).max(1) as usize;
         let rows = rows as usize;
         if threads > 1 && rows > 1 {
-            pool(threads)?.install(|| {
+            // rows hold no buffer: they use whatever threads of the pool are free
+            install(threads, || {
                 (0..rows)
                     .into_par_iter()
                     .with_min_len(min_rows)
                     .for_each(one_row)
-            });
+            })?;
         } else {
             (0..rows).for_each(one_row);
         }
@@ -462,6 +481,11 @@ impl Source for Resample {
         out.check(&r, self.dtype())?;
         self.read_part(start, &r, out, threads)
     }
+
+    fn cost(&self, start: &[u64], stop: &[u64], threads: usize) -> Result<u64, ReadError> {
+        let r = region(&self.shape, start, stop)?;
+        self.part_cost(start, &r, threads)
+    }
 }
 
 /// An element type linear interpolation reads and writes through f64.
@@ -571,6 +595,10 @@ mod tests {
             let off: usize = (0..r.len()).map(|i| start[i] as usize * strides[i]).sum();
             out.copy_from(&r, &self.data[off..], &strides, item, None);
             Ok(())
+        }
+
+        fn cost(&self, _: &[u64], _: &[u64], _: usize) -> Result<u64, ReadError> {
+            Ok(0)
         }
     }
 
