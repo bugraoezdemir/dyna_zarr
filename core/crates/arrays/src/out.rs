@@ -10,10 +10,10 @@
 use unsafe_cell_slice::UnsafeCellSlice;
 
 use crate::dtype::DType;
+use crate::ReadError;
 
 /// Converts one source element into one destination element.
 pub(crate) type ConvertRef<'f> = &'f dyn Fn(&[u8], &mut [u8]);
-use crate::ReadError;
 
 /// A destination region: `shape` and `at` have one value per axis of the read.
 #[derive(Clone)]
@@ -132,6 +132,47 @@ impl<'a> Out<'a> {
             at,
             ..self.clone()
         })
+    }
+
+    /// The bytes of one row of the region: the elements `0 .. len` along the last axis at
+    /// the region's index `outer` on the other axes.
+    ///
+    /// # Safety
+    /// Callers writing rows from several threads must write different rows; the row
+    /// lies inside the region this Out was given (`check`).
+    #[allow(clippy::mut_from_ref)]
+    pub(crate) unsafe fn row_mut(&self, outer: &[u64], len: u64) -> &mut [u8] {
+        let n = self.ndim();
+        let strides = self.strides();
+        let mut e = self.at[n - 1] as usize;
+        for i in 0..n - 1 {
+            e += (self.at[i] + outer[i]) as usize * strides[i];
+        }
+        let item = self.dtype.size();
+        unsafe { self.buf.index_mut(e * item..(e + len as usize) * item) }
+    }
+
+    /// Every element of a region of `region` elements set to `value` (one element's
+    /// bytes).
+    pub(crate) fn fill(&self, region: &[u64], value: &[u8]) {
+        let n = region.len();
+        if n == 0 || region.contains(&0) {
+            return;
+        }
+        let rows: u64 = region[..n - 1].iter().product();
+        let mut outer = vec![0u64; n - 1];
+        for r in 0..rows {
+            let mut rest = r;
+            for i in (0..n - 1).rev() {
+                outer[i] = rest % region[i];
+                rest /= region[i];
+            }
+            // SAFETY: one thread, each row once, inside the region
+            let row = unsafe { self.row_mut(&outer, region[n - 1]) };
+            for el in row.chunks_mut(value.len()) {
+                el.copy_from_slice(value);
+            }
+        }
     }
 
     /// C strides of the destination, in elements.

@@ -313,6 +313,50 @@ impl Array {
             ar::Cast::new(self.src.clone(), to).map_err(err)?,
         ))
     }
+
+    /// The array resampled onto a grid of `shape`: output index o takes the value at
+    /// input index `matrix · o` (scipy.ndimage.affine_transform's convention: the matrix
+    /// maps output to input). `matrix`: n rows of n + 1 (the last column the offset) or
+    /// the full (n + 1) x (n + 1). `interpolation`: "nearest" or "linear"; `mode`:
+    /// "constant" or "grid-constant" (as scipy); `fill`: the value outside the input.
+    /// A request whose input would exceed `max_read_mb` is split first. Lazy: nothing is
+    /// read until asked.
+    #[pyo3(signature = (matrix, shape, interpolation = "linear", mode = "constant", fill = 0.0, max_read_mb = None))]
+    fn resample(
+        &self,
+        matrix: Vec<Vec<f64>>,
+        shape: Vec<u64>,
+        interpolation: &str,
+        mode: &str,
+        fill: f64,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let n = matrix.len();
+        let rows = if n > 0 && matrix.iter().all(|r| r.len() == n) {
+            matrix[..n - 1].to_vec() // the full form: its last row is implied
+        } else {
+            matrix
+        };
+        let m = dyna_zarr_transforms::Matrix::from_rows(&rows)
+            .map_err(|e| ReadError::new_err(e.message))?;
+        let interp =
+            dyna_zarr_transforms::Interpolation::parse(interpolation).ok_or_else(|| {
+                ReadError::new_err(format!(
+                    "interpolation {interpolation:?}: use \"nearest\" or \"linear\""
+                ))
+            })?;
+        let edge = ar::EdgeMode::parse(mode).ok_or_else(|| {
+            ReadError::new_err(format!(
+                "mode {mode:?}: use \"constant\" or \"grid-constant\""
+            ))
+        })?;
+        let mut r =
+            ar::Resample::new(self.src.clone(), &shape, m, interp, edge, fill).map_err(err)?;
+        if let Some(mb) = max_read_mb {
+            r = r.with_max_read((mb * 1048576.0) as u64);
+        }
+        Ok(Self::view(r))
+    }
 }
 
 fn sources(arrays: Vec<PyRef<'_, Array>>) -> Vec<ar::SourceRef> {
