@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "dyna-zarr-core"
+dynamic = ["version"]              # from Cargo.toml: one place for the version
+description = "Native (Rust) engine for dyna-zarr: coordinate transformations and lazy array operations on Zarr arrays, built on zarrs."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+# THIRD_PARTY_LICENSES.txt: every crate and C library the wheels link
+# (scripts/third_party_licenses.py)
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.txt"]
+authors = [{ name = "Bugra Oezdemir", email = "bugraa.ozdemir@gmail.com" }]
+keywords = ["zarr", "ome-zarr", "native", "rust", "lazy-evaluation"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+# no Python dependencies: a compiled module only
+
+[project.urls]
+Homepage = "https://github.com/bugraoezdemir/dyna_zarr"
+Source = "https://github.com/bugraoezdemir/dyna_zarr"
+Issues = "https://github.com/bugraoezdemir/dyna_zarr/issues"
+
+[tool.maturin]
+module-name = "dyna_zarr_core"

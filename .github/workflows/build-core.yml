@@ -1,0 +1,55 @@
+# Build dyna-zarr-core, dyna's native engine (core/, Workplan WP15): one abi3 wheel
+# per platform (Python >= 3.11) and the sdist. Called by tests.yml, so it runs on
+# every pull request and before every release (publish.yml calls tests.yml).
+#
+# zarrs compiles C / C++ libraries from source through its -sys crates (c-blosc,
+# LZ4, Snappy, zlib, zstd): a C and a C++ compiler are needed, which every runner
+# and the manylinux container have. No NASM or CMake.
+name: Build core
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: core wheel ${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { name: linux-x86_64, runner: ubuntu-latest, target: x86_64 }
+          - { name: linux-aarch64, runner: ubuntu-24.04-arm, target: aarch64 }
+          - { name: macos-arm64, runner: macos-latest, target: aarch64 }
+          - { name: macos-x86_64, runner: macos-latest, target: x86_64 }   # cross-compiled
+          - { name: windows-x64, runner: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: core
+          target: ${{ matrix.platform.target }}
+          manylinux: auto          # ignored outside Linux
+          args: --release --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-wheel-${{ matrix.platform.name }}
+          path: core/dist
+
+  sdist:
+    name: core sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: core
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-sdist
+          path: core/dist

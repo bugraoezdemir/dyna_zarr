@@ -1,0 +1,34 @@
+[workspace]
+members = [".", "crates/transforms", "crates/arrays"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/bugraoezdemir/dyna_zarr"
+
+# The Python package: dyna-zarr-core (Python module dyna_zarr_core), dyna-zarr's
+# engine (Workplan WP15, decision DR-1). The work lives in the two library crates
+# below, which know nothing about Python; this crate only binds them.
+[package]
+name = "dyna-zarr-core"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Native (Rust) engine for dyna-zarr: coordinate transformations and lazy array operations on Zarr arrays, built on zarrs"
+
+[lib]
+name = "dyna_zarr_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+# abi3: one wheel per platform for every Python >= 3.11, as micro-reader-core
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
+dyna-zarr-transforms = { path = "crates/transforms" }
+dyna-zarr-arrays = { path = "crates/arrays" }
+
+[profile.release]
+lto = true
+codegen-units = 1

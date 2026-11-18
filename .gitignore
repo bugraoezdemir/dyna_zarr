@@ -60,6 +60,9 @@ env/
 
 # Project-specific
 _archive/
+# the native engine's build output (core/ is tracked, its Cargo.lock too)
+core/target/
+core/dist/
 .coverage
 
 # Non-shipped / local-only (bench + perf report; tests ARE tracked and CI-run)
