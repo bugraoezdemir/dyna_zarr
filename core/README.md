@@ -13,9 +13,12 @@ has:
   conversion);
 - coordinate transformations (`dyna_zarr_core.transforms`): NGFF scale, translation,
   affine, rotation, axis reordering and sequences, as ome_zarr_pyramid models them, and
-  the part of an array a resampled region needs.
+  the part of an array a resampled region needs;
+- affine resampling (`Array.resample`): nearest and linear, with the matrix convention
+  and edge modes of scipy.ndimage.affine_transform and the same results, read lazily
+  region by region and computed on all threads.
 
-Resampling and downscaling under these transformations come next.
+Downscaling comes next.
 
 Its wheels are abi3: one per platform for every Python from 3.11. Building from
 source needs a Rust toolchain and a C compiler (zarrs builds the blosc and zstd C
