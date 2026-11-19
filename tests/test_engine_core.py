@@ -82,6 +82,45 @@ def test_an_engine_outside_the_supported_range_is_not_used(monkeypatch):
         _engine.enabled()
 
 
+def test_threads_that_first_use_the_engine_at_once_all_find_it(monkeypatch):
+    """eubi converts several scenes in parallel, so the engine's first use can come
+    from several threads together. Each must wait for the one import and see its
+    outcome; one used to see no engine and raise "required, but None"."""
+    import threading
+    import time
+
+    class Engine:
+        __version__ = "0.0.1"
+    imports = []
+
+    def slow_import(name):
+        imports.append(name)
+        time.sleep(0.2)                 # the others arrive while this one imports
+        return Engine
+    monkeypatch.setattr(_engine.importlib, "import_module", slow_import)
+    monkeypatch.setattr(_engine, "_looked", False)
+    monkeypatch.setattr(_engine, "_module", None)
+    monkeypatch.setattr(_engine, "_problem", None)
+    monkeypatch.setenv(_engine.ENV, "1")
+
+    start = threading.Barrier(8)
+    seen = []
+
+    def first_use():
+        start.wait()
+        try:
+            seen.append(_engine.engine())
+        except Exception as e:          # noqa: BLE001 - the test reports what went wrong
+            seen.append(e)
+    threads = [threading.Thread(target=first_use) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert seen == [Engine] * 8
+    assert imports == ["dyna_zarr_core"]
+
+
 @pytest.mark.parametrize("version, release", [("0.0.1", (0, 0, 1)), ("0.1.0rc1", (0, 1, 0)),
                                               ("1.2", (1, 2, 0)), ("0.0.2+local", (0, 0, 2))])
 def test_release_numbers(version, release):

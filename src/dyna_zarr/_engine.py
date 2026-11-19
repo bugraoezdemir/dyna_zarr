@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import threading
 from typing import Optional
 
 #: the environment variable that switches the engine on or off
@@ -35,6 +36,7 @@ _OFF = {"0", "off", "false", "no"}
 _module = None
 _problem: Optional[str] = None       # why the engine cannot be used, once looked for
 _looked = False
+_lock = threading.Lock()             # threads that first use the engine at once wait for one import
 _choice: Optional[bool] = None       # set_engine()
 
 
@@ -57,24 +59,32 @@ def _release(version: str) -> tuple:
 
 
 def _find():
-    """Import the engine once and check its version."""
+    """Import the engine once and check its version. Threads that get here at once
+    (eubi converts several scenes in parallel) wait for the one import; ``_looked``
+    is set only when its outcome is, or a second thread would see no engine and no
+    reason why."""
     global _module, _problem, _looked
     if _looked:
         return _module
-    _looked = True
+    with _lock:
+        if not _looked:
+            _module, _problem = _import()
+            _looked = True
+    return _module
+
+
+def _import():
+    """(module, None) for a usable engine, else (None, why not)."""
     try:
         module = importlib.import_module("dyna_zarr_core")
     except ImportError as e:
-        _problem = f"dyna-zarr-core is not installed ({e})"
-        return None
+        return None, f"dyna-zarr-core is not installed ({e})"
     version = getattr(module, "__version__", "0")
     low, high = CORE_RANGE
     if not (low <= _release(version) < high):
-        _problem = (f"dyna-zarr-core {version} is installed, but this dyna-zarr works "
-                    f"with {'.'.join(map(str, low))} up to below {'.'.join(map(str, high))}")
-        return None
-    _module = module
-    return module
+        return None, (f"dyna-zarr-core {version} is installed, but this dyna-zarr works "
+                      f"with {'.'.join(map(str, low))} up to below {'.'.join(map(str, high))}")
+    return module, None
 
 
 def available() -> bool:
