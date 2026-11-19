@@ -629,13 +629,17 @@ class DynamicArray:
         None/'cpu' runs on the CPU (default), 'cuda' runs the pipeline on the GPU. The
         result is always returned as a host numpy array.
         """
+        from . import _lowering
         from .operations._backend import device_context, to_device
         from .operations.reductions import evaluate_small_reductions
-        with device_context(device):
+        with device_context(device), _lowering.engine_threads(_lowering.all_cores()):
             # Small reductions the chain needs are computed first, fused per input
             # (x.mean() and x.std() share one pass), then served from the cache.
             evaluate_small_reductions(self)
-            if self._transform is None:
+            full = _lowering.read(self, (Ellipsis,))
+            if full is not None:
+                result = full
+            elif self._transform is None:
                 # No transform - read entire array. `[...]`, not `[:]`: a 0-d array
                 # has no axis for `:` to index (a persisted 0-d result is one).
                 if self._is_tensorstore:
@@ -822,7 +826,14 @@ class DynamicArray:
         """
         Internal method to read data directly without creating transforms.
         Used by Transform.read() methods to actually fetch data.
+
+        With dyna's native engine on, an array whose whole chain the engine has is read
+        there in one go (see _lowering); otherwise as below.
         """
+        from . import _lowering
+        data = _lowering.read(self, key)
+        if data is not None:
+            return data
         if self._transform is None:
             # Direct read from source
             if self._is_tensorstore:
@@ -834,6 +845,14 @@ class DynamicArray:
         else:
             # Apply transformation chain
             return self._transform.read(key)
+
+    def __getstate__(self):
+        """Pickle without the engine counterpart (a Rust object; rebuilt on first read
+        in the process that unpickles)."""
+        from ._lowering import CACHE
+        state = self.__dict__.copy()
+        state.pop(CACHE, None)
+        return state
 
     def _with_transform(self, transform):
         """

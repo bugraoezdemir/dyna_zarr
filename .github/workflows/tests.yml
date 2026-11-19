@@ -107,6 +107,10 @@ jobs:
         # missing extra shows up as a missing JOB rather than as silent skips
         # inside a green run. -o addopts="": the repo's pytest config sets coverage
         # flags; the workflow decides what to run, and coverage is a separate job.
+        # The engine on: dyna reads every chain it can through it (the coverage job
+        # runs the same suite on the Python path).
+        env:
+          DYNA_ZARR_ENGINE: "1"
         run: python -m pytest tests/ -v -o addopts="" -m "not zarrista and not gpu"
 
   zarrista:
@@ -199,6 +203,10 @@ jobs:
           python -m pip install -e ".[dev,zarrista]"
 
       - name: Run tests with coverage
+        # The Python path: the "test" jobs run the same suite with the engine on (it
+        # reads every chain it can), this one with it off, so both paths are tested.
+        env:
+          DYNA_ZARR_ENGINE: "0"
         run: python -m pytest tests/ -o addopts="" -m "not gpu" --cov=dyna_zarr --cov-report=xml
 
       - name: Upload coverage to Codecov

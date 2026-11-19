@@ -156,8 +156,7 @@ impl Array {
                 let dst = ar::Out::new(bytes, &shape, &at, dtype)?;
                 src.read_into(&start, &stop, &dst, threads)
             };
-            // the given pool; else the shared pool of `threads`; else this thread's own
-            // one-thread pool
+            // the given pool; else the shared pool of `threads`; one thread: right here
             ar::pool::enter(threads, pool.as_deref(), run)?
         })
         .map_err(err)?;

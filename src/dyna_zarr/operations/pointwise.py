@@ -221,7 +221,12 @@ def clip(array, a_min=None, a_max=None):
 
 
 def astype(array, dtype):
-    return map_blocks(lambda x: x.astype(dtype), array, dtype=np.dtype(dtype), name="astype")
+    out = map_blocks(lambda x: x.astype(dtype), array, dtype=np.dtype(dtype), name="astype")
+    # marks the cast for dyna's native engine (it takes over casts whose values NumPy
+    # defines; see _lowering)
+    if getattr(out, "_transform", None) is not None:
+        out._transform.cast_to = np.dtype(dtype)
+    return out
 
 
 def _saturate_block(x, dtype):

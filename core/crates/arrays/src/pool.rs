@@ -10,12 +10,14 @@
 //!   `threads` groups ([`pieces`]), each group one piece after another, whatever the
 //!   scheduling. Work that holds no buffer of its own (output rows) uses whatever threads
 //!   of the pool are free.
-//! - Every read runs inside a pool ([`enter`]): the one given, the shared pool of
-//!   `threads`, or for one thread the calling thread's own one-thread pool. Nothing then
-//!   reaches rayon's global pool (zarrs would on some paths, even for one chunk at a
-//!   time), and that pool is kept at one thread ([`limit_global_pool`]) in case.
+//! - A read starts ([`enter`]) on the pool given, else on the shared pool of `threads`,
+//!   else, with one thread, right on the calling thread. zarrs then decodes one chunk at
+//!   a time (no minimum of chunks at once). On sharded arrays some of its paths hand
+//!   even that one task to rayon's global pool while the caller waits, so a one-thread
+//!   read still keeps one thread busy.
+//! - No pool belongs to a thread: a one-thread read needs no thread of its own, and
+//!   callers that come and go (io.write's region workers) leave no pools behind.
 
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -54,26 +56,9 @@ pub fn pool(threads: usize) -> Result<Arc<rayon::ThreadPool>, ReadError> {
     Ok(p)
 }
 
-thread_local! {
-    static SOLO: RefCell<Option<Arc<rayon::ThreadPool>>> = const { RefCell::new(None) };
-}
-
-/// The calling thread's own pool of one thread (made on first use, ended with the
-/// thread): one-thread reads from different threads never wait for each other.
-pub fn solo() -> Result<Arc<rayon::ThreadPool>, ReadError> {
-    SOLO.with(|s| {
-        if let Some(p) = s.borrow().as_ref() {
-            return Ok(p.clone());
-        }
-        let p = new_pool(1)?;
-        *s.borrow_mut() = Some(p.clone());
-        Ok(p)
-    })
-}
-
 /// Run a read of `threads` from outside the engine: on `given`; else on the shared
-/// pool of `threads`; else (one thread) on this thread's own one-thread pool. Already
-/// on a pool's thread: right here.
+/// pool of `threads`; else (one thread) right here. Already on a pool's thread: right
+/// here.
 pub fn enter<R: Send>(
     threads: usize,
     given: Option<&rayon::ThreadPool>,
@@ -85,18 +70,8 @@ pub fn enter<R: Send>(
     Ok(match given {
         Some(p) => p.install(f),
         None if threads > 1 => pool(threads)?.install(f),
-        None => solo()?.install(f),
+        None => f(),
     })
-}
-
-/// Keep rayon's global pool (this binary's copy) at one thread: if anything reaches for
-/// it, it gets one thread, not one per core. Call before anything uses rayon; later calls
-/// change nothing.
-pub fn limit_global_pool() {
-    let _ = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .thread_name(|_| "dyna-zarr-core-global".to_string())
-        .build_global();
 }
 
 /// Run `f` where parallel work of `threads` may spread: in place on a pool's thread (the
