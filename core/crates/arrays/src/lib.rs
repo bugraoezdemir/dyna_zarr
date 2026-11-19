@@ -5,12 +5,20 @@
 //! [`Squeeze`], [`Concat`], [`Cast`]). Reading a region writes it into a destination the
 //! caller owns ([`Out`]: a Rust buffer, NumPy's memory through the Python bindings, a GPU
 //! staging buffer), so no layer copies what it does not have to; [`read`] gives a new
-//! buffer. Regions are decoded in parallel on a thread pool per read.
+//! buffer.
+//!
+//! Memory and threads (Workplan decision DR-5): a read runs on one thread pool
+//! ([`pool`]), its `threads` cap how many of its buffer-holding pieces are open at once,
+//! and every source reports the most it holds for a region ([`Source::cost`]), which
+//! [`memory`] measures against.
 
+mod blocks;
 mod cast;
+mod downsample;
 mod dtype;
+pub mod memory;
 mod out;
-mod pool;
+pub mod pool;
 mod resample;
 mod source;
 mod views;
@@ -19,10 +27,11 @@ mod zarr;
 use std::path::Path;
 
 pub use cast::converter;
+pub use downsample::{stride, Boundary, Gaussian, Mean};
 pub use dtype::DType;
 pub use out::Out;
 pub use resample::{EdgeMode, Resample, DEFAULT_MAX_READ};
-pub use source::{read, region, Source, SourceRef};
+pub use source::{read, read_cost, region, Source, SourceRef};
 pub use views::{Cast, Concat, ExpandDims, Slice, Squeeze, Transpose};
 pub use zarr::ZarrArray;
 

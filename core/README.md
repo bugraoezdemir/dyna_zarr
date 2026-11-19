@@ -16,9 +16,14 @@ has:
   the part of an array a resampled region needs;
 - affine resampling (`Array.resample`): nearest and linear, with the matrix convention
   and edge modes of scipy.ndimage.affine_transform and the same results, read lazily
-  region by region and computed on all threads.
-
-Downscaling comes next.
+  region by region and computed on all threads;
+- downsampling by integer factors (`Array.downsample`): "stride" and "mean" exactly as
+  tensorstore.downsample (ome_zarr_pyramid's levels), and "gaussian" (a Gaussian
+  low-pass as scipy.ndimage.gaussian_filter, then every f-th sample);
+- memory and threads you set and can rely on: a read's `threads` caps how much it holds
+  at once, `Array.cost(start, stop, threads)` says how much that is (checked against the
+  measured peak in the tests), and reads that share a `Pool` never use more threads
+  than it has. A read with `threads=1` uses one thread.
 
 Its wheels are abi3: one per platform for every Python from 3.11. Building from
 source needs a Rust toolchain and a C compiler (zarrs builds the blosc and zstd C
