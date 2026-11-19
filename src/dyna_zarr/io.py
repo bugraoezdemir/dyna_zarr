@@ -27,6 +27,7 @@ import gc
 import shutil
 import warnings
 
+from ._scope import current as current_scope, write_scope
 from ._compat import renamed
 
 from .operations.pointwise import _saturate_block
@@ -211,7 +212,7 @@ _ENGINES = ("fused", "pipeline")
 
 def _run_fused(chunk_indices, input_shape, input_array, output, final_dtype, device,
                n_threads, early_tenth_timeout=None, early_quarter_timeout=None,
-               observe=None):
+               observe=None, region_threads=1):
     """io.write's default execution loop (``engine="fused"``).
 
     ``n_threads`` threads each take the next band, read it (the op chain runs here, on
@@ -226,7 +227,9 @@ def _run_fused(chunk_indices, input_shape, input_array, output, final_dtype, dev
 
     The early timeouts abort the write when the first tenth / quarter of the regions took
     longer than given (checked once each, when the milestone is reached).
+    ``region_threads``: the engine's threads for each region's read (_plan_regions).
     """
+    from ._lowering import engine_threads
     lock = threading.Lock()
     state = {"next": 0, "done": 0, "error": None}
 
@@ -241,7 +244,8 @@ def _run_fused(chunk_indices, input_shape, input_array, output, final_dtype, dev
                     state["next"] += 1
                 region = tuple(slice(lo, min(hi, size))
                                for (lo, hi), size in zip(band, input_shape))
-                with _use_stream(stream), _device_context(device):
+                with _use_stream(stream), _device_context(device), \
+                        engine_threads(region_threads):
                     data = _asnumpy_pinned(input_array._read_direct(region))
                 if data.dtype != final_dtype:
                     data = _saturate_block(data, final_dtype)
@@ -1787,6 +1791,54 @@ def _region_cost(array, extent, shape, out_dtype):
             int(np.prod([int(e) for e in extent], dtype=np.int64)) * out_itemsize)
 
 
+def _plan_regions(array, bands, shape, max_threads, budget_bytes, python_bytes, out_bytes):
+    """Decision DR-5's split of ``max_threads`` for io.write's fused loop:
+    ``(regions in flight, threads per region, bytes of one region, fits)``.
+
+    With the engine reading the whole chain, a region's memory is the engine's own cost
+    for it (``Array.cost``: what a read with ``t`` threads holds beyond its destination)
+    plus the destination and the output buffer, and more threads per region cost only
+    what the engine says they do. The split uses as many of ``max_threads`` as the budget
+    allows; between equal uses, more regions win (a copy gains more from regions than from
+    threads inside one). Few regions get more threads each (one region: all of them).
+
+    On the Python path, ``max_threads`` workers (as before) of one thread each, a region
+    costing ``python_bytes``. ``fits`` is False when not even one region with one thread
+    fits ``budget_bytes``.
+    """
+    from . import _lowering
+    eng = _lowering.lowered(array)
+    if eng is None:
+        workers = max(1, int(max_threads))
+        fit = workers if budget_bytes is None else int(budget_bytes // max(1, python_bytes))
+        return max(1, min(workers, fit)), 1, int(python_bytes), fit >= 1
+    regions_max = max(1, min(int(max_threads), len(bands)))
+    # the largest band (bands are cell-cut and chunk-rounded, so they differ at the edges)
+    band = max(bands, key=lambda b: int(np.prod([min(hi, n) - lo for (lo, hi), n
+                                                  in zip(b, shape)], dtype=np.int64)))
+    start = [lo for lo, _ in band]
+    stop = [min(hi, n) for (_, hi), n in zip(band, shape)]
+    dest = (int(np.prod([b - a for a, b in zip(start, stop)], dtype=np.int64))
+            * np.dtype(array.dtype).itemsize)
+    costs = {}
+
+    def cost(t):
+        if t not in costs:
+            costs[t] = int(eng.cost(start, stop, t)) + dest + int(out_bytes)
+        return costs[t]
+
+    best = None
+    for r in range(regions_max, 0, -1):
+        for t in range(max(1, int(max_threads) // r), 0, -1):
+            if budget_bytes is None or r * cost(t) <= budget_bytes:
+                if best is None or (r * t, r) > (best[0] * best[1], best[0]):
+                    best = (r, t)
+                break
+    if best is None:
+        return 1, 1, cost(1), False
+    return best[0], best[1], cost(best[1]), True
+
+
 class RepeatedReductionWarning(UserWarning):
     """A reduction too large to cache is broadcast back over the axes it reduced, so a
     region-wise write re-streams it once per region along those axes. The result is
@@ -2739,7 +2791,12 @@ def _open_output(spec: _OutputSpec):
         from ._zip import ZipOutput
         ts_spec = _ts_output_spec(spec)
         ts_spec['kvstore'] = {'driver': 'memory', 'path': 'a/'}
-        handle = ts.open(ts_spec, create=True, context=ts.Context()).result()
+        scope = current_scope()
+        # its own in-memory store (several outputs of one write are all at "a/"), with
+        # the write's thread pools inherited (decision DR-5, see _scope)
+        context = ts.Context() if scope is None else ts.Context(
+            ts.Context.Spec({"memory_key_value_store": {}}), parent=scope.ts_context())
+        handle = ts.open(ts_spec, create=True, context=context).result()
         return ZipOutput(spec.zip_target, spec.zip_key, handle, shape=spec.shape,
                          chunks=spec.chunks, shards=spec.shards, zarr_format=spec.zarr_format)
     if spec.existing is not None:
@@ -2760,7 +2817,11 @@ def _open_output(spec: _OutputSpec):
             dimension_names=spec.dimension_names,
         )
     import tensorstore as ts
-    return ts.open(_ts_output_spec(spec), create=True).result()
+    scope = current_scope()
+    if scope is None:
+        return ts.open(_ts_output_spec(spec), create=True).result()
+    # TensorStore's pools limited to the write's max_threads (decision DR-5, see _scope)
+    return ts.open(_ts_output_spec(spec), create=True, context=scope.ts_context()).result()
 
 
 def _normalize_key(key, shape):
@@ -3251,10 +3312,10 @@ def _plan_xy_tiles(shape, factors, inner, level_shapes, itemsize, budget, unit, 
                 need_units=need_units, minimal=(ay, ax),
                 need_minimal=total(1, *align(1), z_step(1), 1, Z))
 
-def write_levels(array, outputs, *, method="simple", max_threads=None, region_size_mb=None,
-                 dtype=None, compressor=None, zarr_format=None, backend="tensorstore",
-                 storage_options=None, overwrite=False, dimension_names=None,
-                 reducer=None, observe=None, memory_budget_mb=None, max_workers=None):
+def _write_levels(array, outputs, *, method="simple", max_threads=None, region_size_mb=None,
+                  dtype=None, compressor=None, zarr_format=None, backend="tensorstore",
+                  storage_options=None, overwrite=False, dimension_names=None,
+                  reducer=None, observe=None, memory_budget_mb=None, max_workers=None):
     """Write ``array`` and downsampled versions of it from ONE read of ``array``.
 
     ``outputs`` is a sequence of dicts, coarsest last:
@@ -3938,6 +3999,14 @@ _STAGED_WRITES = {"FlattenTransform": "flatten", "ReshapeTransform": "reshape",
                   "ScanTransform": "scan"}
 
 
+@functools.wraps(_write_levels)
+def write_levels(array, outputs, *, max_threads=None, max_workers=None, **kwargs):
+    # every thread of the write counts against max_threads (decision DR-5, see _scope)
+    with write_scope(_scope_threads(max_threads, max_workers)):
+        return _write_levels(array, outputs, max_threads=max_threads,
+                             max_workers=max_workers, **kwargs)
+
+
 def _write_staged(kind, array, spec: _OutputSpec, *, max_threads, device,
                   region_shape, memory_budget_mb, num_readers):
     """Write ``array`` (an outermost reshape/flatten/scan) with its staged writer.
@@ -4065,8 +4134,16 @@ def _write_array(
     max_threads : int
         Default 4; an upper limit (a memory budget can lower it). Formerly
         ``max_workers``, which still works with a FutureWarning.
+        Every thread the write keeps busy counts against it (decision DR-5, since
+        dyna-zarr 0.2.0): TensorStore's pools, which decode the sources and encode the
+        output, have `max_threads` threads (before, they used every core, so
+        ``max_threads=1`` kept about 4 cores busy on a copy), and with the native
+        engine, the threads reading inside a region come out of it too.
         Dask array: the number of dask threads.
-        ``"fused"``: the number of threads, i.e. regions being read or written at once.
+        ``"fused"``: regions being read or written at once x engine threads per region.
+        Many regions get one thread each; with the engine, few regions share the rest
+        (one region: all of them), and a budget too small for more regions leaves their
+        threads to the engine inside the regions it can afford.
         ``"pipeline"``: TOTAL regions live across readers + queue + in-flight writes
         (raised to 3 if lower).
     num_readers : int, optional
@@ -4413,26 +4490,33 @@ def _write_array(
     # Everything above - output, regions, bands - is shared by both engines, so they write
     # exactly the same regions; only the execution loop below differs.
     if engine == "fused":
-        # max_threads = workers. A budget caps them (a ceiling, never a target); the floor
-        # is one worker.
-        workers = requested_workers
-        if budget_bytes is not None:
-            affordable = int(budget_bytes // max(1, worker_bytes))
-            if affordable < 1:
-                warnings.warn(
-                    f"memory_budget_mb={memory_budget_mb:g} cannot fit even one thread "
-                    f"(~{_mib(worker_bytes)}: the region is read as {_mib(read_bytes)} and "
-                    f"written as {_mib(out_bytes)}). Running with one thread; reduce "
-                    f"region_shape/region_size_mb or raise the budget.",
-                    RuntimeWarning, stacklevel=2)
-            workers = max(1, min(requested_workers, affordable))
-        _say(f"[Optimized] Engine: fused, {workers} threads (each reads and writes its own "
-              f"region; ~{_mib(workers * worker_bytes)} at ~{_mib(worker_bytes)}/thread)",
-              flush=True)
+        # max_threads = every thread the write keeps busy (decision DR-5): regions in
+        # flight x threads per region, TensorStore's pools limited to it (see _scope).
+        # A budget caps the regions (a ceiling, never a target); the floor is one region.
+        workers, per_region, region_bytes, fits = _plan_regions(
+            input_array, chunk_indices, input_shape, requested_workers, budget_bytes,
+            worker_bytes, out_bytes)
+        if not fits:
+            warnings.warn(
+                f"memory_budget_mb={memory_budget_mb:g} cannot fit even one thread "
+                f"(~{_mib(region_bytes)}: the region is read as {_mib(read_bytes)} and "
+                f"written as {_mib(out_bytes)}). Running with one thread; reduce "
+                f"region_shape/region_size_mb or raise the budget.",
+                RuntimeWarning, stacklevel=2)
+        if per_region > 1:
+            _say(f"[Optimized] Engine: fused, {workers * per_region} threads ({workers} "
+                 f"region{'s' if workers > 1 else ''} at a time, each read with "
+                 f"{per_region} engine threads; ~{_mib(workers * region_bytes)} at "
+                 f"~{_mib(region_bytes)}/region)", flush=True)
+        else:
+            _say(f"[Optimized] Engine: fused, {workers} threads (each reads and writes its "
+                 f"own region; ~{_mib(workers * region_bytes)} at ~{_mib(region_bytes)}"
+                 f"/thread)", flush=True)
         try:
             _run_fused(chunk_indices, input_shape, input_array, output, final_dtype_obj,
                        device, workers, early_tenth_timeout=early_tenth_timeout,
-                       early_quarter_timeout=early_quarter_timeout, observe=observe)
+                       early_quarter_timeout=early_quarter_timeout, observe=observe,
+                       region_threads=per_region)
         finally:
             if gc_was_enabled:
                 gc.enable()
@@ -4848,11 +4932,21 @@ def _write_array(
     return output_path
 
 
+def _scope_threads(max_threads, max_workers, default=4) -> int:
+    """The thread count a write's scope gets (``renamed`` warns about max_workers later,
+    in the write itself)."""
+    value = max_threads if max_threads is not None else max_workers
+    return max(1, int(default if value is None else value))
+
+
 @functools.wraps(_write_array)
 def write_array(*args, **kwargs):
     gc_was_enabled = gc.isenabled()
     try:
-        return _write_array(*args, **kwargs)
+        threads = kwargs.get("max_threads", args[2] if len(args) > 2 else None)
+        # every thread of the write counts against max_threads (decision DR-5): see _scope
+        with write_scope(_scope_threads(threads, kwargs.get("max_workers"))):
+            return _write_array(*args, **kwargs)
     finally:
         # _write_array pauses the cyclic collector while regions are in flight. Its error
         # paths (a refused region_shape, a failed region) used to leave it off for the

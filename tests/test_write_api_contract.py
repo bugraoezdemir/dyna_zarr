@@ -139,9 +139,12 @@ def test_fused_is_the_default_and_max_threads_is_threads(tmp_path, capsys):
     assert "Live-region budget" not in out
 
 
-def test_fused_memory_budget_clamps_workers(tmp_path, capsys):
+def test_fused_memory_budget_clamps_workers(tmp_path, capsys, monkeypatch):
     """A fused worker holds 2*read + out: 16^3 int32 -> 2*16 + 16 = 48 KiB, so a 192 KiB
-    budget affords exactly 4 workers, and 191 KiB only 3."""
+    budget affords exactly 4 workers, and 191 KiB only 3. That is the Python path's
+    model; the engine budgets a region by its own cost (test_write_threads.py)."""
+    from dyna_zarr import _engine
+    monkeypatch.setattr(_engine, "_choice", False)
     arr = _src(tmp_path)
     for budget_kib, expected in ((192, 4), (191, 3)):
         io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), overwrite=True,

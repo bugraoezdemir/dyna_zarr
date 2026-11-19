@@ -167,7 +167,7 @@ These parameters control different things:
 - **`chunks` / `chunk_size_mb`** set the output's storage layout. `chunks` is an exact shape; `chunk_size_mb` asks dyna-zarr to choose a suitable shape while aligning reads to the source grid where possible.
 - **`region_shape` / `region_size_mb`** set the read-and-process region size used during a streamed write. Regions usually contain multiple chunks and primarily affect performance and peak memory. They **do not** affect the resulting array values.
 - **`memory_budget_mb`** limits the additional memory the write may use by reducing concurrency when needed. It never raises `max_threads`. On local stores, shards larger than the budget are still written within it, chunk by chunk.
-- **`max_threads`** controls concurrency. More threads can improve throughput, but also increase memory use.
+- **`max_threads`** is every thread the write keeps busy: dyna-zarr's region workers, the native engine's threads inside a region, and TensorStore's own pools, which decode the input and encode the output. More threads can improve throughput, but also increase memory use. Since 0.2.0 TensorStore is held to it too; before, it used every core whatever `max_threads` said.
 
 A practical starting point is to set a moderate region size and increase `max_threads` while watching RAM and throughput. As a rough guide, budget for about 2.5–3 times `region_size_mb` per thread for region data and intermediate copies, plus fixed process overhead. The actual amount depends on the operation chain and dtypes.
 
