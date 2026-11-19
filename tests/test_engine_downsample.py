@@ -52,7 +52,30 @@ def test_mean_and_stride_as_tensorstore(tmp_path, dtype, factors):
         v = a.downsample(list(factors), method)
         want = _ts(data, factors, ts_method)
         assert v.shape == want.shape
-        np.testing.assert_array_equal(_all(v), want)
+        got = _all(v)
+        if method == "mean" and dtype.startswith("complex"):
+            # TensorStore divides a complex sum by the count as one complex number. On
+            # macOS (libc++) that rounds differently from dividing each part, by up to
+            # one unit in the last place when the count is not a power of two; on Linux
+            # and Windows it equals dividing each part, as the engine does.
+            for part in ("real", "imag"):
+                np.testing.assert_array_max_ulp(getattr(got, part), getattr(want, part), 1)
+        else:
+            np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("factors", FACTORS, ids=str)
+@pytest.mark.parametrize("dtype", ["complex64", "complex128"])
+def test_complex_mean_is_the_mean_of_each_part(tmp_path, dtype, factors):
+    """Exact on every platform: each part of a complex mean is the float mean of that
+    part, which equals tensorstore.downsample's float mean bit for bit
+    (test_mean_and_stride_as_tensorstore)."""
+    data = _data((13, 22, 31), dtype)
+    got = _all(_store(tmp_path, data, (4, 8, 8), "c").downsample(list(factors)))
+    for part in ("real", "imag"):
+        p = np.ascontiguousarray(getattr(data, part))
+        want = _all(_store(tmp_path, p, (4, 8, 8), part).downsample(list(factors)))
+        np.testing.assert_array_equal(getattr(got, part), want)
 
 
 def test_integer_means_are_exact_at_64_bits(tmp_path):
