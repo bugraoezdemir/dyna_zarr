@@ -28,6 +28,7 @@ import shutil
 import warnings
 
 from ._scope import current as current_scope, write_scope
+from ._release import release
 from ._compat import renamed
 
 from .operations.pointwise import _saturate_block
@@ -309,6 +310,8 @@ def _run_fused(chunk_indices, input_shape, input_array, output, final_dtype, dev
                 if observe is not None:
                     observe(region, data)
                 output[region].write(data).result()
+                del data
+                release()                     # glibc / macOS keep freed buffers (_release)
                 with lock:
                     state["done"] += 1
         except BaseException as exc:          # first error wins; the others stop
@@ -3676,6 +3679,8 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
                         state["next"] += 1
                     for level, dst, out in level_blocks(read_block(origin, stop), origin):
                         handles[level][dst].write(np.ascontiguousarray(out)).result()
+                    out = None
+                    release()                 # glibc / macOS keep freed buffers (_release)
             except BaseException as exc:          # first error wins; the others stop
                 with lock:
                     if state["error"] is None:
@@ -3858,6 +3863,7 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
                             window["finished"].discard(window["low"])
                             window["low"] += 1
                         room.notify_all()
+                    release()                 # glibc / macOS keep freed buffers (_release)
             except BaseException as exc:          # first error wins; the others stop
                 with lock:
                     if state["error"] is None:
@@ -3998,6 +4004,7 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
                         if whole and hasattr(handles[key[0]], "unit_written"):
                             # an output into a zip: the shard is complete, move it in
                             handles[key[0]].unit_written(key[1])
+                    release()                 # glibc / macOS keep freed buffers (_release)
             except BaseException as exc:          # first error wins; the others stop
                 with lock:
                     if state["error"] is None:
@@ -4738,6 +4745,10 @@ def _write_array(
             n_inflight = len(write_futures)
         for f in done:
             f.result()  # surface any write error early (already complete)
+        if done:
+            del f
+            done.clear()
+            release()                       # glibc / macOS keep freed buffers (_release)
         return n_inflight
 
     def writer_thread():

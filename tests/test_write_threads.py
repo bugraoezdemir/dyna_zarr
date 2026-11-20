@@ -281,7 +281,9 @@ def test_a_write_keeps_max_threads_busy(big, tmp_path, engine, max_threads):
 def test_peak_memory_within_the_budget(big, tmp_path, engine, budget_mb, case):
     """The write's peak, over what the process held before it, stays within
     memory_budget_mb plus RUNTIME_MB, on both engines (measured 20-30 MB over at small
-    budgets, under the budget at 128 MB)."""
+    budgets, under the budget at 128 MB). On Linux this needs glibc's arenas limited and
+    freed buffers handed back during the write (_release): without, a copy at 64 MB grew
+    by 93-110 MB."""
     grew = _run("""
         import json, os, sys
         from dyna_zarr import _engine, io
@@ -289,6 +291,9 @@ def test_peak_memory_within_the_budget(big, tmp_path, engine, budget_mb, case):
         _engine.set_engine(sys.argv[3] == "True")
         a = io.read(sys.argv[1])
         v = {"copy": a, "mean": o.coarsen(a, (2, 2, 2)), "float32": a.astype("float32")}[sys.argv[5]]
+        # a small write of the same kind first: what the first write of a process starts
+        # once (TensorStore's pools, thread stacks) is not the write's memory
+        io.write(v[:4, :256, :256], os.path.join(sys.argv[2], "warm.zarr"), max_threads=4)
         before, _ = rss_and_peak()
         io.write(v, os.path.join(sys.argv[2], "o.zarr"), max_threads=4,
                  memory_budget_mb=float(sys.argv[4]))
