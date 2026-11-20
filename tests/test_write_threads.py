@@ -206,7 +206,12 @@ _HELPERS = r'''
 import ctypes, os, sys, time
 def rss_and_peak():
     """(memory now, peak memory) of this process in bytes: the working set on Windows,
-    the resident set elsewhere (on macOS only the peak, so 'now' is the peak so far)."""
+    the resident set on Linux, the physical footprint on macOS.
+
+    Not the resident set on macOS: there it keeps what the write freed (the RSS after a
+    write equalled its peak, on both paths) and varied from 73 to 143 MB for the same
+    write, while the footprint (what Activity Monitor and the memory-pressure killer use)
+    grew 23-29 MB and went back to within 5 MB of where it started (macOS CI, 2026-11-20)."""
     if sys.platform == "win32":
         from ctypes import wintypes
         class PMC(ctypes.Structure):
@@ -224,8 +229,16 @@ def rss_and_peak():
         with open("/proc/self/status") as f:
             d = dict(line.split(":", 1) for line in f)
         return int(d["VmRSS"].split()[0]) << 10, int(d["VmHWM"].split()[0]) << 10
+    if sys.platform == "darwin":
+        class RI(ctypes.Structure):   # struct rusage_info_v4 (sys/resource.h), spare room
+            _fields_ = [("uuid", ctypes.c_uint8 * 16), ("v", ctypes.c_uint64 * 64)]
+        ri = RI()
+        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+        if libc.proc_pid_rusage(os.getpid(), 4, ctypes.byref(ri)) != 0:   # RUSAGE_INFO_V4
+            raise OSError(ctypes.get_errno(), "proc_pid_rusage")
+        return ri.v[7], ri.v[28]   # ri_phys_footprint, ri_lifetime_max_phys_footprint
     import resource
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss   # bytes on macOS
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return peak, peak
 '''
 
@@ -291,7 +304,7 @@ def test_peak_memory_within_the_budget(big, tmp_path, engine, budget_mb, case):
     memory_budget_mb plus RUNTIME_MB, on both engines (measured 20-30 MB over at small
     budgets, under the budget at 128 MB). On Linux this needs glibc's arenas limited and
     freed buffers handed back during the write (_release): without, a copy at 64 MB grew
-    by 93-110 MB."""
+    by 93-110 MB. On macOS the footprint, not the resident set (rss_and_peak)."""
     grew = _run("""
         import json, os, sys
         from dyna_zarr import _engine, io
