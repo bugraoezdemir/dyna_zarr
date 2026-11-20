@@ -12,6 +12,7 @@
   heaps, TensorStore's encoder buffers: about 20-30 MB measured), on both engines.
 """
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -255,7 +256,14 @@ def test_a_write_keeps_max_threads_busy(big, tmp_path, engine, max_threads):
     """Busy threads (CPU time over wall time) of a copy, a strided level and a mean
     level stay near max_threads. Before DR6b, max_threads=1 kept about 4 cores busy on
     a copy (TensorStore encoded on every core). The margin covers the worker's own read
-    overlapping TensorStore encoding another region."""
+    overlapping TensorStore encoding another region.
+
+    On a machine with no more cores than the limit, a write cannot go over it, so the case
+    is skipped: there it can only fail by mismeasuring (a 3-core macOS runner once
+    measured 3.35 cores busy at max_threads=2)."""
+    limit = 1.5 * max_threads + 0.25
+    if (os.cpu_count() or 1) <= limit:
+        pytest.skip(f"{os.cpu_count()} cores cannot exceed {limit} busy")
     busy = _run("""
         import json, os, sys, time
         from dyna_zarr import _engine, io
@@ -273,7 +281,7 @@ def test_a_write_keeps_max_threads_busy(big, tmp_path, engine, max_threads):
         print(json.dumps(out))
     """, big, tmp_path, engine, max_threads)
     for name, cores in busy.items():
-        assert cores <= 1.5 * max_threads + 0.25, (name, busy)
+        assert cores <= limit, (name, busy, f"{os.cpu_count()} cores")
 
 
 @pytest.mark.parametrize("budget_mb", [32, 64])   # one region needs ~22 MB
