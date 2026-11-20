@@ -143,6 +143,63 @@ def memory_share(share):
         _SHARE.reset(token)
 
 
+class MemoryBudgetError(ValueError):
+    """``memory_budget_mb`` is below what the smallest write needs (one region with one
+    thread, or the smallest pass of ``write_levels``).
+
+    Raised before the output is created. ``needed_mb`` is the least budget that works.
+    A caller that works the budget out itself (from free memory, say) and would rather
+    finish over budget than stop writes inside :func:`soft_memory_budget`.
+    """
+
+    def __init__(self, message: str, needed_mb: float):
+        super().__init__(message)
+        self.needed_mb = needed_mb
+
+
+#: True inside soft_memory_budget(): a budget too small for the smallest write warns
+_SOFT_BUDGET = contextvars.ContextVar("dyna_zarr_io_soft_budget", default=False)
+
+
+@contextlib.contextmanager
+def soft_memory_budget():
+    """Writes in this context treat ``memory_budget_mb`` as a target: one too small for
+    the smallest write warns and writes with the smallest anyway (one region with one
+    thread), instead of raising :class:`MemoryBudgetError`.
+
+    For callers that work the budget out themselves, e.g. eubi-bridge's share of free
+    memory: there a conversion that finishes a little over its share is better than one
+    that stops. A budget the user set should stay a limit, so leave such writes outside.
+    """
+    token = _SOFT_BUDGET.set(True)
+    try:
+        yield
+    finally:
+        _SOFT_BUDGET.reset(token)
+
+
+def _budget_too_small(memory_budget_mb, needed_bytes, what, fallback, way_out=None,
+                      say=None):
+    """A budget below the smallest write: raise MemoryBudgetError naming the least that
+    works, or, inside soft_memory_budget(), warn and let the caller run its smallest
+    write (``fallback`` says what that is)."""
+    needed_mb = math.ceil(float(needed_bytes) / 2**20 * 10) / 10
+    msg = (f"memory_budget_mb={float(memory_budget_mb):g} is below what {what} needs: "
+           f"at least {needed_mb:g} MB.")
+    if _SOFT_BUDGET.get():
+        msg = f"{msg} {fallback}"
+        if say:
+            _say(f"{say} WARNING: {msg}", flush=True)
+        warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        return
+    raise MemoryBudgetError(
+        f"{msg} Raise memory_budget_mb to at least {needed_mb:g}"
+        + (f", or {way_out}" if way_out else "")
+        + ". Nothing was written. (A caller that works the budget out itself can write "
+          "inside io.soft_memory_budget() to warn and run the smallest write instead.)",
+        needed_mb)
+
+
 class Extrema:
     """Per-index minimum and maximum of everything io.write writes, for ``observe=``.
 
@@ -3501,7 +3558,14 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
                f"zarr v3 outputs, with backend='tensorstore' (blosc / zstd / gzip / no "
                f"compression) or backend='zarrista' (zarrista-bounded).")
         _say(f"[Levels] WARNING: {msg}", flush=True)
-        if unit_mib * max(1, int(max_threads)) > float(memory_budget_mb):
+        if unit_mib > float(memory_budget_mb):
+            _budget_too_small(
+                memory_budget_mb, unit_mib * 2**20,
+                f"one thread assembling a whole write unit of {aligned(1)}",
+                "Writing one unit per thread anyway.",
+                "write a local zarr v3 output with backend='tensorstore' or 'zarrista', "
+                "where big shards are appended chunk by chunk")
+        elif unit_mib * max(1, int(max_threads)) > float(memory_budget_mb):
             warnings.warn(msg, RuntimeWarning, stacklevel=2)
     if streamed and backend != "tensorstore" and not assembled:
         _say(f"[Levels] a whole write unit of {aligned(1)} exceeds region_size_mb, and "
@@ -3584,11 +3648,10 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
             per_thread = max(1, int(worker_cost(region)))
             affordable = int(float(memory_budget_mb) * 2**20 // per_thread)
             if affordable < 1:
-                msg = (f"memory_budget_mb={memory_budget_mb:g} cannot fit even one thread "
-                       f"(~{per_thread / 2**20:.0f} MiB for a region of {region}). Running "
-                       f"with one thread; reduce region_size_mb or raise the budget.")
-                _say(f"[Levels] WARNING: {msg}", flush=True)
-                warnings.warn(msg, RuntimeWarning, stacklevel=2)
+                _budget_too_small(memory_budget_mb, per_thread,
+                                  f"one thread (a region of {region})",
+                                  "Running with one thread.", "reduce region_size_mb",
+                                  say="[Levels]")
             max_threads = max(1, min(int(max_threads), affordable))
 
             def grow_to(mb, threads, now):
@@ -3663,12 +3726,10 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
                          f"{plan['blocks'] / 2**20:.0f} "
                          f"= {mib(plan['chunks'] + plan['blocks'])} of {memory_budget_mb:.0f}")
             if not plan["fits"]:
-                msg = (f"memory_budget_mb={memory_budget_mb:.0f} is below what even the "
-                       f"smallest pass (tiles of {plan['minimal'][0]}x{plan['minimal'][1]}, "
-                       f"1 thread) needs: at least {mib(plan['need_minimal'])}. Writing "
-                       f"with that anyway.")
-                _say(f"[Levels] WARNING: {msg}", flush=True)
-                warnings.warn(msg, RuntimeWarning, stacklevel=2)
+                _budget_too_small(memory_budget_mb, plan['need_minimal'],
+                                  f"the smallest pass (tiles of {plan['minimal'][0]}x"
+                                  f"{plan['minimal'][1]}, 1 thread)",
+                                  "Writing with that anyway.", say="[Levels]")
             if plan["amp"] > 1:
                 msg = (f"tiles of {ty}x{tx} split the source's read unit "
                        f"{tuple(src_unit[-2:])}: every unit is decoded ~{plan['amp']}x. A "
@@ -4313,18 +4374,6 @@ def _write_array(
         _say(f"Successfully wrote array to {output_path}")
         return output_path
 
-    # Opened BEFORE gc is disabled, so a failure to create the store cannot leave the
-    # interpreter's collector switched off.
-    output = _open_output(spec)
-    zip_output = output if spec.zip_target is not None else None
-
-    # The cyclic collector is paused while regions are in flight (their buffers are freed
-    # by reference counting). No forced gc.collect() first: it cost ~45 ms per write in a
-    # process the size of eubi-bridge's (180k objects), paid once per pyramid level -
-    # measured 60 -> 17 ms per small write, and the slowdown on many-scene conversions.
-    gc_was_enabled = gc.isenabled()
-    gc.disable()
-
     input_shape_temp = spec.shape
     final_dtype = spec.dtype
     final_dtype_obj = spec.dtype
@@ -4412,7 +4461,8 @@ def _write_array(
         # overlapping data silently, with no error. Grow
         # the region to whole shards rather than fail, since the region is an internal
         # tuning choice here, not something the caller asked for.
-        unit = output.write_unit
+        # the output's write unit (as Sink.write_unit): it is created after the plan
+        unit = tuple(spec.shards) if spec.shards is not None else tuple(spec.chunks)
         if any(r % u for r, u in zip(region_shape, unit)):
             grown = tuple(
                 min(-(-r // u) * u, s)
@@ -4487,8 +4537,22 @@ def _write_array(
 
     requested_workers = max(1, int(max_threads))
 
-    # Everything above - output, regions, bands - is shared by both engines, so they write
-    # exactly the same regions; only the execution loop below differs.
+    # --- the plan, before the output exists: a budget too small for the smallest write
+    # raises MemoryBudgetError without leaving an empty output behind (decision DR-5)
+    # engine="pipeline": max_threads = total live regions, split across the three stages
+    # that pin buffers (readers / queue / in-flight writes). Readers are the measured
+    # memory driver (1->8 readers: 507->1089 MiB, no time change), so they stay
+    # caller-tunable via num_readers.
+    def _split(n):
+        readers = max(1, n // 2) if num_readers is None else int(num_readers)
+        readers = max(1, min(readers, n - 2))               # leave >=1 queue, >=1 write
+        queue = max(1, (n - readers) // 2)
+        return readers, queue, max(1, n - readers - queue)
+
+    def _cost(split):
+        readers, queue, inflight = split
+        return readers * worker_bytes + queue * out_bytes + inflight * 2 * out_bytes
+
     if engine == "fused":
         # max_threads = every thread the write keeps busy (decision DR-5): regions in
         # flight x threads per region, TensorStore's pools limited to it (see _scope).
@@ -4497,12 +4561,43 @@ def _write_array(
             input_array, chunk_indices, input_shape, requested_workers, budget_bytes,
             worker_bytes, out_bytes)
         if not fits:
-            warnings.warn(
-                f"memory_budget_mb={memory_budget_mb:g} cannot fit even one thread "
-                f"(~{_mib(region_bytes)}: the region is read as {_mib(read_bytes)} and "
-                f"written as {_mib(out_bytes)}). Running with one thread; reduce "
-                f"region_shape/region_size_mb or raise the budget.",
-                RuntimeWarning, stacklevel=2)
+            _budget_too_small(
+                memory_budget_mb, region_bytes,
+                f"one region with one thread (it is read as {_mib(read_bytes)} and "
+                f"written as {_mib(out_bytes)})",
+                "Running with one thread.", "reduce region_shape/region_size_mb")
+    else:
+        max_threads = max(_MIN_LIVE_REGIONS, requested_workers)
+        if budget_bytes is not None:
+            # Ceiling, never a target: a generous budget must not RAISE concurrency above
+            # what was asked for. Take the largest live-region count whose stages fit.
+            fits = [n for n in range(max_threads, _MIN_LIVE_REGIONS - 1, -1)
+                    if _cost(_split(n)) <= budget_bytes]
+            if not fits:
+                _budget_too_small(
+                    memory_budget_mb, _cost(_split(_MIN_LIVE_REGIONS)),
+                    f"a minimal write pipeline ({_MIN_LIVE_REGIONS} regions live; a "
+                    f"region is read as {_mib(read_bytes)} and written as "
+                    f"{_mib(out_bytes)})",
+                    "Running at the floor.", "reduce region_shape/region_size_mb")
+            max_threads = fits[0] if fits else _MIN_LIVE_REGIONS
+        num_readers, queue_size, max_inflight_writes = _split(max_threads)
+
+    # Opened BEFORE gc is disabled, so a failure to create the store cannot leave the
+    # interpreter's collector switched off.
+    output = _open_output(spec)
+    zip_output = output if spec.zip_target is not None else None
+
+    # The cyclic collector is paused while regions are in flight (their buffers are freed
+    # by reference counting). No forced gc.collect() first: it cost ~45 ms per write in a
+    # process the size of eubi-bridge's (180k objects), paid once per pyramid level -
+    # measured 60 -> 17 ms per small write, and the slowdown on many-scene conversions.
+    gc_was_enabled = gc.isenabled()
+    gc.disable()
+
+    # Everything above - output, regions, bands - is shared by both engines, so they write
+    # exactly the same regions; only the execution loop below differs.
+    if engine == "fused":
         if per_region > 1:
             _say(f"[Optimized] Engine: fused, {workers * per_region} threads ({workers} "
                  f"region{'s' if workers > 1 else ''} at a time, each read with "
@@ -4523,37 +4618,7 @@ def _write_array(
         _say(f"Successfully wrote array to {output_path}")
         return output_path
 
-    # --- engine="pipeline": readers -> queue -> async writers ------------------------------
-    # max_threads = total live regions, split across the three stages that pin buffers
-    # (readers / queue / in-flight writes). Readers are the measured memory driver (1->8
-    # readers: 507->1089 MiB, no time change), so they stay caller-tunable via num_readers.
-    def _split(n):
-        readers = max(1, n // 2) if num_readers is None else int(num_readers)
-        readers = max(1, min(readers, n - 2))               # leave >=1 queue, >=1 write
-        queue = max(1, (n - readers) // 2)
-        return readers, queue, max(1, n - readers - queue)
-
-    def _cost(split):
-        readers, queue, inflight = split
-        return readers * worker_bytes + queue * out_bytes + inflight * 2 * out_bytes
-
-    max_threads = max(_MIN_LIVE_REGIONS, requested_workers)
-    if budget_bytes is not None:
-        # Ceiling, never a target: a generous budget must not RAISE concurrency above what
-        # was asked for. Take the largest live-region count whose stages fit.
-        fits = [n for n in range(max_threads, _MIN_LIVE_REGIONS - 1, -1)
-                if _cost(_split(n)) <= budget_bytes]
-        if not fits:
-            warnings.warn(
-                f"memory_budget_mb={memory_budget_mb:g} cannot fit even a minimal write "
-                f"pipeline: at least {_MIN_LIVE_REGIONS} regions must be live (~"
-                f"{_mib(_cost(_split(_MIN_LIVE_REGIONS)))}; a region is read as "
-                f"{_mib(read_bytes)} and written as {_mib(out_bytes)}). Running at the "
-                f"floor; reduce region_shape/region_size_mb or raise the budget.",
-                RuntimeWarning, stacklevel=2)
-        max_threads = fits[0] if fits else _MIN_LIVE_REGIONS
-    num_readers, queue_size, max_inflight_writes = _split(max_threads)
-
+    # --- engine="pipeline": readers -> queue -> async writers (planned above) -------------
     # Writer THREADS are not part of the memory budget knob: .write() is async (returns a
     # future; TensorStore's C++ pool does the I/O), so writer count is measurably irrelevant
     # to throughput (1 vs 8 writers = same wall time under zstd) while each extra writer
@@ -5033,6 +5098,13 @@ class io:
         while it runs: ``share()`` returns ``(memory MB, threads)`` usable now. See
         :func:`memory_share`."""
         return memory_share(share)
+
+    @staticmethod
+    def soft_memory_budget():
+        """Writes in this context warn, instead of raising MemoryBudgetError, when
+        ``memory_budget_mb`` is too small for the smallest write. See
+        :func:`soft_memory_budget`."""
+        return soft_memory_budget()
 
     @staticmethod
     def create_sink(output_path, shape, dtype, *, chunks=None, chunk_size_mb=None,

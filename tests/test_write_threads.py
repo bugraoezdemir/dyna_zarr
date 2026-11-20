@@ -276,7 +276,7 @@ def test_a_write_keeps_max_threads_busy(big, tmp_path, engine, max_threads):
         assert cores <= 1.5 * max_threads + 0.25, (name, busy)
 
 
-@pytest.mark.parametrize("budget_mb", [16, 64])
+@pytest.mark.parametrize("budget_mb", [32, 64])   # one region needs ~22 MB
 @pytest.mark.parametrize("case", ["copy", "mean", "float32"])
 def test_peak_memory_within_the_budget(big, tmp_path, engine, budget_mb, case):
     """The write's peak, over what the process held before it, stays within

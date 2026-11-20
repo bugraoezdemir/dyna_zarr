@@ -184,8 +184,9 @@ def test_the_budget_is_what_the_write_adds_to_the_process(data, tmp_path):
 def test_the_budget_caps_the_threads_when_shards_fit_a_region(data, tmp_path):
     outs = [dict(path=str(tmp_path / "L0.zarr"), factors=(1, 1, 1), chunks=(8, 64, 64))]
     with io.capture_messages() as messages:
+        # one thread needs 3 MB here (a 1 MB region read, transformed and written)
         io.write_levels(dyna_zarr.from_array(data), outs, zarr_format=2, max_threads=8,
-                        region_size_mb=1, memory_budget_mb=2.5)
+                        region_size_mb=1, memory_budget_mb=6.5)
     line = next(m for m in messages if "outputs in one pass" in m)
     assert re.search(r", ([12]) threads", line), line
     np.testing.assert_array_equal(zarr.open_array(outs[0]["path"])[...], data)
