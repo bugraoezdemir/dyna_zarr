@@ -194,18 +194,70 @@ def test_fused_floor_is_one_worker(tmp_path, capsys):
 
 
 @pytest.mark.parametrize("engine", ["fused", "pipeline"])
-def test_impossible_budget_warns_and_floors(tmp_path, engine):
-    """A budget too small for the floor warns loudly instead of deadlocking."""
+def test_impossible_budget_raises_before_writing(tmp_path, engine):
+    """A budget too small for the smallest write fails loudly, names the least budget
+    that works, and leaves no output behind (decision DR-5)."""
+    from dyna_zarr import MemoryBudgetError
+    arr = _src(tmp_path)
+    out = tmp_path / "o.zarr"
+    kw = dict(chunks=(8, 8, 8), engine=engine, region_shape=(16, 16, 16), zarr_format=2,
+              max_threads=8)
+    with pytest.raises(MemoryBudgetError) as err:
+        io.write(arr, str(out), memory_budget_mb=0.001, **kw)
+    assert err.value.needed_mb > 0.001
+    assert f"at least {err.value.needed_mb:g}" in str(err.value)
+    assert not out.exists()
+    # the budget it names is enough
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        io.write(arr, str(out), memory_budget_mb=err.value.needed_mb, **kw)
+    np.testing.assert_array_equal(zarr.open(str(out), mode="r")[:], arr[...])
+
+
+@pytest.mark.parametrize("engine", ["fused", "pipeline"])
+def test_impossible_budget_in_a_soft_budget_warns_and_floors(tmp_path, engine):
+    """Inside io.soft_memory_budget() (a budget the caller worked out, e.g. eubi's
+    share of free memory) the same budget warns and writes with the smallest write."""
     arr = _src(tmp_path)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), engine=engine,
-                 region_shape=(16, 16, 16), zarr_format=2,
-                 max_threads=8, memory_budget_mb=0.001)
+        with io.soft_memory_budget():
+            io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), engine=engine,
+                     region_shape=(16, 16, 16), zarr_format=2,
+                     max_threads=8, memory_budget_mb=0.001)
     msgs = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
-    assert any("cannot fit" in m for m in msgs), msgs
-    # and it still produced correct output
-    assert zarr.open(str(tmp_path / "o.zarr"), mode="r").shape == (32, 32, 32)
+    assert any("is below what" in m for m in msgs), msgs
+    np.testing.assert_array_equal(zarr.open(str(tmp_path / "o.zarr"), mode="r")[:],
+                                  arr[...])
+
+
+def test_a_soft_budget_ends_with_its_context(tmp_path):
+    from dyna_zarr import MemoryBudgetError
+    arr = _src(tmp_path)
+    with io.soft_memory_budget():
+        pass
+    with pytest.raises(MemoryBudgetError):
+        io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), zarr_format=2,
+                 region_shape=(16, 16, 16), memory_budget_mb=0.001)
+
+
+@pytest.mark.parametrize("soft", [False, True])
+def test_write_levels_budget_below_one_thread(tmp_path, soft):
+    """write_levels: raises before creating its outputs, or warns in a soft budget."""
+    from dyna_zarr import MemoryBudgetError
+    arr = _src(tmp_path)
+    outs = [dict(path=str(tmp_path / "L0.zarr"), factors=(1, 1, 1), chunks=(8, 8, 8)),
+            dict(path=str(tmp_path / "L1.zarr"), factors=(2, 2, 2), chunks=(8, 8, 8))]
+    if not soft:
+        with pytest.raises(MemoryBudgetError) as err:
+            io.write_levels(arr, outs, zarr_format=2, max_threads=4, memory_budget_mb=0.001)
+        assert err.value.needed_mb > 0.001
+        assert not any((tmp_path / n).exists() for n in ("L0.zarr", "L1.zarr"))
+        return
+    with pytest.warns(RuntimeWarning, match="is below what"):
+        with io.soft_memory_budget():
+            io.write_levels(arr, outs, zarr_format=2, max_threads=4, memory_budget_mb=0.001)
+    np.testing.assert_array_equal(zarr.open(outs[0]["path"], mode="r")[:], arr[...])
 
 
 @pytest.mark.parametrize("engine,workers", [("fused", 1), ("pipeline", 3)])
