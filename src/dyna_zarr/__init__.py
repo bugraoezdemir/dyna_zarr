@@ -11,6 +11,10 @@ Includes efficient TIFF reading via tifffile's zarr bridge with concurrent acces
 __version__ = "0.1.6"
 __author__ = "Bugra Oezdemir"
 
+# First, before anything starts threads: glibc arenas shared by dyna's threads, so a
+# write's memory stays near memory_budget_mb on Linux (see _release)
+from . import _release  # noqa: F401,E402
+
 # Import core classes
 from .dynamic_array import DynamicArray, slice_array, from_array
 from .codecs import Codecs
