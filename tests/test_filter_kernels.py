@@ -191,3 +191,152 @@ def test_errors_name_the_way_out():
         filters.correlate1d(x.T, [1.0], 0, np.zeros((5, 4), np.float32))
     with pytest.raises(filters.FilterError, match="float16 is not supported"):
         filters.correlate1d(x.astype("float16"), [1.0], 0, np.zeros((4, 5), np.float16))
+
+
+# ----------------------------------------------------------------- step 3 (DR7)
+# Passes are given as (axis, kind, values, origin, mode) to filters.chains.
+
+
+def _same_bits(got, want, msg=""):
+    """Equal values, NaN where NaN, and the same sign of zero."""
+    np.testing.assert_array_equal(got, want, err_msg=msg)
+    if got.dtype.kind == "f":
+        np.testing.assert_array_equal(np.signbit(got), np.signbit(want), err_msg=msg)
+
+
+def _floats_with_specials(shape, dtype, seed):
+    x = _data(shape, dtype, seed)
+    flat = x.reshape(-1)
+    if flat.size > 4:
+        flat[1], flat[flat.size // 2] = np.nan, -0.0
+        flat[-2] = 0.0
+    return x
+
+
+def _chains_out(x, chains, combine=None, threads=1):
+    out = np.empty(x.shape, x.dtype)
+    filters.chains(x, chains, out, combine=combine, threads=threads)
+    return out
+
+
+@pytest.mark.parametrize("dtype", TYPES)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("kind", ["minimum", "maximum"])
+@pytest.mark.parametrize("size, origin", [(1, 0), (2, 0), (3, 0), (4, -1), (5, 2), (8, -4)])
+def test_minimum_and_maximum_equal_scipy(dtype, mode, kind, size, origin):
+    """Sliding minima and maxima, NaN and signed zeros included (floats)."""
+    f1d = ndi.minimum_filter1d if kind == "minimum" else ndi.maximum_filter1d
+    for k, shape in enumerate(SHAPES):
+        make = _floats_with_specials if np.dtype(dtype).kind == "f" else _data
+        x = make(shape, dtype, seed=k)
+        for axis in range(len(shape)):
+            if size // 2 + origin >= size or size // 2 + origin < 0:
+                continue
+            want = f1d(x, size, axis, mode=mode, cval=3.5, origin=origin)
+            out = np.empty_like(x)
+            filters.chains(x, [[(axis, kind, [size], origin, mode)]], out, cval=3.5)
+            _same_bits(out, want, f"{shape} axis {axis}")
+
+
+@pytest.mark.parametrize("dtype", TYPES)
+@pytest.mark.parametrize("mode", MODES)
+def test_separable_minimum_maximum_and_grey_morphology_equal_scipy(dtype, mode):
+    make = _floats_with_specials if np.dtype(dtype).kind == "f" else _data
+    x = make((5, 9, 12), dtype, seed=11)
+    sizes = (2, 3, 4)
+    mn = _chains_out(x, [[(a, "minimum", [s], 0, mode) for a, s in enumerate(sizes)]])
+    _same_bits(mn, ndi.minimum_filter(x, sizes, mode=mode))
+    _same_bits(mn, ndi.grey_erosion(x, size=sizes, mode=mode))
+    # grey_dilation: the origin negated, one lower for even sizes
+    dil = [(a, "maximum", [s], -(1 - s % 2), mode) for a, s in enumerate(sizes)]
+    _same_bits(_chains_out(x, [dil]), ndi.grey_dilation(x, size=sizes, mode=mode))
+    mx = _chains_out(x, [[(a, "maximum", [s], 0, mode) for a, s in enumerate(sizes)]])
+    _same_bits(mx, ndi.maximum_filter(x, sizes, mode=mode))
+
+
+@pytest.mark.parametrize("dtype", TYPES)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("size, origin", [(2, 0), (3, 0), (4, -1), (5, 1), (9, 0)])
+def test_uniform_equals_scipy(dtype, mode, size, origin):
+    """The running sum in scipy's order: equal for floats too on the whole array."""
+    for k, shape in enumerate(SHAPES):
+        x = _data(shape, dtype, seed=k)
+        for axis in range(len(shape)):
+            if not X86 and _out_of_range(x, np.full(size, 1 / size), axis, mode, 3.5,
+                                         origin, dtype):
+                continue
+            want = ndi.uniform_filter1d(x, size, axis, mode=mode, cval=3.5, origin=origin)
+            out = np.empty_like(x)
+            filters.chains(x, [[(axis, "uniform", [size], origin, mode)]], out, cval=3.5)
+            _same_bits(out, want, f"{shape} axis {axis}")
+
+
+@pytest.mark.parametrize("dtype", TYPES)
+@pytest.mark.parametrize("mode", MODES)
+def test_laplace_equals_scipy(dtype, mode):
+    """generic_laplace: one [1, -2, 1] pass per axis on the input, added in the type."""
+    for k, shape in enumerate(SHAPES):
+        x = _data(shape, dtype, seed=k)
+        if not X86 and any(_out_of_range(x, [1, -2, 1], a, mode, 3.5, 0, dtype)
+                           for a in range(x.ndim)):
+            continue
+        chains = [[(a, "correlate", [1.0, -2.0, 1.0], 0, mode)] for a in range(x.ndim)]
+        out = np.empty_like(x)
+        filters.chains(x, chains, out, combine="sum", cval=3.5)
+        _same_bits(out, ndi.laplace(x, mode=mode, cval=3.5), f"{shape}")
+
+
+def _gaussian_chain(ndim, sigma, order, mode, truncate=4.0):
+    """scipy's gaussian_filter as passes, with scipy's own weights."""
+    chain = []
+    for a in range(ndim):
+        if sigma[a] > 1e-15:
+            w = _gaussian_kernel1d(sigma[a], order[a], int(truncate * float(sigma[a]) + 0.5))
+            chain.append((a, "correlate", [float(v) for v in w[::-1]], 0, mode))
+    return chain
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "int16", "uint16", "int32", "float32", "float64"])
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("sigma", [(1.0, 1.5, 2.0), (0.0, 1.0, 0.7)])
+def test_gaussian_laplace_equals_scipy(dtype, mode, sigma):
+    x = _data((5, 19, 14), dtype, seed=12)
+    if not X86 and np.dtype(dtype).kind != "f":
+        pytest.skip("second derivatives leave the range of integer types")
+    chains = []
+    for d in range(3):
+        order = [2 if a == d else 0 for a in range(3)]
+        chains.append(_gaussian_chain(3, sigma, order, mode))
+    out = np.empty_like(x)
+    filters.chains(x, chains, out, combine="sum")
+    _same_bits(out, ndi.gaussian_laplace(x, sigma, mode=mode))
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("sigma", [(1.0, 1.5, 2.0), (0.0, 1.0, 0.7)])
+def test_gaussian_gradient_magnitude_equals_scipy(dtype, mode, sigma):
+    x = _data((5, 19, 14), dtype, seed=13)
+    chains = []
+    for d in range(3):
+        order = [1 if a == d else 0 for a in range(3)]
+        chains.append(_gaussian_chain(3, sigma, order, mode))
+    for threads in (1, 4):
+        out = np.empty_like(x)
+        filters.chains(x, chains, out, combine="hypot", threads=threads)
+        _same_bits(out, ndi.gaussian_gradient_magnitude(x, sigma, mode=mode))
+
+
+def test_a_gradient_magnitude_of_integers_is_refused():
+    x = np.zeros((4, 5), np.uint16)
+    chains = [[(0, "correlate", [-1.0, 0.0, 1.0], 0, "reflect")]]
+    with pytest.raises(filters.FilterError, match="floating-point"):
+        filters.chains(x, chains, np.empty_like(x), combine="hypot")
+
+
+def test_running_passes_on_threads_change_nothing():
+    x = _floats_with_specials((30, 40, 50), "float32", seed=14)
+    for kind, size in (("minimum", 5), ("maximum", 4), ("uniform", 7)):
+        for axis in range(3):
+            chain = [[(axis, kind, [size], 0, "mirror")]]
+            _same_bits(_chains_out(x, chain, threads=4), _chains_out(x, chain))

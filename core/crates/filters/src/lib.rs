@@ -16,9 +16,13 @@
 
 mod correlate;
 mod gaussian;
+mod pass;
+mod running;
 
-pub use correlate::{correlate1d, Span};
-pub use gaussian::{gaussian_filter, gaussian_weights, numpy_sum, radius, separable, Pass};
+pub use correlate::{correlate1d, correlate1d_on, pass_bytes, Span};
+pub use gaussian::{gaussian_filter, gaussian_weights, numpy_sum, radius};
+pub use pass::{separable, terms, Combine, Line, Pass};
+pub use running::{min_max1d_on, running_pass_bytes, uniform1d_on};
 
 /// The crate's version, as `dyna_zarr_core` reports it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -124,6 +128,12 @@ pub trait Element: Copy + Send + Sync + 'static {
     /// "integer indefinite" value (the lowest integer), as on x86-64. ARM compilers
     /// saturate instead, so scipy's own results differ there for values out of range.
     fn from_f64(v: f64) -> Self;
+    /// `self + other` as numpy adds in this type (integers wrap).
+    fn add_wrapping(self, other: Self) -> Self;
+    /// `self * other` as numpy multiplies in this type (integers wrap).
+    fn mul_wrapping(self, other: Self) -> Self;
+    /// The square root in this type, for floating-point types (None for integers).
+    fn sqrt(self) -> Option<Self>;
 }
 
 /// x86's `cvttsd2si` to 32 bits: truncation, the lowest i32 outside its range or NaN.
@@ -145,7 +155,7 @@ fn cvtt64(v: f64) -> i64 {
 }
 
 macro_rules! element {
-    ($($t:ty, $name:literal, |$v:ident| $out:expr;)*) => {$(
+    ($($t:ty, $name:literal, $kind:ident, |$v:ident| $out:expr;)*) => {$(
         impl Element for $t {
             const NAME: &'static str = $name;
             #[inline(always)]
@@ -156,27 +166,54 @@ macro_rules! element {
             fn from_f64($v: f64) -> Self {
                 $out
             }
+            element!(@arith $kind $t);
         }
     )*};
+    (@arith int $t:ty) => {
+        #[inline(always)]
+        fn add_wrapping(self, other: Self) -> Self {
+            <$t>::wrapping_add(self, other)
+        }
+        #[inline(always)]
+        fn mul_wrapping(self, other: Self) -> Self {
+            <$t>::wrapping_mul(self, other)
+        }
+        fn sqrt(self) -> Option<Self> {
+            None
+        }
+    };
+    (@arith float $t:ty) => {
+        #[inline(always)]
+        fn add_wrapping(self, other: Self) -> Self {
+            self + other
+        }
+        #[inline(always)]
+        fn mul_wrapping(self, other: Self) -> Self {
+            self * other
+        }
+        fn sqrt(self) -> Option<Self> {
+            Some(<$t>::sqrt(self))
+        }
+    };
 }
 
 element! {
-    u8, "uint8", |v| cvtt32(v) as u8;
-    i8, "int8", |v| cvtt32(v) as i8;
-    u16, "uint16", |v| cvtt32(v) as u16;
-    i16, "int16", |v| cvtt32(v) as i16;
+    u8, "uint8", int, |v| cvtt32(v) as u8;
+    i8, "int8", int, |v| cvtt32(v) as i8;
+    u16, "uint16", int, |v| cvtt32(v) as u16;
+    i16, "int16", int, |v| cvtt32(v) as i16;
     // 32-bit integers: unsigned through the 64-bit conversion, as compilers emit it
-    u32, "uint32", |v| cvtt64(v) as u32;
-    i32, "int32", |v| cvtt32(v);
+    u32, "uint32", int, |v| cvtt64(v) as u32;
+    i32, "int32", int, |v| cvtt32(v);
     // the usual unsigned 64-bit sequence: values from 2^63 up are shifted down first
-    u64, "uint64", |v| if v < 9_223_372_036_854_775_808.0 {
+    u64, "uint64", int, |v| if v < 9_223_372_036_854_775_808.0 {
         cvtt64(v) as u64
     } else {
         (cvtt64(v - 9_223_372_036_854_775_808.0) as u64) ^ (1 << 63)
     };
-    i64, "int64", |v| cvtt64(v);
-    f32, "float32", |v| v as f32;
-    f64, "float64", |v| v;
+    i64, "int64", int, |v| cvtt64(v);
+    f32, "float32", float, |v| v as f32;
+    f64, "float64", float, |v| v;
 }
 
 #[cfg(test)]

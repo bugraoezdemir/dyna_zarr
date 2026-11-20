@@ -68,8 +68,12 @@ class MapOverlapTransform(Transform):
     """
 
     def __init__(self, array, func, depth, boundary="reflect", dtype=None, name=None,
-                 device=None, block_info=False, align=None):
+                 device=None, block_info=False, align=None, kernel=None):
         super().__init__()
+        #: which named filter ``func`` is, with its arguments (``{"name": ..., ...}``), set
+        #: by the filters below; dyna's native engine reads a transform it recognises
+        #: (Workplan DR7, see _lowering). A ``func`` alone is never recognised.
+        self.kernel = kernel
         if boundary not in _BOUNDARY_TO_NPPAD:
             raise ValueError(f"unknown boundary {boundary!r}; expected one of "
                              f"{sorted(_BOUNDARY_TO_NPPAD)}")
@@ -240,17 +244,44 @@ def map_overlap(array, func, depth, boundary="reflect", dtype=None, name=None, d
     )
 
 
+def _named(array, func, depth, boundary, name, device, kernel):
+    """map_overlap for one of the named filters below, recording which it is (``kernel``)
+    so the native engine can read it."""
+    return array._with_transform(
+        MapOverlapTransform(array, func, depth, boundary=boundary, name=name,
+                            device=device, kernel=kernel))
+
+
+#: gaussian_filter keywords the engine follows; any other keeps the Python path
+_GAUSSIAN_KW = {"order", "cval"}
+
+
 def gaussian_filter(array, sigma, boundary="reflect", truncate=4.0, device=None, **kw):
     depth = _gaussian_depth(sigma, array.ndim, truncate)
     func = lambda b: ndimage_namespace(b).gaussian_filter(
         b, sigma=sigma, mode=boundary, truncate=truncate, **kw)
-    return map_overlap(array, func, depth, boundary=boundary, name="gaussian_filter", device=device)
+    kernel = None
+    if set(kw) <= _GAUSSIAN_KW:
+        kernel = {"name": "gaussian_filter", "sigma": sigma, "order": kw.get("order", 0),
+                  "mode": boundary, "cval": kw.get("cval", 0.0), "truncate": truncate}
+    return _named(array, func, depth, boundary, "gaussian_filter", device, kernel)
+
+
+#: keywords the engine follows for the filters below; any other keeps the Python path
+_CVAL_KW = {"cval"}
+
+
+def _size_kernel(name, size, boundary, kw):
+    """The kernel spec of a filter with a window of ``size`` (None: not for the engine)."""
+    if not set(kw) <= _CVAL_KW:
+        return None
+    return {"name": name, "size": size, "mode": boundary, "cval": kw.get("cval", 0.0)}
 
 
 def uniform_filter(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).uniform_filter(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="uniform_filter", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "uniform_filter",
+                  device, _size_kernel("uniform_filter", size, boundary, kw))
 
 
 def median_filter(array, size, boundary="reflect", device=None, **kw):
@@ -261,26 +292,26 @@ def median_filter(array, size, boundary="reflect", device=None, **kw):
 
 def minimum_filter(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).minimum_filter(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="minimum_filter", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "minimum_filter", device,
+                  _size_kernel("minimum_filter", size, boundary, kw))
 
 
 def maximum_filter(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).maximum_filter(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="maximum_filter", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "maximum_filter", device,
+                  _size_kernel("maximum_filter", size, boundary, kw))
 
 
 def grey_erosion(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).grey_erosion(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="grey_erosion", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "grey_erosion", device,
+                  _size_kernel("grey_erosion", size, boundary, kw))
 
 
 def grey_dilation(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).grey_dilation(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="grey_dilation", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "grey_dilation", device,
+                  _size_kernel("grey_dilation", size, boundary, kw))
 
 
 def _kernel_depth(weights, ndim):
@@ -318,8 +349,10 @@ def laplace(array, boundary="reflect", device=None, **kw):
     """Laplace filter via the second-derivative [1, -2, 1] stencil (scipy.ndimage.laplace).
     Fixed radius 1 on every axis."""
     func = lambda b: ndimage_namespace(b).laplace(b, mode=boundary, **kw)
-    return map_overlap(array, func, (1,) * array.ndim, boundary=boundary,
-                       name="laplace", device=device)
+    kernel = None
+    if set(kw) <= _CVAL_KW:
+        kernel = {"name": "laplace", "mode": boundary, "cval": kw.get("cval", 0.0)}
+    return _named(array, func, (1,) * array.ndim, boundary, "laplace", device, kernel)
 
 
 def gaussian_laplace(array, sigma, boundary="reflect", truncate=4.0, device=None, **kw):
@@ -328,8 +361,8 @@ def gaussian_laplace(array, sigma, boundary="reflect", truncate=4.0, device=None
     depth = _gaussian_depth(sigma, array.ndim, truncate)
     func = lambda b: ndimage_namespace(b).gaussian_laplace(
         b, sigma=sigma, mode=boundary, truncate=truncate, **kw)
-    return map_overlap(array, func, depth, boundary=boundary,
-                       name="gaussian_laplace", device=device)
+    return _named(array, func, depth, boundary, "gaussian_laplace", device,
+                  _gaussian_kernel("gaussian_laplace", sigma, boundary, truncate, kw))
 
 
 def gaussian_gradient_magnitude(array, sigma, boundary="reflect", truncate=4.0,
@@ -339,8 +372,18 @@ def gaussian_gradient_magnitude(array, sigma, boundary="reflect", truncate=4.0,
     depth = _gaussian_depth(sigma, array.ndim, truncate)
     func = lambda b: ndimage_namespace(b).gaussian_gradient_magnitude(
         b, sigma=sigma, mode=boundary, truncate=truncate, **kw)
-    return map_overlap(array, func, depth, boundary=boundary,
-                       name="gaussian_gradient_magnitude", device=device)
+    return _named(array, func, depth, boundary, "gaussian_gradient_magnitude", device,
+                  _gaussian_kernel("gaussian_gradient_magnitude", sigma, boundary, truncate,
+                                   kw))
+
+
+def _gaussian_kernel(name, sigma, boundary, truncate, kw):
+    """The kernel spec of gaussian_laplace / gaussian_gradient_magnitude (None: not for
+    the engine)."""
+    if not set(kw) <= _CVAL_KW:
+        return None
+    return {"name": name, "sigma": sigma, "mode": boundary, "cval": kw.get("cval", 0.0),
+            "truncate": truncate}
 
 
 __all__ = [

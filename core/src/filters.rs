@@ -227,6 +227,91 @@ fn gaussian_filter(
     })
 }
 
+/// One pass as Python gives it: (axis, kind, values, origin, mode).
+pub type PassSpec = (usize, String, Vec<f64>, isize, String);
+
+/// The passes of `chains` (see `Array.filter`), with `cval` for constant mode.
+pub fn chains_of(chains: Vec<Vec<PassSpec>>, cval: f64) -> Result<Vec<Vec<fl::Pass>>, String> {
+    chains
+        .into_iter()
+        .map(|c| c.into_iter().map(|p| pass_of(p, cval)).collect())
+        .collect()
+}
+
+fn pass_of((axis, kind, values, origin, mode): PassSpec, cval: f64) -> Result<fl::Pass, String> {
+    let mode = fl::Mode::parse(&mode, cval)
+        .ok_or_else(|| format!("mode {mode:?}: reflect, mirror, nearest, wrap or constant"))?;
+    let size = || match values.as_slice() {
+        [s] if s.fract() == 0.0 && *s >= 1.0 => Ok(*s as usize),
+        _ => Err(format!("a {kind} pass takes [size], not {values:?}")),
+    };
+    let line = match kind.as_str() {
+        "correlate" => fl::Line::Correlate {
+            weights: values.clone(),
+            origin,
+        },
+        "uniform" => fl::Line::Uniform {
+            size: size()?,
+            origin,
+        },
+        "minimum" | "maximum" => fl::Line::MinMax {
+            size: size()?,
+            origin,
+            minimum: kind == "minimum",
+        },
+        other => {
+            return Err(format!(
+                "pass kind {other:?}: correlate, uniform, minimum or maximum"
+            ))
+        }
+    };
+    Ok(fl::Pass { axis, line, mode })
+}
+
+/// `combine` by name: None, "sum" or "hypot".
+pub fn combine_of(combine: Option<&str>) -> Result<Option<fl::Combine>, String> {
+    combine
+        .map(|c| fl::Combine::parse(c).ok_or_else(|| format!("combine {c:?}: sum or hypot")))
+        .transpose()
+}
+
+/// A filter of chains of passes (see `Array.filter`) on a whole NumPy array: scipy's
+/// separable filters (one chain) and generic_laplace / generic_gradient_magnitude
+/// (several, combined by "sum" / "hypot").
+#[pyfunction]
+#[pyo3(signature = (input, chains, output, combine = None, cval = 0.0, threads = 1))]
+fn chains(
+    py: Python<'_>,
+    input: &Bound<'_, PyAny>,
+    chains: Vec<Vec<PassSpec>>,
+    output: &Bound<'_, PyAny>,
+    combine: Option<&str>,
+    cval: f64,
+    threads: usize,
+) -> PyResult<()> {
+    let (i, o) = (Mem::of(input, false)?, Mem::of(output, true)?);
+    checked(&i, &o)?;
+    let chains = chains_of(chains, cval).map_err(FilterError::new_err)?;
+    let combine = combine_of(combine).map_err(FilterError::new_err)?;
+    let n = i.shape.len();
+    if let Some(p) = chains.iter().flatten().find(|p| p.axis >= n) {
+        return Err(FilterError::new_err(format!(
+            "a pass along axis {} of a {n}-d array",
+            p.axis
+        )));
+    }
+    let shape = i.shape.clone();
+    threaded(py, threads, || {
+        typed!(i, o, |x, y| match (chains.len(), combine) {
+            (1, None) => fl::separable(x, &shape, &chains[0], y),
+            (_, Some(c)) => fl::terms(x, &shape, &chains, c, y),
+            _ => Err(fl::FilterError::new(
+                "several chains need combine (sum or hypot)",
+            )),
+        })
+    })
+}
+
 /// The correlation weights of scipy.ndimage.gaussian_filter1d (its kernel reversed).
 #[pyfunction]
 fn gaussian_weights(sigma: f64, order: usize, radius: usize) -> Vec<f64> {
@@ -245,6 +330,7 @@ pub fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add("VERSION", fl::VERSION)?;
     m.add_function(wrap_pyfunction!(correlate1d, &m)?)?;
     m.add_function(wrap_pyfunction!(gaussian_filter, &m)?)?;
+    m.add_function(wrap_pyfunction!(chains, &m)?)?;
     m.add_function(wrap_pyfunction!(gaussian_weights, &m)?)?;
     m.add_function(wrap_pyfunction!(numpy_sum, &m)?)?;
     Ok(m)

@@ -1,7 +1,7 @@
 //! The Gaussian filter and its derivatives (scipy.ndimage.gaussian_filter), and the
 //! driver that runs a separable filter as a sequence of passes.
 
-use crate::{correlate1d, Element, FilterError, Mode, Span};
+use crate::{separable, Element, FilterError, Mode, Pass};
 
 /// numpy's `a.sum()` of a contiguous f64 array (numpy 2): its pairwise sum of all the
 /// elements, 8 accumulators in blocks of up to 128, halved above that. Matched numpy
@@ -96,60 +96,6 @@ pub fn gaussian_weights(sigma: f64, order: usize, radius: usize) -> Vec<f64> {
     kernel
 }
 
-/// One pass of a separable filter: correlate along `axis` with `weights`, extended by
-/// `mode`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Pass {
-    pub axis: usize,
-    pub weights: Vec<f64>,
-    pub mode: Mode,
-}
-
-/// Run `passes` over the whole of `input` (C order, `shape`) into `output`, as scipy
-/// runs a separable filter: the first pass reads `input`, every later pass reads the
-/// one before in the output type. No passes: `output` is `input` cast.
-pub fn separable<T: Element, U: Element + Default>(
-    input: &[T],
-    shape: &[usize],
-    passes: &[Pass],
-    output: &mut [U],
-) -> Result<(), FilterError> {
-    if output.len() != input.len() {
-        return Err(FilterError::new(format!(
-            "output of {} elements for an input of {}",
-            output.len(),
-            input.len()
-        )));
-    }
-    let run = |src: &[_], p: &Pass, dst: &mut [U]| -> Result<(), FilterError> {
-        let span = Span::whole(*shape.get(p.axis).unwrap_or(&0));
-        correlate1d::<U, U>(src, shape, p.axis, &p.weights, 0, p.mode, span, dst)
-    };
-    let Some((first, rest)) = passes.split_first() else {
-        for (o, v) in output.iter_mut().zip(input) {
-            *o = U::from_f64(v.to_f64());
-        }
-        return Ok(());
-    };
-    let span = Span::whole(*shape.get(first.axis).unwrap_or(&0));
-    correlate1d(
-        input,
-        shape,
-        first.axis,
-        &first.weights,
-        0,
-        first.mode,
-        span,
-        output,
-    )?;
-    let mut tmp = vec![U::default(); output.len()];
-    for p in rest {
-        tmp.copy_from_slice(output);
-        run(&tmp, p, output)?;
-    }
-    Ok(())
-}
-
 /// scipy.ndimage.gaussian_filter of the whole of `input` into `output`: per axis in
 /// order, a pass of [`gaussian_weights`] (axes with sigma <= 1e-15 are skipped, as
 /// scipy). `sigma`, `order` and `mode` hold one entry per axis.
@@ -175,10 +121,9 @@ pub fn gaussian_filter<T: Element, U: Element + Default>(
     }
     let passes: Vec<Pass> = (0..n)
         .filter(|&a| sigma[a] > 1e-15)
-        .map(|a| Pass {
-            axis: a,
-            weights: gaussian_weights(sigma[a], order[a], radius(sigma[a], truncate)),
-            mode: mode[a],
+        .map(|a| {
+            let w = gaussian_weights(sigma[a], order[a], radius(sigma[a], truncate));
+            Pass::correlate(a, w, mode[a])
         })
         .collect();
     separable(input, shape, &passes, output)

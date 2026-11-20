@@ -38,12 +38,19 @@ def arrays(tmp_path_factory):
         z[...] = data
         return core.Array.open(str(tmp / name))
 
-    return {
+    out = {
         "v2-blosc": write("v2", (4, 32, 32), 2, compressors=numcodecs.Blosc(cname="lz4")),
         "v3-zstd": write("v3", (4, 32, 32), compressors=zc.ZstdCodec(level=3)),
         "v3-none": write("v3n", (4, 32, 32), compressors=None),
         "v3-sharded": write("sh", (2, 16, 16), shards=(4, 32, 64)),
     }
+    # The engine's shared pools of 2, 4, 8 and 16 threads, made before any measurement:
+    # the first read with a thread count creates its pool (about 30 KB kept for the
+    # process), which is not that read's memory. Without this, whichever case first
+    # used 4 threads measured 30 KB more (a filter read, run alone, went 286 bytes over).
+    for t in (2, 4, 8, 16):
+        out["v3-zstd"].downsample([2, 2, 2], "mean").read([0, 0, 0], [6, 48, 64], threads=t)
+    return out
 
 
 def _rotation():
@@ -72,7 +79,31 @@ CHAINS = {
     "mean-split": lambda a: a.downsample([2, 2, 2], "mean", max_read_mb=0.02),
     "gaussian-split": lambda a: a.downsample([2, 2, 2], "gaussian", max_read_mb=0.05),
     "resample-split": lambda a: a.resample(_rotation(), list(a.shape), "linear", max_read_mb=0.02),
+    # separable filters (DR7): Gaussian passes of radius 2, 4 and 8, in three modes
+    "filter": lambda a: a.separable(_filter_passes("reflect", "mirror", "nearest")),
+    # wrap reaches the far end of the axis: the box spans it whole near an edge
+    "filter-wrap": lambda a: a.separable(_filter_passes("wrap", "constant", "wrap")),
+    "filter-split": lambda a: a.separable(_filter_passes("reflect", "reflect", "reflect"),
+                                          max_read_mb=0.05),
+    "filter-of-mean": lambda a: a.downsample([1, 2, 2], "mean")
+    .separable(_filter_passes("mirror", "mirror", "mirror")),
+    # running passes (a maximum, a minimum with an origin, a uniform window)
+    "filter-running": lambda a: a.filter([[(0, "maximum", [3], 0, "reflect"),
+                                           (1, "minimum", [4], -1, "mirror"),
+                                           (2, "uniform", [5], 0, "nearest")]]),
+    # chains combined: a laplace (sum) and a gradient magnitude (hypot, floats)
+    "filter-sum": lambda a: a.filter([[(k, "correlate", [1.0, -2.0, 1.0], 0, "reflect")]
+                                      for k in range(3)], combine="sum"),
+    "filter-hypot": lambda a: a.astype("float32").filter(
+        [[(k, "correlate", list(core.filters.gaussian_weights(1.0, int(k == d), 4)), 0,
+           "mirror") for k in range(3)] for d in range(3)], combine="hypot"),
 }
+
+
+def _filter_passes(*modes):
+    w = core.filters.gaussian_weights
+    return [(0, w(0.5, 0, 2), modes[0]), (1, w(1.0, 0, 4), modes[1]),
+            (2, w(2.0, 1, 8), modes[2])]
 
 
 def _regions(v):

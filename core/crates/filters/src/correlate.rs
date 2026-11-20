@@ -34,7 +34,117 @@ impl Span {
 
 /// Lanes of this many elements are summed together (a pass along any axis but the last
 /// sums whole rows of the block at once, element by element in scipy's order).
-const LANE: usize = 256;
+pub(crate) const LANE: usize = 256;
+
+/// Output rows a task of a pass along any axis but the last computes together (the input
+/// rows they share are converted to f64 once).
+const BLOCK: usize = 16;
+
+/// Heap bytes of one correlation pass computing `out_len` positions with `taps` weights:
+/// (shared, per thread). Shared: the extended line's row table. Per thread: a line and its
+/// sums (along the last axis) or a block's scratch (along another), whichever is larger.
+/// For callers that budget memory.
+pub fn pass_bytes(out_len: usize, taps: usize) -> (u64, u64) {
+    let ext = (out_len + taps.max(1) - 1) as u64;
+    let shared = ext * std::mem::size_of::<Option<usize>>() as u64;
+    let line = 2 * ext * 8;
+    let block = ((BLOCK + taps) * LANE * 8) as u64;
+    (shared, line.max(block))
+}
+
+/// What every pass along an axis needs: the block's layout and the extended line's rows.
+pub(crate) struct Layout {
+    pub(crate) outer: usize,
+    pub(crate) in_len: usize,
+    pub(crate) inner: usize,
+    pub(crate) out_len: usize,
+    /// out_len + taps - 1: the extended line's length
+    pub(crate) ext: usize,
+    /// for every entry b of the extended line (position out_start + b - (taps / 2 + origin)),
+    /// its row in the block, or None for the fill (constant mode)
+    pub(crate) rows: Vec<Option<usize>>,
+}
+
+/// Check a pass's arguments and build its [`Layout`]; None when the output is empty.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn layout(
+    input_len: usize,
+    shape: &[usize],
+    axis: usize,
+    taps: usize,
+    origin: isize,
+    mode: Mode,
+    span: Span,
+    output_len: usize,
+) -> Result<Option<Layout>, FilterError> {
+    let nd = shape.len();
+    if axis >= nd {
+        return Err(FilterError::new(format!(
+            "axis {axis} of a {nd}-d block of shape {shape:?}"
+        )));
+    }
+    if taps == 0 {
+        return Err(FilterError::new("a filter of size 0"));
+    }
+    let (size1, size2) = (taps / 2, taps - taps / 2 - 1);
+    if origin < -(size1 as isize) || origin > size2 as isize {
+        return Err(FilterError::new(format!(
+            "origin {origin} for a size of {taps}: between -{size1} and {size2}"
+        )));
+    }
+    if input_len != shape.iter().product::<usize>() {
+        return Err(FilterError::new(format!(
+            "{input_len} elements for shape {shape:?}"
+        )));
+    }
+    let in_len = shape[axis];
+    if span.start + in_len > span.len || span.out_start + span.out_len > span.len {
+        return Err(FilterError::new(format!(
+            "{span:?} for a block {in_len} long on axis {axis}"
+        )));
+    }
+    let outer: usize = shape[..axis].iter().product();
+    let inner: usize = shape[axis + 1..].iter().product();
+    let out_len = span.out_len;
+    if output_len != outer * out_len * inner {
+        return Err(FilterError::new(format!(
+            "output of {output_len} elements; the pass writes {}",
+            outer * out_len * inner
+        )));
+    }
+    if output_len == 0 {
+        return Ok(None);
+    }
+    // The extended line, as scipy's line buffer: entry b is position
+    // out_start + b - (size1 + origin).
+    let ext = out_len + taps - 1;
+    let first = span.out_start as i64 - size1 as i64 - origin as i64;
+    let rows = (0..ext)
+        .map(|b| match mode.index(first + b as i64, span.len as i64) {
+            None => Ok(None),
+            Some(g) => {
+                let r = g - span.start as i64;
+                if (0..in_len as i64).contains(&r) {
+                    Ok(Some(r as usize))
+                } else {
+                    Err(FilterError::new(format!(
+                        "position {g} of axis {axis} is not in the block                          ({} .. {}): read the filter's reach first",
+                        span.start,
+                        span.start + in_len
+                    )))
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Layout {
+        outer,
+        in_len,
+        inner,
+        out_len,
+        ext,
+        rows,
+    }))
+}
 
 /// scipy's symmetry test of the weights: 1 symmetric, -1 antisymmetric, 0 neither.
 /// Only odd sizes count, and "equal" means within f64's epsilon, as `NI_Correlate1D`.
@@ -71,69 +181,45 @@ pub fn correlate1d<T: Element, U: Element>(
     span: Span,
     output: &mut [U],
 ) -> Result<(), FilterError> {
-    let nd = shape.len();
-    if axis >= nd {
-        return Err(FilterError::new(format!(
-            "axis {axis} of a {nd}-d block of shape {shape:?}"
-        )));
-    }
+    // outside a pool rayon would use its global pool of every core: one thread then
+    let parallel = rayon::current_thread_index().is_some();
+    correlate1d_on(
+        parallel, input, shape, axis, weights, origin, mode, span, output,
+    )
+}
+
+/// [`correlate1d`], with lines in parallel on the current rayon pool when `parallel`,
+/// else one after another on this thread (also inside a pool: a caller that planned one
+/// thread for this pass keeps it to one).
+#[allow(clippy::too_many_arguments)]
+pub fn correlate1d_on<T: Element, U: Element>(
+    parallel: bool,
+    input: &[T],
+    shape: &[usize],
+    axis: usize,
+    weights: &[f64],
+    origin: isize,
+    mode: Mode,
+    span: Span,
+    output: &mut [U],
+) -> Result<(), FilterError> {
     let fs = weights.len();
-    if fs == 0 {
-        return Err(FilterError::new("no weights"));
-    }
-    let (size1, size2) = (fs / 2, fs - fs / 2 - 1);
-    if origin < -(size1 as isize) || origin > size2 as isize {
-        return Err(FilterError::new(format!(
-            "origin {origin} for {fs} weights: between -{size1} and {size2}"
-        )));
-    }
-    if input.len() != shape.iter().product::<usize>() {
-        return Err(FilterError::new(format!(
-            "{} elements for shape {shape:?}",
-            input.len()
-        )));
-    }
-    let in_len = shape[axis];
-    if span.start + in_len > span.len || span.out_start + span.out_len > span.len {
-        return Err(FilterError::new(format!(
-            "{span:?} for a block {in_len} long on axis {axis}"
-        )));
-    }
-    let outer: usize = shape[..axis].iter().product();
-    let inner: usize = shape[axis + 1..].iter().product();
-    let out_len = span.out_len;
-    if output.len() != outer * out_len * inner {
-        return Err(FilterError::new(format!(
-            "output of {} elements; the pass writes {}",
-            output.len(),
-            outer * out_len * inner
-        )));
-    }
-    if output.is_empty() {
+    let Some(lay) = layout(
+        input.len(),
+        shape,
+        axis,
+        fs,
+        origin,
+        mode,
+        span,
+        output.len(),
+    )?
+    else {
         return Ok(());
-    }
-    // The extended line, as scipy's line buffer: entry b is position
-    // out_start + b - (size1 + origin); `rows[b]` is its row in the block (None: cval).
-    let ext = out_len + fs - 1;
-    let first = span.out_start as i64 - size1 as i64 - origin as i64;
-    let rows = (0..ext)
-        .map(|b| match mode.index(first + b as i64, span.len as i64) {
-            None => Ok(None),
-            Some(g) => {
-                let r = g - span.start as i64;
-                if (0..in_len as i64).contains(&r) {
-                    Ok(Some(r as usize))
-                } else {
-                    Err(FilterError::new(format!(
-                        "position {g} of axis {axis} is not in the block \
-                         ({} .. {}): read the kernel's reach first",
-                        span.start,
-                        span.start + in_len
-                    )))
-                }
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    };
+    let (in_len, inner, out_len, ext, rows) =
+        (lay.in_len, lay.inner, lay.out_len, lay.ext, lay.rows);
+    let (size1, size2) = (fs / 2, fs - fs / 2 - 1);
     let k = Kernel {
         w: weights,
         size1,
@@ -141,47 +227,77 @@ pub fn correlate1d<T: Element, U: Element>(
         sym: symmetry(weights),
         cval: mode.cval(),
     };
-    // In parallel only inside a rayon pool the caller entered (its threads); outside one,
-    // on this thread: rayon would otherwise use its global pool of every core.
-    let parallel = rayon::current_thread_index().is_some();
     if inner == 1 {
         // along the last axis: one contiguous line at a time, extended into a buffer
-        let line = |buf: &mut Vec<f64>, (o, dst): (usize, &mut [U])| {
+        // (and the sums of the whole line at once, term by term)
+        let line = |(buf, acc): &mut (Vec<f64>, Vec<f64>), (o, dst): (usize, &mut [U])| {
             let line = &input[o * in_len..(o + 1) * in_len];
-            for (b, r) in rows.iter().enumerate() {
-                buf[b] = r.map_or(k.cval, |r| line[r].to_f64());
+            for (b, r) in buf.iter_mut().zip(&rows) {
+                *b = r.map_or(k.cval, |r| line[r].to_f64());
             }
-            for (ll, d) in dst.iter_mut().enumerate() {
-                *d = U::from_f64(k.at(buf, ll + size1));
+            k.line(buf, acc);
+            for (d, v) in dst.iter_mut().zip(acc.iter()) {
+                *d = U::from_f64(*v);
             }
         };
+        let buffers = || (vec![0f64; ext], vec![0f64; out_len]);
         if parallel {
             output
                 .par_chunks_mut(out_len)
                 .enumerate()
-                .for_each_init(|| vec![0f64; ext], line);
+                .for_each_init(buffers, line);
         } else {
-            let mut buf = vec![0f64; ext];
+            let mut bufs = buffers();
             output
                 .chunks_mut(out_len)
                 .enumerate()
-                .for_each(|x| line(&mut buf, x));
+                .for_each(|x| line(&mut bufs, x));
         }
     } else {
-        // along another axis: each output row (outer o, position q) sums whole input
-        // rows, lane by lane; every element sees scipy's operations in scipy's order
-        let slab = |(slab, dst): (usize, &mut [U])| {
-            let (o, q) = (slab / out_len, slab % out_len);
+        // along another axis: blocks of BLOCK output rows (outer o, positions q ..), lane
+        // by lane. The input rows a block needs are read as f64 once into a scratch of
+        // (BLOCK + n - 1) x LANE; every output element then sums them in scipy's order.
+        let block = |scratch: &mut Vec<f64>, o: usize, qb: usize, dst: &mut [U]| {
+            let (q0, qn) = (qb * BLOCK, dst.len() / inner);
+            let need = qn + fs - 1;
+            scratch.resize(need * LANE, 0.0);
             let base = o * in_len * inner;
-            let row = |b: usize| rows[b].map(|r| &input[base + r * inner..][..inner]);
-            for (l, out) in dst.chunks_mut(LANE).enumerate() {
-                k.lanes(&row, q + size1, l * LANE, out);
+            for l0 in (0..inner).step_by(LANE) {
+                let m = LANE.min(inner - l0);
+                for (rr, r) in rows[q0..q0 + need].iter().enumerate() {
+                    let srow = &mut scratch[rr * LANE..rr * LANE + m];
+                    match r {
+                        Some(r) => {
+                            let src = &input[base + r * inner + l0..][..m];
+                            for (d, v) in srow.iter_mut().zip(src) {
+                                *d = v.to_f64();
+                            }
+                        }
+                        None => srow.fill(k.cval),
+                    }
+                }
+                for qi in 0..qn {
+                    k.lanes(scratch, qi + size1, m, &mut dst[qi * inner + l0..][..m]);
+                }
             }
         };
+        let slab = BLOCK * inner;
         if parallel {
-            output.par_chunks_mut(inner).enumerate().for_each(slab);
+            output
+                .par_chunks_mut(out_len * inner)
+                .enumerate()
+                .for_each(|(o, dst)| {
+                    dst.par_chunks_mut(slab)
+                        .enumerate()
+                        .for_each_init(Vec::new, |s, (qb, d)| block(s, o, qb, d))
+                });
         } else {
-            output.chunks_mut(inner).enumerate().for_each(slab);
+            let mut scratch = Vec::new();
+            for (o, dst) in output.chunks_mut(out_len * inner).enumerate() {
+                for (qb, d) in dst.chunks_mut(slab).enumerate() {
+                    block(&mut scratch, o, qb, d);
+                }
+            }
         }
     }
     Ok(())
@@ -196,95 +312,86 @@ struct Kernel<'a> {
 }
 
 impl Kernel<'_> {
-    /// One output value from the extended line `buf`, centred at `c`: the three loops of
-    /// `NI_Correlate1D`, term by term.
+    /// Every output of one line from its extended line `buf` into `acc` (one value per
+    /// output): the three loops of `NI_Correlate1D`, taken term by term across the whole
+    /// line, so each output sees scipy's operations in scipy's order.
     #[inline]
-    fn at(&self, buf: &[f64], c: usize) -> f64 {
+    fn line(&self, buf: &[f64], acc: &mut [f64]) {
         let (w, s1, s2) = (self.w, self.size1, self.size2);
+        let m = acc.len();
         match self.sym {
-            1 => {
-                let mut v = buf[c] * w[s1];
-                for j in (1..=s1).rev() {
-                    v += (buf[c - j] + buf[c + j]) * w[s1 - j];
+            1 | -1 => {
+                for (a, b) in acc.iter_mut().zip(&buf[s1..s1 + m]) {
+                    *a = b * w[s1];
                 }
-                v
-            }
-            -1 => {
-                let mut v = buf[c] * w[s1];
                 for j in (1..=s1).rev() {
-                    v += (buf[c - j] - buf[c + j]) * w[s1 - j];
+                    let wj = w[s1 - j];
+                    let (lo, hi) = (&buf[s1 - j..s1 - j + m], &buf[s1 + j..s1 + j + m]);
+                    if self.sym == 1 {
+                        for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
+                            *a += (l + h) * wj;
+                        }
+                    } else {
+                        for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
+                            *a += (l - h) * wj;
+                        }
+                    }
                 }
-                v
             }
             _ => {
-                let mut v = buf[c + s2] * w[s1 + s2];
-                for t in 0..s1 + s2 {
-                    // jj = t - s1 runs from -size1 to size2 - 1
-                    v += buf[c + t - s1] * w[t];
+                let last = s1 + s2;
+                for (a, b) in acc.iter_mut().zip(&buf[last..last + m]) {
+                    *a = b * w[last];
                 }
-                v
+                // jj = t - size1 runs from -size1 to size2 - 1: buffer position ll + t
+                for (t, &wt) in w[..last].iter().enumerate() {
+                    for (a, b) in acc.iter_mut().zip(&buf[t..t + m]) {
+                        *a += b * wt;
+                    }
+                }
             }
         }
     }
 
-    /// The same sums for `out.len()` elements of a row at once: `row(b)` is the input row
-    /// at extended position b (None: the fill), read from element `at` on.
+    /// The same sums for `out.len()` elements of a row at once, from `scratch`: rows of
+    /// LANE f64s, the extended positions of one block; `c` is the output's centre row.
     #[inline]
-    fn lanes<'r, T: Element, U: Element>(
-        &self,
-        row: &impl Fn(usize) -> Option<&'r [T]>,
-        c: usize,
-        at: usize,
-        out: &mut [U],
-    ) {
-        let m = out.len();
+    fn lanes<U: Element>(&self, scratch: &[f64], c: usize, m: usize, out: &mut [U]) {
         let (w, s1, s2) = (self.w, self.size1, self.size2);
+        let row = |b: usize| &scratch[b * LANE..b * LANE + m];
         let mut acc = [0f64; LANE];
-        let mut a = [0f64; LANE];
-        let mut b = [0f64; LANE];
-        let load = |b_: usize, dst: &mut [f64; LANE]| match row(b_) {
-            Some(r) => {
-                for (d, v) in dst[..m].iter_mut().zip(&r[at..at + m]) {
-                    *d = v.to_f64();
-                }
-            }
-            None => dst[..m].fill(self.cval),
-        };
+        let acc = &mut acc[..m];
         match self.sym {
             1 | -1 => {
-                load(c, &mut a);
-                for i in 0..m {
-                    acc[i] = a[i] * w[s1];
+                for (a, v) in acc.iter_mut().zip(row(c)) {
+                    *a = v * w[s1];
                 }
                 for j in (1..=s1).rev() {
-                    load(c - j, &mut a);
-                    load(c + j, &mut b);
                     let wj = w[s1 - j];
+                    let (lo, hi) = (row(c - j), row(c + j));
                     if self.sym == 1 {
-                        for i in 0..m {
-                            acc[i] += (a[i] + b[i]) * wj;
+                        for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
+                            *a += (l + h) * wj;
                         }
                     } else {
-                        for i in 0..m {
-                            acc[i] += (a[i] - b[i]) * wj;
+                        for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
+                            *a += (l - h) * wj;
                         }
                     }
                 }
             }
             _ => {
-                load(c + s2, &mut a);
-                for i in 0..m {
-                    acc[i] = a[i] * w[s1 + s2];
+                for (a, v) in acc.iter_mut().zip(row(c + s2)) {
+                    *a = v * w[s1 + s2];
                 }
                 for (t, &wt) in w[..s1 + s2].iter().enumerate() {
-                    load(c + t - s1, &mut a);
-                    for i in 0..m {
-                        acc[i] += a[i] * wt;
+                    for (a, v) in acc.iter_mut().zip(row(c + t - s1)) {
+                        *a += v * wt;
                     }
                 }
             }
         }
-        for (d, v) in out.iter_mut().zip(&acc[..m]) {
+        for (d, v) in out.iter_mut().zip(acc.iter()) {
             *d = U::from_f64(*v);
         }
     }

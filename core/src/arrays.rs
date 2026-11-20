@@ -450,6 +450,59 @@ impl Array {
         }
     }
 
+    /// A separable filter (Workplan DR7): `passes` applied in order, each
+    /// `(axis, weights, mode)` a scipy.ndimage.correlate1d along one axis with scipy's
+    /// values, in this array's element type after every pass (as scipy.ndimage). `mode`
+    /// is reflect, mirror, nearest, wrap or constant (filled with `cval`). Any region
+    /// gives the values of the whole filtered array. Lazy: nothing is read until asked.
+    #[pyo3(signature = (passes, cval = 0.0, max_read_mb = None))]
+    fn separable(
+        &self,
+        passes: Vec<(usize, Vec<f64>, String)>,
+        cval: f64,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let passes = passes
+            .into_iter()
+            .map(|(axis, weights, mode)| {
+                let mode = ar::FilterMode::parse(&mode, cval).ok_or_else(|| {
+                    ReadError::new_err(format!(
+                        "mode {mode:?}: use \"reflect\", \"mirror\", \"nearest\", \"wrap\" or \"constant\""
+                    ))
+                })?;
+                Ok(ar::Pass::correlate(axis, weights, mode))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let mut f = ar::Separable::new(self.src.clone(), passes).map_err(err)?;
+        if let Some(mb) = max_read_mb {
+            f = f.with_max_read((mb * 1048576.0) as u64);
+        }
+        Ok(Self::view(f))
+    }
+
+    /// A filter of one or more chains of passes (Workplan DR7), each pass
+    /// `(axis, kind, values, origin, mode)`: kind "correlate" (values: the weights),
+    /// "uniform", "minimum" or "maximum" (values: [size]). Each chain runs on this array
+    /// as scipy.ndimage runs a separable filter; several chains are combined by `combine`:
+    /// "sum" (scipy's generic_laplace) or "hypot" (generic_gradient_magnitude, floats
+    /// only). Any region gives the values of the whole filtered array. Lazy.
+    #[pyo3(signature = (chains, combine = None, cval = 0.0, max_read_mb = None))]
+    fn filter(
+        &self,
+        chains: Vec<Vec<crate::filters::PassSpec>>,
+        combine: Option<&str>,
+        cval: f64,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let chains = crate::filters::chains_of(chains, cval).map_err(ReadError::new_err)?;
+        let combine = crate::filters::combine_of(combine).map_err(ReadError::new_err)?;
+        let mut f = ar::Separable::terms(self.src.clone(), chains, combine).map_err(err)?;
+        if let Some(mb) = max_read_mb {
+            f = f.with_max_read((mb * 1048576.0) as u64);
+        }
+        Ok(Self::view(f))
+    }
+
     /// The array resampled onto a grid of `shape`: output index o takes the value at
     /// input index `matrix · o` (scipy.ndimage.affine_transform's convention: the matrix
     /// maps output to input). `matrix`: n rows of n + 1 (the last column the offset) or

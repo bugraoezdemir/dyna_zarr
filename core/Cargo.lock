@@ -330,6 +330,7 @@ dependencies = [
 name = "dyna-zarr-arrays"
 version = "0.0.1"
 dependencies = [
+ "dyna-zarr-filters",
  "dyna-zarr-transforms",
  "half",
  "mimalloc",

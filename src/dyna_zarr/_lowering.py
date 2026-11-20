@@ -16,9 +16,27 @@ What the engine takes over, and only where it gives the Python path's exact valu
   expand_dims, squeeze, concatenate, stack;
 - ``astype`` where NumPy's result is defined for every value ("same_kind" casts: no
   float -> integer, whose out-of-range values NumPy leaves to the platform);
-- ``coarsen(..., "mean")``: both follow tensorstore.downsample.
+- ``coarsen(..., "mean")``: both follow tensorstore.downsample;
+- the named filters (task DR7) in reflect, mirror, nearest or constant mode, with
+  ``cval`` (and ``order`` for gaussian_filter), their values scipy's bit for bit:
+  gaussian_filter, gaussian_laplace and laplace (any numeric type),
+  gaussian_gradient_magnitude (float32 / float64: for integers scipy's square root goes
+  through NumPy casts the engine does not follow), minimum_filter, maximum_filter,
+  grey_erosion and grey_dilation (any numeric type), and uniform_filter for integers up
+  to 32 bits. The Gaussians run scipy's own kernel weights in scipy's order.
+
+  Not wrap: the Python path wraps each read's box around itself rather than the array,
+  so its values depend on the region read, and the engine (which wraps around the
+  array) would differ from it. Not uniform_filter of floats: scipy's running sum rounds
+  differently depending on where a line starts, which on the Python path is the read
+  box (with extended values at its inner edges), so those values depend on the region
+  read too; integer sums are exact, whatever the start.
 
 Everything else returns None here, and the caller uses the Python path.
+
+A filter without its own ``device`` follows the device context of the read (cupy on a
+GPU); the engine reads on the CPU, so such an array, and every array built on it, is
+read by the Python path inside a GPU context (``INHERITS``).
 """
 from __future__ import annotations
 
@@ -35,6 +53,9 @@ from . import _engine
 
 #: the attribute caching an array's engine counterpart (dropped when pickling)
 CACHE = "_engine_cache"
+#: set on an array whose engine counterpart includes a filter that follows the device
+#: context (device=None): read by the engine only in a CPU context
+INHERITS = "_engine_inherits_device"
 #: "not built yet" in the cache (None means "cannot be built")
 _UNSET = object()
 #: threads of one engine read: inside a write, what its planner gives each region
@@ -72,9 +93,23 @@ def lowered(array):
             cached = None
         if cached is not None and not _same(cached, array):
             cached = None
+        inherits = cached is not None and _inherits_device(array)
         with _lock:
+            array.__dict__[INHERITS] = inherits
             array.__dict__[CACHE] = cached
     return cached
+
+
+def _inherits_device(array) -> bool:
+    """Whether ``array``'s lowered chain has a filter that follows the device context."""
+    t = array._transform
+    if t is None:
+        return False
+    if type(t).__name__ == "MapOverlapTransform" and t.device is None:
+        return True
+    inputs = [getattr(t, "array", None), *getattr(t, "arrays", ()), *getattr(t, "operands", ())]
+    # inputs were lowered first (their flags are set); scalar operands have no __dict__
+    return any(getattr(a, "__dict__", {}).get(INHERITS, False) for a in inputs)
 
 
 def _same(eng, array) -> bool:
@@ -217,6 +252,151 @@ def _map_blocks(core, t):
     return None if eng is None else eng.astype(np.dtype(to).name)
 
 
+def _map_overlap(core, t):
+    """A named filter (its ``kernel`` spec) the engine has, on the CPU, read whole: no
+    ``block_info``, no ``align``, no other output type."""
+    spec = getattr(t, "kernel", None)
+    if spec is None or t.block_info or t.align is not None or t.device not in (None, "cpu"):
+        return None
+    if np.dtype(t.dtype) != np.dtype(t.array.dtype):
+        return None
+    if spec.get("mode") not in _FILTER_MODES:
+        return None
+    build = _KERNELS.get(spec["name"])
+    return None if build is None else build(t, spec)
+
+
+#: the modes in which the engine gives the Python path's values (not wrap: see above)
+_FILTER_MODES = {"reflect", "mirror", "nearest", "constant"}
+
+
+def _gaussian_chain(ndim, sigma, order, mode, truncate):
+    """scipy.ndimage.gaussian_filter as engine passes (axis, kind, values, origin, mode):
+    per axis with sigma > 1e-15 (as scipy), scipy's own weights for (sigma, order,
+    radius), reversed as gaussian_filter1d reverses them. None if scipy's kernel function
+    cannot be found (the Python path then keeps the filter)."""
+    try:
+        from scipy.ndimage._filters import _gaussian_kernel1d
+    except ImportError:
+        return None
+    chain = []
+    for axis in range(ndim):
+        if not sigma[axis] > 1e-15:
+            continue
+        radius = int(truncate * float(sigma[axis]) + 0.5)
+        weights = _gaussian_kernel1d(sigma[axis], int(order[axis]), radius)[::-1]
+        chain.append((axis, "correlate", [float(w) for w in weights], 0, mode))
+    return chain
+
+
+def _gaussian(t, spec):
+    """gaussian_filter: one chain."""
+    ndim = t.array.ndim
+    sigma = _per_axis(spec["sigma"], ndim)
+    order = _per_axis(spec["order"], ndim)
+    if sigma is None or order is None:
+        return None
+    chain = _gaussian_chain(ndim, sigma, order, spec["mode"], spec["truncate"])
+    eng = None if chain is None else _up(t.array)
+    if eng is None:
+        return None
+    if not chain:
+        return eng                              # scipy copies the input
+    return eng.filter([chain], cval=float(spec["cval"]))
+
+
+def _gaussian_terms(t, spec, order, combine):
+    """gaussian_laplace (order 2, "sum") and gaussian_gradient_magnitude (order 1,
+    "hypot"): one Gaussian chain per axis, with that axis' derivative, each applied to
+    the input (scipy's generic_laplace / generic_gradient_magnitude)."""
+    ndim = t.array.ndim
+    if combine == "hypot" and np.dtype(t.dtype).kind != "f":
+        return None
+    sigma = _per_axis(spec["sigma"], ndim)
+    if sigma is None:
+        return None
+    chains = []
+    for d in range(ndim):
+        orders = [order if a == d else 0 for a in range(ndim)]
+        chain = _gaussian_chain(ndim, sigma, orders, spec["mode"], spec["truncate"])
+        if chain is None:
+            return None
+        chains.append(chain)
+    eng = _up(t.array)
+    if eng is None:
+        return None
+    return eng.filter(chains, combine=combine, cval=float(spec["cval"]))
+
+
+def _laplace(t, spec):
+    """laplace: a [1, -2, 1] pass per axis on the input, added (generic_laplace)."""
+    eng = _up(t.array)
+    if eng is None:
+        return None
+    chains = [[(a, "correlate", [1.0, -2.0, 1.0], 0, spec["mode"])]
+              for a in range(t.array.ndim)]
+    return eng.filter(chains, combine="sum", cval=float(spec["cval"]))
+
+
+#: uniform_filter goes to the engine for these types only (see the module notes)
+_UNIFORM_TYPES = {"int8", "uint8", "int16", "uint16", "int32", "uint32"}
+
+#: the pass kind of each filter with a window
+_SIZE_KINDS = {"uniform_filter": "uniform", "minimum_filter": "minimum",
+               "grey_erosion": "minimum", "maximum_filter": "maximum",
+               "grey_dilation": "maximum"}
+
+
+def _size_filter(t, spec):
+    """uniform_filter, minimum_filter, maximum_filter, grey_erosion, grey_dilation: one
+    pass per axis whose size is above 1 (scipy skips the others), with scipy's origin:
+    0, except grey_dilation, which negates it and lowers it by one for an even size."""
+    name = spec["name"]
+    if name == "uniform_filter" and np.dtype(t.dtype).name not in _UNIFORM_TYPES:
+        return None
+    sizes = _per_axis(spec["size"], t.array.ndim)
+    if sizes is None or not all(isinstance(z, (int, np.integer))
+                                and not isinstance(z, (bool, np.bool_)) for z in sizes):
+        return None
+    passes = []
+    for axis, z in enumerate(sizes):
+        z = int(z)
+        if z > 1:
+            origin = -(1 - z % 2) if name == "grey_dilation" else 0
+            passes.append((axis, _SIZE_KINDS[name], [float(z)], origin, spec["mode"]))
+    eng = _up(t.array)
+    if eng is None:
+        return None
+    if not passes:
+        return eng                              # scipy copies the input
+    return eng.filter([passes], cval=float(spec["cval"]))
+
+
+#: the named filters the engine reads, by the name their kernel spec records
+_KERNELS = {
+    "gaussian_filter": _gaussian,
+    "gaussian_laplace": lambda t, spec: _gaussian_terms(t, spec, 2, "sum"),
+    "gaussian_gradient_magnitude": lambda t, spec: _gaussian_terms(t, spec, 1, "hypot"),
+    "laplace": _laplace,
+    "uniform_filter": _size_filter,
+    "minimum_filter": _size_filter,
+    "maximum_filter": _size_filter,
+    "grey_erosion": _size_filter,
+    "grey_dilation": _size_filter,
+}
+
+
+def _per_axis(value, ndim):
+    """scipy's _normalize_sequence: one value for every axis, or one per axis (the
+    elements themselves, as scipy passes them on)."""
+    if isinstance(value, (str, bytes)):
+        return None
+    if np.ndim(value) == 0:
+        return [value] * ndim
+    value = list(value)
+    return value if len(value) == ndim else None
+
+
 _TRANSFORMS = {
     "SliceTransform": _slice,
     "TransposeTransform": _transpose,
@@ -227,10 +407,16 @@ _TRANSFORMS = {
     "StackTransform": _stack,
     "CoarsenTransform": _coarsen,
     "MapBlocksTransform": _map_blocks,
+    "MapOverlapTransform": _map_overlap,
 }
 
 
 # ------------------------------------------------------------------------------ reads
+
+def _device() -> str:
+    from .operations._backend import current_device
+    return current_device()
+
 
 def _engine_key(key):
     """``key`` as the engine indexes (ints, slices with a positive step, None,
@@ -265,6 +451,8 @@ def read(array, key):
     eng = lowered(array)
     if eng is None:
         return None
+    if array.__dict__.get(INHERITS) and _device() != "cpu":
+        return None                             # the filter runs on that device
     k = _engine_key(key)
     if k is None:
         return None

@@ -68,7 +68,7 @@ pub fn stride(src: SourceRef, factors: &[u64]) -> Result<Slice, ReadError> {
 
 /// Halve the output region along its longest axis while its input box is too large;
 /// call `run(start, region, out)` on each piece.
-fn split<F>(
+pub(crate) fn split<F>(
     start: &[u64],
     r: &[u64],
     out: &Out,
@@ -105,7 +105,7 @@ type PieceCost<'a> = dyn Fn(&[u64], &[u64]) -> Result<u64, ReadError> + 'a;
 
 /// The cost of a [`split`] read: the same halving, then the most costly piece (pieces
 /// run one after another).
-fn split_cost(
+pub(crate) fn split_cost(
     start: &[u64],
     r: &[u64],
     max_read: u64,
