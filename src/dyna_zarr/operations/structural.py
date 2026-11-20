@@ -156,8 +156,8 @@ class ConcatenateTransform(Transform):
         # Convert to slices
         normalized_key = []
         for k, size in zip(key, self.shape):
-            if isinstance(k, int):
-                normalized_key.append(slice(k, k + 1))
+            if _is_int_index(k):                    # NumPy ints too, as the squeeze below
+                normalized_key.append(slice(int(k), int(k) + 1))
             elif isinstance(k, slice):
                 normalized_key.append(k)
             else:
@@ -592,12 +592,13 @@ class SliceTransform(Transform):
             result = result[tuple(slice(None, None, -1) if ax in flip_axes else slice(None)
                                   for ax in range(result.ndim))]
 
-        # Add back any newaxis dimensions at the correct positions
+        # Add back any newaxis dimensions at the correct positions: one output axis per
+        # earlier key entry that is not an int (slices AND the new axes already put back;
+        # counting only slices put `a[None, :, 5, None]` at (1, 1, 6, 50), not NumPy's
+        # (1, 6, 1, 50))
         for i, stored_key_elem in enumerate(self.key):
             if stored_key_elem is np.newaxis:
-                # Count how many non-newaxis, non-int dimensions come before this
-                axis_pos = sum(1 for j, k in enumerate(self.key[:i])
-                               if k is not np.newaxis and not isinstance(k, int))
+                axis_pos = sum(1 for k in self.key[:i] if not isinstance(k, int))
                 result = np.expand_dims(result, axis=axis_pos)
 
         return result

@@ -43,9 +43,6 @@ fn array_info<'py>(py: Python<'py>, path: PathBuf) -> PyResult<Bound<'py, PyDict
 
 #[pymodule]
 fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // reads run on the engine's own pools; anything reaching for rayon's global pool
-    // gets one thread, not one per core (Workplan decision DR-5)
-    dyna_zarr_arrays::pool::limit_global_pool();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("TRANSFORMS_VERSION", dyna_zarr_transforms::VERSION)?;
     m.add("ARRAYS_VERSION", dyna_zarr_arrays::VERSION)?;

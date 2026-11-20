@@ -4,9 +4,11 @@
   ``Array.cost`` for the same region and threads: for Zarr arrays and every view, alone
   and chained, with and without splitting, on one thread and several.
 - On one thread the cost is not far above the peak (it is a plan, not a guess).
-- A read with ``threads=1`` uses one thread: the calling thread's own one-thread pool,
-  never rayon's pool of one thread per core. Reads that share a ``Pool`` never use more
-  threads than the pool has.
+- A read with ``threads=1`` keeps one thread busy (on the calling thread; it starts no
+  thread on unsharded arrays). Reads that share a ``Pool`` never use more threads than
+  the pool has.
+- Short-lived Python threads reading and ending is safe, also when the engine was first
+  used on one of them (mimalloc v3 crashed the process then; core/Cargo.toml).
 """
 import subprocess
 import sys
@@ -178,26 +180,97 @@ def _run(code, *args):
 
 
 @pytest.mark.parametrize("sharded", [False, True])
-def test_one_thread_reads_use_one_thread(tmp_path, sharded):
-    """zarrs' default (4 chunks at once) and its sharded paths (rayon even for one chunk
-    at a time) would start a pool of one thread per core: one thread is one thread."""
+def test_one_thread_reads_keep_one_thread_busy(tmp_path, sharded):
+    """zarrs' default (4 chunks at once) used to run a one-thread read on several
+    threads. Busy threads are measured as CPU time over wall time; on an unsharded array
+    no thread may be started at all (sharded, zarrs hands its one task at a time to
+    rayon's global pool, which may start idle threads)."""
     pytest.importorskip("psutil")
     path = tmp_path / "many"
     kw = {"shards": (2, 64, 64)} if sharded else {}
     z = zarr.create_array(str(path), shape=(8, 256, 256), chunks=(1, 32, 32), dtype="uint8", **kw)
     z[...] = 7
-    before, after = _run("""
-        import sys, psutil, numpy, dyna_zarr_core as core   # numpy first: OpenBLAS's threads
+    before, after, busy = _run("""
+        import sys, time, psutil, numpy, dyna_zarr_core as core   # numpy first: OpenBLAS
         a = core.Array.open(sys.argv[1])
         me = psutil.Process()
+        views = (a, a.downsample([2, 2, 2]), a.downsample([2, 2, 2], "gaussian"),
+                 a.downsample([2, 2, 2], "stride"))
         before = me.num_threads()
-        for v in (a, a.downsample([2, 2, 2]), a.downsample([2, 2, 2], "gaussian"),
-                  a.downsample([2, 2, 2], "stride")):
-            v.read([0, 0, 0], list(v.shape), threads=1)
-            v.cost([0, 0, 0], list(v.shape), threads=4)
-        print(before, me.num_threads())
+        c0, t0 = sum(me.cpu_times()[:2]), time.perf_counter()
+        while time.perf_counter() - t0 < 1.0:
+            for v in views:
+                v.read([0, 0, 0], list(v.shape), threads=1)
+                v.cost([0, 0, 0], list(v.shape), threads=4)
+        busy = (sum(me.cpu_times()[:2]) - c0) / (time.perf_counter() - t0)
+        print(before, me.num_threads(), busy)
     """, path)
-    assert int(after) - int(before) <= 1
+    assert float(busy) < 1.5
+    if not sharded:
+        assert int(after) == int(before)
+
+
+def test_short_lived_threads_reading(tmp_path):
+    """Python threads that read and end, as io.write's region workers do."""
+    path = tmp_path / "a"
+    z = zarr.create_array(str(path), shape=(8, 64, 64), chunks=(2, 32, 32), dtype="uint16",
+                          zarr_format=2)
+    z[...] = 3
+    out = _run("""
+        import sys
+        from concurrent.futures import ThreadPoolExecutor
+        import dyna_zarr_core as core
+        a = core.Array.open(sys.argv[1])
+        for _ in range(100):
+            with ThreadPoolExecutor(4) as ex:
+                list(ex.map(lambda k: int(a.read([k, 0, 0], [k + 1, 64, 64]).sum()), range(8)))
+        print("ok")
+    """, path)
+    assert out == ["ok"]
+
+
+def test_first_use_on_a_thread_that_ends(tmp_path):
+    """The engine loaded and first used on a thread that ends (dyna loads it lazily,
+    often on an io.write worker), then used from many new threads. With mimalloc v3 the
+    first new thread that reused the ended thread's TEB address (Windows reuses them; it
+    is mimalloc's thread id) took v3's torn-down main heap and crashed the process."""
+    path = tmp_path / "a"
+    z = zarr.create_array(str(path), shape=(4, 64, 64), chunks=(2, 32, 32), dtype="uint16",
+                          zarr_format=2)
+    z[...] = 3
+    out = _run("""
+        import sys, threading
+        box = {}
+        def teb():                                   # the thread's TEB (Windows), else 0
+            if sys.platform != "win32":
+                return 0
+            import ctypes as C
+            k32, nt = C.WinDLL("kernel32"), C.WinDLL("ntdll")
+            k32.GetCurrentThread.restype = C.c_void_p
+            info = (C.c_uint64 * 6)()
+            nt.NtQueryInformationThread(C.c_void_p(k32.GetCurrentThread()), 0, info,
+                                        C.sizeof(info), None)
+            return info[1]
+        def read():
+            a = box["core"].Array.open(sys.argv[1])
+            assert int(a.read([0, 0, 0], [1, 64, 64]).sum()) == 3 * 64 * 64
+        def first():
+            import dyna_zarr_core
+            box["core"], box["teb"] = dyna_zarr_core, teb()
+            read()
+        t = threading.Thread(target=first); t.start(); t.join()
+        reused = 0
+        def later():
+            global reused
+            reused += box["teb"] != 0 and teb() == box["teb"]
+            read()
+        for _ in range(2000):
+            t = threading.Thread(target=later); t.start(); t.join()
+            if reused >= 2:
+                break
+        print("ok", reused)
+    """, path)
+    assert out[0] == "ok"
 
 
 def test_a_pool_is_all_the_threads_reads_use(tmp_path):

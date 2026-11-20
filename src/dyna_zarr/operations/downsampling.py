@@ -342,7 +342,11 @@ class CoarsenTransform(Transform):
         # than TensorStore, which reduces each chunk as it decodes it. Only one chunk's
         # input is held at a time, too.
         pieces = list(self._pieces(src))
-        if len(pieces) == 1:
+        if not pieces:
+            # an empty region: no input to read
+            block = np.empty(tuple(-(-(s.stop - s.start) // f) for s, f in zip(src, self.factors)),
+                             dtype=self.dtype)
+        elif len(pieces) == 1:
             block = coarsen_block(self.array._read_direct(src), self.factors, self.method)
         else:
             block = None

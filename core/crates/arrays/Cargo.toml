@@ -27,7 +27,7 @@ dyna-zarr-transforms = { path = "../transforms" }
 [dev-dependencies]
 tempfile = "3"
 # examples/read_bench.rs allocates as the Python module does
-mimalloc = "0.1"
+mimalloc = { version = "0.1", features = ["v2"] }
 
 [lints.rust]
 # `--cfg system_alloc` (examples/read_bench.rs) measures the system allocator
