@@ -41,7 +41,7 @@ OWN_FILES = {"blosc-src": ["licenses/c-blosc/LICENSE.txt"],
 #: repository) whose files stand for theirs
 SAME_AS = {"zarrs_plugin": "zarrs"}
 #: the workspace's own crates (MIT, this repository's LICENSE)
-OWN_CRATES = {"dyna-zarr-transforms", "dyna-zarr-arrays"}
+OWN_CRATES = {"dyna-zarr-transforms", "dyna-zarr-arrays", "dyna-zarr-filters"}
 #: the targets the wheels are built for (.github/workflows/build-core.yml)
 TARGETS = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin",
            "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]

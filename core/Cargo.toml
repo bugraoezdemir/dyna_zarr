@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/transforms", "crates/arrays"]
+members = [".", "crates/transforms", "crates/arrays", "crates/filters"]
 resolver = "2"
 
 [workspace.package]
@@ -28,6 +28,7 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
 dyna-zarr-transforms = { path = "crates/transforms" }
 dyna-zarr-arrays = { path = "crates/arrays" }
+dyna-zarr-filters = { path = "crates/filters" }
 serde_json = "1"
 # The module's allocator (MIT). Measured 2026-11-18 on Windows: with the system
 # allocator every decoded chunk (~1 MB) came from freshly mapped memory, and reads took

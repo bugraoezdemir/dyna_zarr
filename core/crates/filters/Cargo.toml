@@ -1,0 +1,13 @@
+[package]
+name = "dyna-zarr-filters"
+version = "0.0.1"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Decision DR-6 a: unpublished until the first set of filters is complete
+publish = false
+description = "scipy.ndimage's filters on in-memory blocks, with scipy's results: dyna-zarr's filter kernels (Workplan DR7)"
+
+[dependencies]
+# lines of a pass in parallel, on whatever pool the caller runs in
+rayon = "1"

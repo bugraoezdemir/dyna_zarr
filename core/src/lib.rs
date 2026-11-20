@@ -8,6 +8,7 @@
 //! Python path as the reference the tests compare with.
 
 mod arrays;
+mod filters;
 mod transforms;
 
 /// mimalloc for everything Rust allocates in this module (Python's own memory is not
@@ -94,5 +95,13 @@ fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .import("sys")?
         .getattr("modules")?
         .set_item("dyna_zarr_core.transforms", &sub)?;
+    // dyna_zarr_core.filters (DR7), registered the same way
+    let sub = filters::module(m.py())?;
+    m.add_submodule(&sub)?;
+    m.py()
+        .import("sys")?
+        .getattr("modules")?
+        .set_item("dyna_zarr_core.filters", &sub)?;
+    m.add("FILTERS_VERSION", dyna_zarr_filters::VERSION)?;
     Ok(())
 }

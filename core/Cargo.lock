@@ -347,11 +347,19 @@ name = "dyna-zarr-core"
 version = "0.0.1"
 dependencies = [
  "dyna-zarr-arrays",
+ "dyna-zarr-filters",
  "dyna-zarr-transforms",
  "libmimalloc-sys",
  "mimalloc",
  "pyo3",
  "serde_json",
+]
+
+[[package]]
+name = "dyna-zarr-filters"
+version = "0.0.1"
+dependencies = [
+ "rayon",
 ]
 
 [[package]]
