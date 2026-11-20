@@ -41,6 +41,9 @@ serde_json = "1"
 # ome_zarr_pyramid's suite crashed this way. v2 never tears its main heap down
 # (tests/test_engine_memory.py::test_first_use_on_a_thread_that_ends).
 mimalloc = { version = "0.1", features = ["v2"] }
+# mimalloc's options (mi_option_set / mi_option_get), for the purge delay (src/lib.rs);
+# the same library as above (the features are unified)
+libmimalloc-sys = { version = "0.1.49", default-features = false, features = ["extended", "v2"] }
 
 [profile.release]
 lto = true

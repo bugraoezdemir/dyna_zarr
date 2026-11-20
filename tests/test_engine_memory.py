@@ -293,3 +293,20 @@ def test_a_pool_is_all_the_threads_reads_use(tmp_path):
         print(before, me.num_threads())
     """, path)
     assert int(after) - int(before) <= 3
+
+
+@pytest.mark.parametrize("env, expected", [(None, 1), ("10", 10), ("7", 7)])
+def test_freed_memory_goes_back_within_a_millisecond(env, expected):
+    """The engine's allocator hands freed memory back 1 ms later (mimalloc's default is
+    10 ms, which kept several freed chunk buffers per read thread: core/src/lib.rs);
+    MIMALLOC_PURGE_DELAY wins. With "10" this also checks that the option the engine
+    sets is mimalloc's purge delay (its default is 10)."""
+    import os
+    environ = {k: v for k, v in os.environ.items() if k != "MIMALLOC_PURGE_DELAY"}
+    if env is not None:
+        environ["MIMALLOC_PURGE_DELAY"] = env
+    out = subprocess.run([sys.executable, "-c",
+                          "import dyna_zarr_core as c; print(c.allocator_purge_delay_ms())"],
+                         capture_output=True, text=True, timeout=120, env=environ)
+    assert out.returncode == 0, out.stderr
+    assert int(out.stdout.split()[-1]) == expected

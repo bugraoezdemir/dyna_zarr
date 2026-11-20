@@ -37,8 +37,9 @@ from . import _engine
 CACHE = "_engine_cache"
 #: "not built yet" in the cache (None means "cannot be built")
 _UNSET = object()
-#: threads of one engine read: 1 inside io.write's region workers (each region is one
-#: worker; decision DR-5's planner divides max_threads in DR6b); all cores in compute()
+#: threads of one engine read: inside a write, what its planner gives each region
+#: (regions in flight x threads per region <= max_threads, decision DR-5); all cores in
+#: compute()
 _THREADS: ContextVar[int] = ContextVar("dyna_zarr_engine_threads", default=1)
 _lock = threading.Lock()
 
@@ -272,4 +273,11 @@ def read(array, key):
     except Exception:                           # noqa: BLE001 - e.g. out of range: Python
         return None                             # path, with its own error
     shape = list(view.shape)
-    return view.read([0] * len(shape), shape, threads=_THREADS.get())
+    threads = _THREADS.get()
+    if threads == 1:
+        return view.read([0] * len(shape), shape, threads=1)     # on this thread
+    # several threads: inside a write, on its one pool (decision DR-5, see _scope)
+    from ._scope import current
+    scope = current()
+    pool = None if scope is None else scope.pool()
+    return view.read([0] * len(shape), shape, threads=threads, pool=pool)
