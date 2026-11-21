@@ -120,7 +120,30 @@ CHAINS = {
                   a, np.uint16(0).tobytes()], "uint16"),
     "pointwise-split": lambda a: core.pointwise(
         "add", [a, a], "uint16", max_read_mb=0.05),
+    # tiled labels (step 8): tiles of a threshold, whole and clipped at the array's end
+    "label-tiles": lambda a: _label_tiles(a, [4, 32, 32]),
+    "label-tiles-clipped": lambda a: _label_tiles(a, [5, 40, 50]),
 }
+
+
+def _label_tiles(a, tile):
+    """tilewise-ccl's Phase B over a threshold of ``a``, with tables as Phase A builds
+    them (every tile's local labels, here numbered on from the tiles before)."""
+    import itertools
+    from scipy import ndimage as ndi
+    mask = core.pointwise("greater", [a, np.uint16(3500).tobytes()], "uint16")
+    fg = mask.read([0] * a.ndim, list(a.shape))
+    struct = ndi.generate_binary_structure(a.ndim, 1)
+    grid = [-(-s // t) for s, t in zip(a.shape, tile)]
+    tables, offsets, nxt = [], [0], 1
+    for tidx in itertools.product(*[range(g) for g in grid]):
+        sl = tuple(slice(i * t, (i + 1) * t) for i, t in zip(tidx, tile))
+        n = ndi.label(fg[sl], structure=struct)[1]
+        tables.append(np.concatenate([[0], np.arange(nxt, nxt + n)]).astype(np.int64))
+        nxt += n
+        offsets.append(offsets[-1] + n + 1)
+    return mask.label_tiles(tile, 1, np.concatenate(tables).tobytes(),
+                            np.asarray(offsets, np.int64).tobytes())
 
 
 def _filter_passes(*modes):

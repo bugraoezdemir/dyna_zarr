@@ -455,8 +455,67 @@ def _gaussian_kernel(name, sigma, boundary, truncate, kw):
             "truncate": truncate}
 
 
+# --------------------------------------------------------------------------- #
+# Labels of a tiled mask (tilewise-ccl's Phase B)
+# --------------------------------------------------------------------------- #
+
+def _label_tiles_block(block, location, tables, tile, struct, dtype):
+    """Phase B on one read: every tile it holds (whole, by ``align=tile``) labeled on its
+    own with scipy.ndimage.label and mapped through its table."""
+    import itertools
+    from scipy import ndimage as ndi
+    ndim = len(tile)
+    starts = [lo for lo, _ in location]
+    stops = [hi for _, hi in location]
+    out = np.zeros(block.shape, dtype=dtype)
+    lo = [starts[a] // tile[a] for a in range(ndim)]
+    hi = [(stops[a] - 1) // tile[a] for a in range(ndim)]
+    if any(stops[a] <= starts[a] for a in range(ndim)):
+        return out
+    for tidx in itertools.product(*[range(lo[a], hi[a] + 1) for a in range(ndim)]):
+        # the tile's core, inside the read (align gives whole tiles; the last ones are
+        # clipped at the array's end, where the read stops too)
+        cs = [tidx[a] * tile[a] for a in range(ndim)]
+        ce = [min(cs[a] + tile[a], stops[a]) for a in range(ndim)]
+        sl = tuple(slice(cs[a] - starts[a], ce[a] - starts[a]) for a in range(ndim))
+        local, _ = ndi.label(np.asarray(block[sl]) > 0, structure=struct)
+        out[sl] = tables[tidx][local]
+    return out
+
+
+def label_tiles(mask, tables, tile_shape, connectivity=1, dtype=np.int32):
+    """The final labels of a tiled ``mask`` (tilewise-ccl's Phase B), lazily.
+
+    The mask is cut into tiles of ``tile_shape`` (the last ones clipped at the array's
+    end). Each tile's foreground (``mask > 0``) is labeled on its own with
+    ``scipy.ndimage.label`` and ``generate_binary_structure(ndim, connectivity)``, and
+    its local label ``l`` becomes ``tables[tile_index][l]``: ``tables`` maps every tile's
+    grid index (a tuple) to a 1-D array holding the background's entry and one per local
+    label (tilewise-ccl's Phase A builds them). ``dtype``: int32 or int64.
+
+    Every read covers whole tiles (``align=tile_shape``), since a tile's local labels
+    depend on the whole tile; io.write takes that alignment as its region size. dyna's
+    native engine reads it (Workplan DR7 step 8) with the same labels."""
+    tile = tuple(int(t) for t in tile_shape)
+    if len(tile) != mask.ndim or any(t < 1 for t in tile):
+        raise ValueError(f"label_tiles: tiles of {tile_shape} for an array of shape "
+                         f"{tuple(mask.shape)}")
+    from functools import partial
+    from scipy import ndimage as ndi
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+        raise ValueError(f"label_tiles: labels as {dtype}; use int32 or int64")
+    struct = ndi.generate_binary_structure(mask.ndim, connectivity)
+    func = partial(_label_tiles_block, tables=tables, tile=tile, struct=struct, dtype=dtype)
+    kernel = {"name": "label_tiles", "tables": tables, "tile": tile,
+              "connectivity": int(connectivity), "dtype": dtype}
+    return mask._with_transform(
+        MapOverlapTransform(mask, func, 0, boundary="constant", dtype=dtype,
+                            name="label_tiles", block_info=True, align=tile, kernel=kernel))
+
+
 __all__ = [
-    "MapOverlapTransform", "map_overlap",
+    "MapOverlapTransform", "map_overlap", "label_tiles",
     "gaussian_filter", "uniform_filter", "median_filter", "rank_filter", "percentile_filter",
     "minimum_filter", "maximum_filter", "grey_erosion", "grey_dilation",
     "convolve", "correlate",

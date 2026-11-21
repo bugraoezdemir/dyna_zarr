@@ -423,6 +423,23 @@ fn numpy_sum(values: Vec<f64>) -> f64 {
     fl::numpy_sum(&values)
 }
 
+/// scipy.ndimage.label of a foreground given as bytes (one per element, nonzero =
+/// foreground) of `shape`, with `generate_binary_structure(ndim, connectivity)`: the
+/// labels' bytes (uint32 per element) and their number.
+#[pyfunction]
+fn label<'py>(
+    py: Python<'py>,
+    foreground: &Bound<'py, pyo3::types::PyBytes>,
+    shape: Vec<usize>,
+    connectivity: usize,
+) -> PyResult<(Bound<'py, pyo3::types::PyBytes>, u32)> {
+    let fg = foreground.as_bytes();
+    let (lab, n) = fl::label(fg, &shape, connectivity).map_err(err)?;
+    // SAFETY: u32 labels viewed as bytes
+    let bytes = unsafe { std::slice::from_raw_parts(lab.as_ptr() as *const u8, lab.len() * 4) };
+    Ok((pyo3::types::PyBytes::new(py, bytes), n))
+}
+
 pub fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     let m = PyModule::new(py, "filters")?;
     m.add("FilterError", py.get_type::<FilterError>())?;
@@ -432,6 +449,7 @@ pub fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_function(wrap_pyfunction!(chains, &m)?)?;
     m.add_function(wrap_pyfunction!(rank_filter, &m)?)?;
     m.add_function(wrap_pyfunction!(correlate, &m)?)?;
+    m.add_function(wrap_pyfunction!(label, &m)?)?;
     m.add_function(wrap_pyfunction!(gaussian_weights, &m)?)?;
     m.add_function(wrap_pyfunction!(numpy_sum, &m)?)?;
     Ok(m)

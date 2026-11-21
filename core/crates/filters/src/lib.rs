@@ -16,6 +16,7 @@
 
 mod correlate;
 mod gaussian;
+mod label;
 mod ndcorrelate;
 mod pass;
 mod rank;
@@ -24,6 +25,7 @@ mod window;
 
 pub use correlate::{correlate1d, correlate1d_on, pass_bytes, Span};
 pub use gaussian::{gaussian_filter, gaussian_weights, numpy_sum, radius};
+pub use label::{label, label_bytes};
 pub use ndcorrelate::{correlate_on, Correlate};
 pub use pass::{separable, terms, Combine, Line, Pass};
 pub use rank::{rank_filter_on, RankFilter, Select};

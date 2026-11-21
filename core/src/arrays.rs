@@ -577,6 +577,46 @@ impl Array {
         Ok(Self::view(f))
     }
 
+    /// The final labels of this mask in tiles of `tile` (tilewise-ccl's Phase B, Workplan
+    /// DR7 step 8): each tile's foreground (`v > 0`) labeled as scipy.ndimage.label does
+    /// with `generate_binary_structure(ndim, connectivity)`, its local label l mapped to
+    /// `tables[offsets[k] + l]` for tile k (tiles in C order of the grid). `tables` and
+    /// `offsets` are the bytes of int64 arrays; `dtype` "int32" or "int64". Lazy; a read
+    /// labels every tile it overlaps whole.
+    #[pyo3(signature = (tile, connectivity, tables, offsets, dtype = "int32"))]
+    fn label_tiles(
+        &self,
+        tile: Vec<u64>,
+        connectivity: usize,
+        tables: &Bound<'_, PyBytes>,
+        offsets: &Bound<'_, PyBytes>,
+        dtype: &str,
+    ) -> PyResult<Array> {
+        let ints = |b: &Bound<'_, PyBytes>, what: &str| -> PyResult<Vec<i64>> {
+            let b = b.as_bytes();
+            if b.len() % 8 != 0 {
+                return Err(ReadError::new_err(format!(
+                    "{what}: not the bytes of int64s"
+                )));
+            }
+            Ok(b.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_ne_bytes(*c))
+                .collect())
+        };
+        let tables = ints(tables, "tables")?;
+        let offsets = ints(offsets, "offsets")?
+            .into_iter()
+            .map(|v| usize::try_from(v).map_err(|_| ReadError::new_err("a negative offset")))
+            .collect::<PyResult<Vec<usize>>>()?;
+        let t = ar::DType::parse(dtype).map_err(err)?;
+        Ok(Self::view(
+            ar::TileLabels::new(self.src.clone(), &tile, connectivity, tables, offsets, t)
+                .map_err(err)?,
+        ))
+    }
+
     /// The array resampled onto a grid of `shape`: output index o takes the value at
     /// input index `matrix · o` (scipy.ndimage.affine_transform's convention: the matrix
     /// maps output to input). `matrix`: n rows of n + 1 (the last column the offset) or

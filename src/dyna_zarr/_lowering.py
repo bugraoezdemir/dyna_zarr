@@ -27,6 +27,8 @@ What the engine takes over, and only where it gives the Python path's exact valu
   median_filter, rank_filter and percentile_filter (step 4) for any numeric type on
   arrays of two or more dimensions, and for integers up to 32 bits on 1-D arrays (see
   _rank). correlate and convolve with a real n-D kernel (step 5), any numeric type.
+- label_tiles (step 8, tilewise-ccl's Phase B): every tile labeled as
+  scipy.ndimage.label labels it and mapped through its table, the same labels;
 - pointwise operations whose values NumPy defines exactly (step 7): arithmetic,
   comparisons, logic, bit operations, rounding, sqrt, where and clip, each checked once
   against the NumPy dyna runs with (see _lowering_pointwise).
@@ -273,8 +275,11 @@ def _map_blocks(core, t):
 
 def _map_overlap(core, t):
     """A named filter (its ``kernel`` spec) the engine has, on the CPU, read whole: no
-    ``block_info``, no ``align``, no other output type."""
+    ``block_info``, no ``align``, no other output type; or label_tiles (step 8), whose
+    ``block_info`` and ``align`` are its own."""
     spec = getattr(t, "kernel", None)
+    if spec is not None and spec.get("name") == "label_tiles":
+        return _label_tiles(t, spec)
     if spec is None or t.block_info or t.align is not None or t.device not in (None, "cpu"):
         return None
     if np.dtype(t.dtype) != np.dtype(t.array.dtype):
@@ -283,6 +288,33 @@ def _map_overlap(core, t):
         return None
     build = _KERNELS.get(spec["name"])
     return None if build is None else build(t, spec)
+
+
+def _label_tiles(t, spec):
+    """tilewise-ccl's Phase B: the tables flattened in C order of the tile grid."""
+    if t.device not in (None, "cpu") or not hasattr(t.array, "shape"):
+        return None
+    tile = tuple(spec["tile"])
+    if t.align != tile:
+        return None
+    eng = _up(t.array)
+    if eng is None or not hasattr(eng, "label_tiles"):
+        return None
+    shape = tuple(t.array.shape)
+    grid = [-(-s // w) for s, w in zip(shape, tile)]
+    tables, offsets, at = [], [0], 0
+    import itertools
+    for tidx in itertools.product(*[range(g) for g in grid]):
+        tb = np.asarray(spec["tables"][tidx])
+        if tb.ndim != 1 or tb.size < 1 or tb.dtype.kind not in "iu":
+            return None
+        tables.append(tb.astype(np.int64, copy=False))
+        at += tb.size
+        offsets.append(at)
+    flat = np.concatenate(tables) if tables else np.zeros(0, np.int64)
+    return eng.label_tiles(list(tile), spec["connectivity"], flat.tobytes(),
+                           np.asarray(offsets, dtype=np.int64).tobytes(),
+                           np.dtype(spec["dtype"]).name)
 
 
 #: the modes in which the engine gives the Python path's values (scipy's five)
