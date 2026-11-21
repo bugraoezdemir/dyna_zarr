@@ -272,6 +272,25 @@ macro_rules! unsigned_safe {
 
 unsigned_safe!(u8, u16, u32, u64);
 
+/// `acc + x * w` as scipy's compiled loops compute their `acc += x * w`: one fused
+/// multiply-add where the C compiler fuses it, else the product rounded, then added.
+/// clang and GCC fuse such statements on aarch64 (`-ffp-contract`), which is how scipy's
+/// wheels for macOS arm64 and Linux aarch64 are built, and their float64 results differ
+/// from the unfused ones in the last bit (found by dyna's CI on macOS arm64, 2026-11-22).
+/// x86-64 wheels are built for a baseline without FMA, so they never fuse. `--cfg
+/// scipy_fma` fuses on any target, to test the fused form on x86-64.
+#[inline(always)]
+pub(crate) fn madd(acc: f64, x: f64, w: f64) -> f64 {
+    if cfg!(any(
+        scipy_fma,
+        all(target_arch = "aarch64", not(target_os = "windows"))
+    )) {
+        x.mul_add(w, acc)
+    } else {
+        acc + x * w
+    }
+}
+
 /// `v > -1 ? (type)v : -(type)(-v)` for an unsigned type.
 #[inline(always)]
 pub(crate) fn unsigned_safe<U: Unsigned>(v: f64) -> U {

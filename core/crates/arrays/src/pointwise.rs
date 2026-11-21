@@ -37,6 +37,10 @@ use crate::ReadError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
     Add,
+    AddNanFirst,
+    SubtractNanFirst,
+    MultiplyNanFirst,
+    DivideNanFirst,
     Subtract,
     Multiply,
     Divide,
@@ -79,8 +83,14 @@ pub enum Op {
     Clip,
 }
 
-const NAMES: [(Op, &str); 41] = [
+const NAMES: [(Op, &str); 45] = [
     (Op::Add, "add"),
+    // where both operands are NaN, the first's (as NumPy's GCC-built loops keep it;
+    // the plain names keep the second's, as its MSVC-built loops do)
+    (Op::AddNanFirst, "add:nan_first"),
+    (Op::SubtractNanFirst, "subtract:nan_first"),
+    (Op::MultiplyNanFirst, "multiply:nan_first"),
+    (Op::DivideNanFirst, "divide:nan_first"),
     (Op::Subtract, "subtract"),
     (Op::Multiply, "multiply"),
     (Op::Divide, "divide"),
@@ -196,11 +206,11 @@ impl Op {
         );
         let boolean = t == DType::Bool;
         match self {
-            Divide | Sqrt | Reciprocal | Fabs | Copysign | Rint => float,
+            Divide | DivideNanFirst | Sqrt | Reciprocal | Fabs | Copysign | Rint => float,
             LeftShift | RightShift => int,
             BitwiseAnd | BitwiseOr | BitwiseXor | Invert => int || boolean,
             // NumPy squares bools in int8: no bool loop
-            Negative | Positive | Sign | Subtract | Square => int || float,
+            Negative | Positive | Sign | Subtract | SubtractNanFirst | Square => int || float,
             _ => int || float || boolean,
         }
     }
@@ -797,16 +807,42 @@ fn map3<T: Copy, U>(a: In<T>, b: In<T>, c: In<T>, out: &mut [U], f: impl Fn(T, T
     }
 }
 
+/// `f(p, q)`, and where both are NaN the second operand's NaN (IEEE leaves which one
+/// open; NumPy's MSVC-built loops keep the second). `f(q, q)` of a NaN is that NaN,
+/// quieted, so no bits are touched by hand.
+#[inline(always)]
+fn nan_second<T: Elem>(p: T, q: T, f: impl Fn(T, T) -> T) -> T {
+    if p.is_nan() && q.is_nan() {
+        f(q, q)
+    } else {
+        f(p, q)
+    }
+}
+
+/// As [`nan_second`], keeping the first operand's NaN (NumPy's GCC-built loops).
+#[inline(always)]
+fn nan_first<T: Elem>(p: T, q: T, f: impl Fn(T, T) -> T) -> T {
+    if p.is_nan() && q.is_nan() {
+        f(p, p)
+    } else {
+        f(p, q)
+    }
+}
+
 /// `op` (its result in the loop type) on `ins` into `out`; `cond` is `where`'s
 /// condition.
 fn same<T: Elem>(op: Op, ins: &[In<T>], cond: Option<In<B>>, out: &mut [T]) {
     use Op::*;
     let a = ins[0];
     match op {
-        Add => map2(a, ins[1], out, T::add),
-        Subtract => map2(a, ins[1], out, T::sub),
-        Multiply => map2(a, ins[1], out, T::mul),
-        Divide => map2(a, ins[1], out, T::div),
+        Add => map2(a, ins[1], out, |p, q| nan_second(p, q, T::add)),
+        Subtract => map2(a, ins[1], out, |p, q| nan_second(p, q, T::sub)),
+        Multiply => map2(a, ins[1], out, |p, q| nan_second(p, q, T::mul)),
+        Divide => map2(a, ins[1], out, |p, q| nan_second(p, q, T::div)),
+        AddNanFirst => map2(a, ins[1], out, |p, q| nan_first(p, q, T::add)),
+        SubtractNanFirst => map2(a, ins[1], out, |p, q| nan_first(p, q, T::sub)),
+        MultiplyNanFirst => map2(a, ins[1], out, |p, q| nan_first(p, q, T::mul)),
+        DivideNanFirst => map2(a, ins[1], out, |p, q| nan_first(p, q, T::div)),
         Maximum => map2(a, ins[1], out, T::maximum),
         Minimum => map2(a, ins[1], out, T::minimum),
         BitwiseAnd => map2(a, ins[1], out, T::and),

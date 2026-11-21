@@ -62,6 +62,11 @@ _GIVES_BOOL = {
     "greater", "greater_equal", "less", "less_equal", "equal", "not_equal", "logical_and",
     "logical_or", "logical_xor", "logical_not", "isnan", "isinf", "isfinite", "signbit",
 }
+#: operations whose NaN, where both operands are NaN, NumPy builds differ on (IEEE leaves
+#: it open): MSVC-built loops keep the second operand's, GCC-built ones the first's. The
+#: engine has both (``name`` and ``name:nan_first``); the check picks the one this NumPy
+#: agrees with.
+_NAN_VARIANTS = {"add", "subtract", "multiply", "divide"}
 #: loop and result types the engine computes in
 _TYPES = {"bool", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
           "float32", "float64"}
@@ -169,9 +174,14 @@ def build(core, t, up):
             return None             # which NaN NumPy keeps depends on the array's length
         operands.append(b)
         scalars[k] = b
+    chosen = name
     if not _agrees(core, name, loop, len(ops), scalars):
-        return None
-    return core.pointwise(name, operands, loop.name)
+        if name not in _NAN_VARIANTS or loop.kind != "f":
+            return None
+        chosen = name + ":nan_first"
+        if not _agrees(core, chosen, loop, len(ops), scalars):
+            return None
+    return core.pointwise(chosen, operands, loop.name)
 
 
 # ------------------------------------------------------------------- the NumPy check
@@ -234,6 +244,7 @@ def _probe_inputs(name, loop, n, scalars):
 
 
 def _numpy(name, vals):
+    name = name.split(":")[0]            # an engine variant: NumPy's own function
     if name == "where":
         return np.where(*vals)
     if name == "clip":
@@ -254,7 +265,7 @@ def _agrees(core, name, loop, n, scalars):
         length, vals, eng = _probe_inputs(name, loop, n, scalars)
         with np.errstate(all="ignore"):
             want = np.asarray(_numpy(name, vals))
-        out = np.dtype(bool) if name in _GIVES_BOOL else loop
+        out = np.dtype(bool) if name.split(":")[0] in _GIVES_BOOL else loop
         got = np.frombuffer(core.pointwise_apply(name, eng, length, loop.name), dtype=out)
         if want.dtype == out and want.shape == got.shape:
             if out.kind == "f":

@@ -12,6 +12,7 @@
 //! convolve is a correlation with the kernel reversed and the origins negated (one lower
 //! for an even size), as scipy builds it ([`Correlate::convolve`]).
 
+use crate::madd;
 use crate::window::{Footprint, Window};
 use crate::{Element, FilterError, Mode, Span};
 
@@ -162,7 +163,8 @@ impl Correlate {
     }
 }
 
-/// `acc[l] = 0.0 + w0 * at[off0 + l] + w1 * at[off1 + l] + ...`, term after term.
+/// `acc[l] = 0.0 + w0 * at[off0 + l] + w1 * at[off1 + l] + ...`, term after term (each
+/// `+ w * x` as scipy's compiled loop does it: [`madd`]).
 #[inline(never)]
 fn sum_tile(at: &[f64], terms: &[(f64, usize)], acc: &mut [f64]) {
     let m = acc.len();
@@ -170,7 +172,7 @@ fn sum_tile(at: &[f64], terms: &[(f64, usize)], acc: &mut [f64]) {
     for &(w, off) in terms {
         let row = &at[off..off + m];
         for (a, x) in acc.iter_mut().zip(row) {
-            *a += w * x;
+            *a = madd(*a, w, *x);
         }
     }
 }
@@ -243,7 +245,7 @@ mod tests {
                         _ => None,
                     };
                 }
-                acc += wk * flat.map_or(mode.cval(), |f| data[f]);
+                acc = madd(acc, wk, flat.map_or(mode.cval(), |f| data[f]));
             }
             out.push(acc);
             for a in (0..n).rev() {

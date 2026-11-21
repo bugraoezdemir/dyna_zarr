@@ -3,6 +3,7 @@
 
 use rayon::prelude::*;
 
+use crate::madd;
 use crate::{Element, FilterError, Mode};
 
 /// Which part of an axis a pass reads and writes, in the whole array's positions.
@@ -329,11 +330,11 @@ impl Kernel<'_> {
                     let (lo, hi) = (&buf[s1 - j..s1 - j + m], &buf[s1 + j..s1 + j + m]);
                     if self.sym == 1 {
                         for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
-                            *a += (l + h) * wj;
+                            *a = madd(*a, l + h, wj);
                         }
                     } else {
                         for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
-                            *a += (l - h) * wj;
+                            *a = madd(*a, l - h, wj);
                         }
                     }
                 }
@@ -346,7 +347,7 @@ impl Kernel<'_> {
                 // jj = t - size1 runs from -size1 to size2 - 1: buffer position ll + t
                 for (t, &wt) in w[..last].iter().enumerate() {
                     for (a, b) in acc.iter_mut().zip(&buf[t..t + m]) {
-                        *a += b * wt;
+                        *a = madd(*a, *b, wt);
                     }
                 }
             }
@@ -371,11 +372,11 @@ impl Kernel<'_> {
                     let (lo, hi) = (row(c - j), row(c + j));
                     if self.sym == 1 {
                         for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
-                            *a += (l + h) * wj;
+                            *a = madd(*a, l + h, wj);
                         }
                     } else {
                         for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
-                            *a += (l - h) * wj;
+                            *a = madd(*a, l - h, wj);
                         }
                     }
                 }
@@ -386,7 +387,7 @@ impl Kernel<'_> {
                 }
                 for (t, &wt) in w[..s1 + s2].iter().enumerate() {
                     for (a, v) in acc.iter_mut().zip(row(c + t - s1)) {
-                        *a += v * wt;
+                        *a = madd(*a, *v, wt);
                     }
                 }
             }

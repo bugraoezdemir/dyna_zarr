@@ -11,3 +11,7 @@ description = "scipy.ndimage's filters on in-memory blocks, with scipy's results
 [dependencies]
 # lines of a pass in parallel, on whatever pool the caller runs in
 rayon = "1"
+
+[lints.rust]
+# `--cfg scipy_fma`: the fused multiply-adds of scipy's aarch64 wheels on any target (tests)
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(scipy_fma)"] }

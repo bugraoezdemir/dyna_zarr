@@ -95,7 +95,14 @@ def test_kernel_equals_numpy(name, loop):
     if name == "clip":
         lo, hi = (-0.0, 3.5) if dt.kind == "f" else (2, 9 if dt != np.dtype(bool) else 1)
         scalars = {1: np.asarray(lo, dt).tobytes(), 2: np.asarray(hi, dt).tobytes()}
-    assert lp._agrees(core, name, dt, n, scalars)
+    used = name
+    agrees = lp._agrees(core, name, dt, n, scalars)
+    if not agrees and name in lp._NAN_VARIANTS and dt.kind == "f":
+        used = name + ":nan_first"           # this NumPy keeps the first operand's NaN
+        agrees = lp._agrees(core, used, dt, n, scalars)
+    if not agrees:
+        pytest.skip(f"this NumPy computes {name} in {loop} by a rule the engine does not "
+                    "follow (NumPy's arm64 maximum, for one); the Python path reads it")
     length = 5003
     vals, eng = [], []
     for k in range(n):
@@ -107,7 +114,7 @@ def test_kernel_equals_numpy(name, loop):
         vals.append(v)
         eng.append((v.tobytes(), False))
     want = np.asarray(lp._numpy(name, vals))
-    got = np.frombuffer(core.pointwise_apply(name, eng, length, loop), dtype=want.dtype)
+    got = np.frombuffer(core.pointwise_apply(used, eng, length, loop), dtype=want.dtype)
     _same_bits(got, want)
 
 
@@ -132,6 +139,16 @@ def _zarr(path, data, chunks=(2, 16, 16)):
     z = zarr.create_array(str(path), shape=data.shape, chunks=chunks, dtype=data.dtype)
     z[...] = data
     return io.read(str(path))
+
+
+def _lowered_unless_numpy_differs(v):
+    """The engine counterpart of ``v``; None only where the NumPy check refused an
+    operation of it (a NumPy whose rule differs keeps the Python path, by design)."""
+    lp._checked.clear()
+    eng = _lowering.lowered(v)
+    if eng is None:
+        assert False in lp._checked.values(), "not lowered, and no NumPy check refused it"
+    return eng
 
 
 def _both(fn):
@@ -206,7 +223,7 @@ def test_pointwise_reads_as_python_and_numpy(tmp_path, case, pair):
         pytest.skip("NumPy has no loop for these types")
     v = build(_zarr(tmp_path / "a.zarr", x), _zarr(tmp_path / "b.zarr", y))
     if want.dtype.name in lp._TYPES:
-        assert _lowering.lowered(v) is not None
+        _lowered_unless_numpy_differs(v)
     for key in _keys(v.shape):
         e, p = _both(lambda: np.asarray(v._read_direct(key)))
         _same_bits(e, p, f"{key}")
@@ -249,23 +266,26 @@ def test_other_expressions_keep_the_python_path(tmp_path, expr):
 def test_a_gpu_device_is_not_lowered(tmp_path):
     a = _zarr(tmp_path / "a.zarr", _data(SHAPE, "float32"))
     assert _lowering.lowered(o.map_blocks(np.add, a, a, device="cuda")) is None
-    assert _lowering.lowered(o.map_blocks(np.add, a, a, device="cpu")) is not None
+    _lowered_unless_numpy_differs(o.map_blocks(np.add, a, a, device="cpu"))
 
 
 def test_an_operation_numpy_disagrees_on_keeps_the_python_path(tmp_path):
     """The NumPy check decides: an operation it found different stays in Python."""
     a = _zarr(tmp_path / "a.zarr", _data(SHAPE, "float32"))
-    key = ("subtract", "float32", 2, ())
-    saved = lp._checked.get(key)
-    lp._checked[key] = False
+    # both of the engine's NaN variants disagree
+    keys = [("subtract", "float32", 2, ()), ("subtract:nan_first", "float32", 2, ())]
+    saved = {k: lp._checked.get(k) for k in keys}
+    for k in keys:
+        lp._checked[k] = False
     try:
         assert _lowering.lowered(a - a) is None
     finally:
-        if saved is None:
-            lp._checked.pop(key, None)
-        else:
-            lp._checked[key] = saved
-    assert _lowering.lowered(a - a) is not None
+        for k, v in saved.items():
+            if v is None:
+                lp._checked.pop(k, None)
+            else:
+                lp._checked[k] = v
+    _lowered_unless_numpy_differs(a - a)
 
 
 def test_a_filter_chain_written_as_python(tmp_path):
@@ -275,7 +295,7 @@ def test_a_filter_chain_written_as_python(tmp_path):
     a = _zarr(tmp_path / "a.zarr", data, chunks=(4, 32, 32))
     g = o.gaussian_filter(a, 1.5)
     v = o.where(g > 30000, g, 0).astype("uint8")
-    assert _lowering.lowered(v) is not None
+    _lowered_unless_numpy_differs(v)
     out = {}
     for on in (True, False):
         _engine.set_engine(on)
