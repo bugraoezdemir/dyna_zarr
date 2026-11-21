@@ -17,11 +17,13 @@
 mod correlate;
 mod gaussian;
 mod pass;
+mod rank;
 mod running;
 
 pub use correlate::{correlate1d, correlate1d_on, pass_bytes, Span};
 pub use gaussian::{gaussian_filter, gaussian_weights, numpy_sum, radius};
 pub use pass::{separable, terms, Combine, Line, Pass};
+pub use rank::{rank_filter_on, Footprint, RankFilter, Select};
 pub use running::{min_max1d_on, running_pass_bytes, uniform1d_on};
 
 /// The crate's version, as `dyna_zarr_core` reports it.
@@ -31,9 +33,26 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FilterError(pub String);
 
+/// How the message of [`FilterError::from_line_start`] starts.
+const FROM_LINE_START: &str = "scipy's value depends on where the line starts: ";
+
 impl FilterError {
     pub fn new(message: impl Into<String>) -> Self {
         Self(message.into())
+    }
+
+    /// A pass asked for part of a line whose values, in scipy, depend on everything the
+    /// line holds before that part: a sliding minimum or maximum through a NaN (scipy's
+    /// loop keeps a NaN or drops it depending on the values before it). Only a run from
+    /// the line's start gives scipy's values; a caller reading part of an array has to
+    /// read it another way.
+    pub fn line_start(what: &str) -> Self {
+        Self(format!("{FROM_LINE_START}{what}"))
+    }
+
+    /// Whether this is [`FilterError::line_start`]'s error.
+    pub fn from_line_start(&self) -> bool {
+        self.0.starts_with(FROM_LINE_START)
     }
 }
 

@@ -16,9 +16,16 @@ use pyo3::prelude::*;
 use pyo3::types::{PyEllipsis, PySlice, PyTuple};
 
 create_exception!(dyna_zarr_core, ReadError, PyValueError);
+// The engine cannot give dyna's Python-path values for this read (they depend on where
+// the read starts): dyna reads it with the Python path.
+create_exception!(dyna_zarr_core, UsePythonPath, ReadError);
 
 fn err(e: ar::ReadError) -> PyErr {
-    ReadError::new_err(e.message)
+    if e.python_path {
+        UsePythonPath::new_err(e.message)
+    } else {
+        ReadError::new_err(e.message)
+    }
 }
 
 /// A fixed set of threads that reads run on (Workplan decision DR-5). A write makes one
@@ -497,6 +504,42 @@ impl Array {
         let chains = crate::filters::chains_of(chains, cval).map_err(ReadError::new_err)?;
         let combine = crate::filters::combine_of(combine).map_err(ReadError::new_err)?;
         let mut f = ar::Separable::terms(self.src.clone(), chains, combine).map_err(err)?;
+        if let Some(mb) = max_read_mb {
+            f = f.with_max_read((mb * 1048576.0) as u64);
+        }
+        Ok(Self::view(f))
+    }
+
+    /// scipy.ndimage's n-D rank filter (Workplan DR7 step 4): the element of rank `rank`
+    /// among the positions of a footprint of `shape` (all of it, or those `mask` marks,
+    /// C order) shifted by `origin`, the array extended at its edges by `mode`. What
+    /// scipy's rank_filter, median_filter and percentile_filter run for arrays of two or
+    /// more dimensions and ranks other than the first and the last. Any region gives the
+    /// values of the whole filtered array. Lazy.
+    #[pyo3(signature = (shape, rank, mask = None, origin = None, mode = "reflect", cval = 0.0, max_read_mb = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn rank_filter(
+        &self,
+        shape: Vec<usize>,
+        rank: usize,
+        mask: Option<Vec<bool>>,
+        origin: Option<Vec<isize>>,
+        mode: &str,
+        cval: f64,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let mode = ar::FilterMode::parse(mode, cval).ok_or_else(|| {
+            ReadError::new_err(format!(
+                "mode {mode:?}: use \"reflect\", \"mirror\", \"nearest\", \"wrap\" or \"constant\""
+            ))
+        })?;
+        let origin = origin.unwrap_or_else(|| vec![0; shape.len()]);
+        let fp = ar::Footprint {
+            shape,
+            mask,
+            origin,
+        };
+        let mut f = ar::Rank::new(self.src.clone(), fp, rank, mode).map_err(err)?;
         if let Some(mb) = max_read_mb {
             f = f.with_max_read((mb * 1048576.0) as u64);
         }

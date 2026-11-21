@@ -285,9 +285,34 @@ def uniform_filter(array, size, boundary="reflect", device=None, **kw):
 
 
 def median_filter(array, size, boundary="reflect", device=None, **kw):
+    """Median of each ``size`` window (scipy.ndimage.median_filter)."""
     func = lambda b: ndimage_namespace(b).median_filter(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="median_filter", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "median_filter",
+                  device, _size_kernel("median_filter", size, boundary, kw))
+
+
+def rank_filter(array, rank, size, boundary="reflect", device=None, **kw):
+    """The element of rank ``rank`` (0 the smallest, -1 the largest) of each ``size``
+    window (scipy.ndimage.rank_filter)."""
+    func = lambda b: ndimage_namespace(b).rank_filter(b, rank, size=size, mode=boundary, **kw)
+    kernel = _size_kernel("rank_filter", size, boundary, kw)
+    if kernel is not None:
+        kernel["rank"] = rank
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "rank_filter",
+                  device, kernel)
+
+
+def percentile_filter(array, percentile, size, boundary="reflect", device=None, **kw):
+    """The ``percentile`` (0 to 100, or -100 to 0 counted from the top) of each ``size``
+    window, as scipy picks it: the element of rank ``int(n * percentile / 100)`` of the
+    window's n values (scipy.ndimage.percentile_filter)."""
+    func = lambda b: ndimage_namespace(b).percentile_filter(
+        b, percentile, size=size, mode=boundary, **kw)
+    kernel = _size_kernel("percentile_filter", size, boundary, kw)
+    if kernel is not None:
+        kernel["percentile"] = percentile
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "percentile_filter",
+                  device, kernel)
 
 
 def minimum_filter(array, size, boundary="reflect", device=None, **kw):
@@ -388,7 +413,7 @@ def _gaussian_kernel(name, sigma, boundary, truncate, kw):
 
 __all__ = [
     "MapOverlapTransform", "map_overlap",
-    "gaussian_filter", "uniform_filter", "median_filter",
+    "gaussian_filter", "uniform_filter", "median_filter", "rank_filter", "percentile_filter",
     "minimum_filter", "maximum_filter", "grey_erosion", "grey_dilation",
     "convolve", "correlate",
     "laplace", "gaussian_laplace", "gaussian_gradient_magnitude",

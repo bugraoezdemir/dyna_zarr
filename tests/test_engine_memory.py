@@ -97,6 +97,12 @@ CHAINS = {
     "filter-hypot": lambda a: a.astype("float32").filter(
         [[(k, "correlate", list(core.filters.gaussian_weights(1.0, int(k == d), 4)), 0,
            "mirror") for k in range(3)] for d in range(3)], combine="hypot"),
+    # the n-D rank filter (step 4): a median, an even box in constant mode, wrap, split
+    "rank": lambda a: a.rank_filter([3, 3, 3], 13),
+    "rank-even": lambda a: a.rank_filter([2, 4, 5], 17, mode="constant", cval=7.0),
+    "rank-wrap": lambda a: a.rank_filter([3, 5, 3], 20, mode="wrap"),
+    "rank-split": lambda a: a.rank_filter([1, 5, 5], 12, max_read_mb=0.05),
+    "rank-of-mean": lambda a: a.downsample([1, 2, 2], "mean").rank_filter([3, 3, 3], 13),
 }
 
 

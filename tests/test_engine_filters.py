@@ -1,4 +1,4 @@
-"""dyna's named filters read by the native engine (Workplan WP15, task DR7 step 2).
+"""dyna's named filters read by the native engine (Workplan WP15, task DR7 steps 2-4).
 
 gaussian_filter records which filter it is on its MapOverlapTransform; dyna_zarr's
 _lowering builds the engine's separable view from scipy's own kernel weights. Every case
@@ -148,7 +148,8 @@ STAYS = {
     "align": lambda a: o.map_overlap(a, lambda b: b, 1, align=8),
     # floats: the Python path's running sum depends on the region read (see _lowering)
     "uniform-float": lambda a: o.uniform_filter(a, 3),
-    "median": lambda a: o.median_filter(a, 3),            # not lowered yet (DR7 step 4)
+    "median-footprint": lambda a: o.median_filter(a, 3, footprint=np.ones((3, 3, 3), bool)),
+    "percentile-float32": lambda a: o.percentile_filter(a, np.float32(30.0), 3),
     "minimum-origin": lambda a: o.minimum_filter(a, 3, origin=1),
     "gradient-wrap": lambda a: o.gaussian_gradient_magnitude(a, 1.0, boundary="wrap"),
 }
@@ -282,4 +283,134 @@ def test_step3_written_as_python(tmp_path):
         out[on] = zarr.open_array(str(path), mode="r")[...]
     _same(out[True], out[False])
     want = ndi.grey_dilation(ndi.laplace(ndi.uniform_filter(data, 3), mode="nearest"), 4)
+    np.testing.assert_array_equal(out[True], want)
+
+
+# --------------------------------------------------------------------- step 4 (DR7)
+
+#: name -> (dyna's filter, scipy's); ranks inside the window, the first and the last
+#: (scipy's minimum / maximum filters), percentiles and even sizes
+STEP4 = {
+    "median": (lambda a, m, kw: o.median_filter(a, 3, boundary=m, **kw),
+               lambda d, m, kw: ndi.median_filter(d, 3, mode=m, **kw)),
+    "median-flat": (lambda a, m, kw: o.median_filter(a, (1, 5, 5), boundary=m, **kw),
+                    lambda d, m, kw: ndi.median_filter(d, (1, 5, 5), mode=m, **kw)),
+    "rank-even": (lambda a, m, kw: o.rank_filter(a, 5, (2, 3, 4), boundary=m, **kw),
+                  lambda d, m, kw: ndi.rank_filter(d, 5, (2, 3, 4), mode=m, **kw)),
+    "rank-negative": (lambda a, m, kw: o.rank_filter(a, -3, (3, 3, 2), boundary=m, **kw),
+                      lambda d, m, kw: ndi.rank_filter(d, -3, (3, 3, 2), mode=m, **kw)),
+    "rank-first": (lambda a, m, kw: o.rank_filter(a, 0, (3, 1, 4), boundary=m, **kw),
+                   lambda d, m, kw: ndi.rank_filter(d, 0, (3, 1, 4), mode=m, **kw)),
+    "rank-last": (lambda a, m, kw: o.rank_filter(a, -1, 3, boundary=m, **kw),
+                  lambda d, m, kw: ndi.rank_filter(d, -1, 3, mode=m, **kw)),
+    "percentile": (lambda a, m, kw: o.percentile_filter(a, 37.5, (3, 4, 3), boundary=m, **kw),
+                   lambda d, m, kw: ndi.percentile_filter(d, 37.5, (3, 4, 3), mode=m, **kw)),
+    "percentile-top": (lambda a, m, kw: o.percentile_filter(a, -10, 3, boundary=m, **kw),
+                       lambda d, m, kw: ndi.percentile_filter(d, -10, 3, mode=m, **kw)),
+    "percentile-100": (lambda a, m, kw: o.percentile_filter(a, 100, (2, 2, 3), boundary=m,
+                                                            **kw),
+                       lambda d, m, kw: ndi.percentile_filter(d, 100, (2, 2, 3), mode=m,
+                                                              **kw)),
+}
+
+
+def _ties_and_specials(shape, dtype, seed=0):
+    """Few distinct values; floats with NaN, -0.0 and 0.0 (where scipy's quickselect
+    order decides)."""
+    rng = np.random.default_rng(seed)
+    data = (rng.integers(-6, 7, size=shape) * 7).astype(dtype) if np.dtype(dtype).kind in "if"         else rng.integers(0, 13, size=shape).astype(dtype) * 7
+    if data.dtype.kind == "f":
+        flat = data.reshape(-1)
+        pick = rng.random(flat.size)
+        flat[pick < 0.03] = np.nan
+        flat[(pick >= 0.03) & (pick < 0.1)] = -0.0
+    return data
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "int8", "uint16", "int32", "uint64", "int64",
+                                   "float32", "float64"])
+@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "constant"])
+@pytest.mark.parametrize("name", list(STEP4))
+def test_step4_filters_read_as_python_and_scipy(tmp_path, dtype, mode, name):
+    build, ref = STEP4[name]
+    kw = {"cval": 14.0} if mode == "constant" else {}
+    data = _ties_and_specials(SHAPE, dtype)
+    v = build(_zarr(tmp_path / "a.zarr", data), mode, kw)
+    assert _lowering.lowered(v) is not None
+    want = ref(data, mode, kw)
+    # the first and last ranks are sliding minima / maxima: through a NaN, scipy's values
+    # depend on where a line starts, so the Python path's region reads differ from scipy
+    # on the whole array (the engine hands those reads to it: see the next test)
+    whole_only = name in ("rank-first", "rank-last", "percentile-100") and data.dtype.kind == "f"
+    for i, key in enumerate(_keys(v.shape)):
+        e, p = _both(lambda: np.asarray(v._read_direct(key)))
+        _same(e, p)
+        if whole_only and i > 0:
+            continue
+        np.testing.assert_array_equal(e, want[key])
+        if e.dtype.kind == "f":
+            np.testing.assert_array_equal(np.signbit(e), np.signbit(want[key]))
+
+
+@pytest.mark.parametrize("name", ["minimum", "maximum", "grey_erosion", "grey_dilation"])
+@pytest.mark.parametrize("mode", ["reflect", "constant"])
+def test_sliding_extremes_through_nan_read_as_python(tmp_path, name, mode):
+    """Many NaNs: a read whose pass starts inside the array goes back to the Python
+    path (UsePythonPath), so engine and Python path agree on every read; reads from the
+    array's start stay with the engine, and a whole read equals scipy."""
+    build, _ = STEP3[name]
+    kw = {"cval": 3.0} if mode == "constant" else {}
+    data = _ties_and_specials(SHAPE, "float32", seed=5)
+    v = build(_zarr(tmp_path / "a.zarr", data), mode, kw)
+    assert _lowering.lowered(v) is not None
+    for key in _keys(v.shape):
+        _same(*_both(lambda: np.asarray(v._read_direct(key))))
+    whole = (slice(None),) * 3
+    assert _lowering.read(v, whole) is not None
+    assert _lowering.read(v, (slice(2, 5), slice(10, 30), slice(5, 20))) is None
+    np.testing.assert_array_equal(np.asarray(v._read_direct(whole)), _scipy(name, data, mode, kw))
+
+
+@pytest.mark.parametrize("dtype, cval, takes", [
+    ("uint16", 0.0, True), ("int32", -5.0, True),
+    # scipy's 1-D routine selects among int64 or float values, and converts cval with
+    # NumPy: the engine takes integers up to 32 bits, with a cval the type holds
+    ("int64", 0.0, False), ("float32", 0.0, False), ("uint8", 2.5, False),
+    ("uint8", 300.0, False)])
+def test_step4_on_1d_arrays(tmp_path, dtype, cval, takes):
+    data = _ties_and_specials((300,), dtype)
+    a = _zarr(tmp_path / "a.zarr", data, chunks=(64,))
+    v = o.median_filter(a, 5, boundary="constant", cval=cval)
+    assert (_lowering.lowered(v) is not None) == takes
+    e, p = _both(v.compute)
+    _same(e, p)
+    if takes:
+        np.testing.assert_array_equal(e, ndi.median_filter(data, 5, mode="constant", cval=cval))
+    # rank 0: scipy's minimum filter, which the engine reads for every type
+    assert _lowering.lowered(o.rank_filter(a, 0, 5)) is not None
+
+
+def test_step4_errors_stay_scipys(tmp_path):
+    """A rank outside the window keeps the Python path, which raises scipy's error."""
+    a = _zarr(tmp_path / "a.zarr", _data(SHAPE, "uint16"))
+    for v in (o.rank_filter(a, 27, 3), o.percentile_filter(a, 120, 3)):
+        assert _lowering.lowered(v) is None
+        with pytest.raises(RuntimeError):
+            v.compute()
+
+
+def test_step4_written_as_python(tmp_path):
+    """A median of a filter written in regions, engine against Python path."""
+    data = _ties_and_specials((12, 96, 80), "float32", seed=3)
+    a = _zarr(tmp_path / "a.zarr", data, chunks=(4, 32, 32))
+    v = o.percentile_filter(o.median_filter(a, (3, 5, 5), boundary="mirror"), 80, 3)
+    assert _lowering.lowered(v) is not None
+    out = {}
+    for on in (True, False):
+        _engine.set_engine(on)
+        path = tmp_path / f"out-{on}.zarr"
+        io.write(v, str(path), chunks=(4, 32, 32), max_threads=3, memory_budget_mb=24)
+        out[on] = zarr.open_array(str(path), mode="r")[...]
+    _same(out[True], out[False])
+    want = ndi.percentile_filter(ndi.median_filter(data, (3, 5, 5), mode="mirror"), 80, 3)
     np.testing.assert_array_equal(out[True], want)

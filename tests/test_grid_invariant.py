@@ -125,6 +125,10 @@ def test_neighborhood(kind):
             r = fn(f, np.ones((3,) * nd, "f4") / 3 ** nd)
         elif "sigma" in params:
             r = fn(f, 1)
+        elif "rank" in params:
+            r = fn(f, 1, size=3)
+        elif "percentile" in params:
+            r = fn(f, 50, size=3)
         elif "size" in params:
             r = fn(f, size=3)
         else:

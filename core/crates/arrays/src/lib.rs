@@ -20,6 +20,7 @@ mod filter;
 pub mod memory;
 mod out;
 pub mod pool;
+mod rank;
 mod resample;
 mod source;
 mod views;
@@ -32,6 +33,7 @@ pub use downsample::{stride, Boundary, Gaussian, Mean};
 pub use dtype::DType;
 pub use filter::{Combine, FilterLine, FilterMode, Pass, Separable};
 pub use out::Out;
+pub use rank::{Footprint, Rank};
 pub use resample::{EdgeMode, Resample, DEFAULT_MAX_READ};
 pub use source::{read, read_cost, region, Source, SourceRef};
 pub use views::{Cast, Concat, ExpandDims, Slice, Squeeze, Transpose};
@@ -44,11 +46,27 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReadError {
     pub message: String,
+    /// The engine cannot give the values dyna's Python path gives for this read (it
+    /// depends on where the read starts, as scipy's sliding minimum through a NaN does):
+    /// read it with the Python path.
+    pub python_path: bool,
 }
 
 impl ReadError {
     pub fn new(message: String) -> Self {
-        Self { message }
+        Self {
+            message,
+            python_path: false,
+        }
+    }
+
+    /// A filter's error: [`ReadError::python_path`] when its values depend on where its
+    /// line starts.
+    pub fn filter(e: dyna_zarr_filters::FilterError) -> Self {
+        Self {
+            python_path: e.from_line_start(),
+            message: e.0,
+        }
     }
 }
 

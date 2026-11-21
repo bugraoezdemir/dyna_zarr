@@ -24,6 +24,9 @@ What the engine takes over, and only where it gives the Python path's exact valu
   through NumPy casts the engine does not follow), minimum_filter, maximum_filter,
   grey_erosion and grey_dilation (any numeric type), and uniform_filter for integers up
   to 32 bits. The Gaussians run scipy's own kernel weights in scipy's order.
+  median_filter, rank_filter and percentile_filter (step 4) for any numeric type on
+  arrays of two or more dimensions, and for integers up to 32 bits on 1-D arrays (see
+  _rank).
 
   Not wrap: the Python path wraps each read's box around itself rather than the array,
   so its values depend on the region read, and the engine (which wraps around the
@@ -34,12 +37,21 @@ What the engine takes over, and only where it gives the Python path's exact valu
 
 Everything else returns None here, and the caller uses the Python path.
 
+A sliding minimum or maximum of floats through a NaN (minimum_filter, maximum_filter,
+grey_erosion, grey_dilation, and rank filters of the first or last rank) is lowered, but
+a read whose pass starts inside the array and meets a NaN goes back to the Python path:
+scipy's loop keeps a NaN or drops it depending on the values before it, so its values
+after a NaN depend on where the line starts. The Python path's values then depend on
+the region read, and the engine cannot follow them; the engine raises UsePythonPath and
+``read`` returns None. Without a NaN, both are scipy's values exactly.
+
 A filter without its own ``device`` follows the device context of the read (cupy on a
 GPU); the engine reads on the CPU, so such an array, and every array built on it, is
 read by the Python path inside a GPU context (``INHERITS``).
 """
 from __future__ import annotations
 
+import operator
 import os
 import threading
 from contextlib import contextmanager
@@ -372,6 +384,81 @@ def _size_filter(t, spec):
     return eng.filter([passes], cval=float(spec["cval"]))
 
 
+#: types the engine's rank filter reads (scipy's n-D routine)
+_RANK_TYPES = {"int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64",
+               "float32", "float64"}
+#: ... and on 1-D arrays, where scipy runs another routine (see _rank)
+_RANK_1D_TYPES = {"int8", "uint8", "int16", "uint16", "int32", "uint32"}
+
+
+def _scipy_rank(spec, n):
+    """The rank scipy's _rank_filter picks in a window of n values, or None where scipy
+    raises (the Python path then raises scipy's error)."""
+    name = spec["name"]
+    if name == "median_filter":
+        rank = n // 2
+    elif name == "percentile_filter":
+        p = spec["percentile"]
+        # Python and NumPy 64-bit numbers only: scipy computes with the percentile's own
+        # type, and a float32 one would round differently
+        if isinstance(p, (bool, np.bool_)) or not isinstance(p, (int, float, np.integer)):
+            return None
+        p = float(p)
+        if p < 0.0:
+            p += 100.0
+        if not 0.0 <= p <= 100.0:
+            return None
+        rank = n - 1 if p == 100.0 else int(float(n) * p / 100.0)
+    else:
+        try:
+            rank = operator.index(spec["rank"])
+        except TypeError:
+            return None
+    if rank < 0:
+        rank += n
+    return rank if 0 <= rank < n else None
+
+
+def _rank(t, spec):
+    """median_filter, rank_filter and percentile_filter, as scipy's _rank_filter runs
+    them: rank 0 and the last rank are minimum_filter / maximum_filter (separable passes);
+    any other rank is the n-D rank filter. On a 1-D array scipy runs another routine
+    (_rank_filter_1d, on int64 or the float type), which agrees with the n-D one where
+    the window's values are told apart by value alone: integers up to 32 bits, with a
+    cval the type holds exactly (that routine converts cval with NumPy, the n-D one with
+    a C cast). Other 1-D arrays keep the Python path."""
+    ndim = t.array.ndim
+    sizes = _per_axis(spec["size"], ndim)
+    if sizes is None or not all(isinstance(z, (int, np.integer))
+                                and not isinstance(z, (bool, np.bool_)) and z >= 1
+                                for z in sizes):
+        return None
+    sizes = [int(z) for z in sizes]
+    n = int(np.prod(sizes))
+    rank = _scipy_rank(spec, n)
+    if rank is None:
+        return None
+    mode, cval = spec["mode"], float(spec["cval"])
+    if rank in (0, n - 1):
+        kind = "minimum" if rank == 0 else "maximum"
+        passes = [(a, kind, [float(z)], 0, mode) for a, z in enumerate(sizes) if z > 1]
+        eng = _up(t.array)
+        if eng is None or not passes:
+            return eng                          # a window of one: scipy copies the input
+        return eng.filter([passes], cval=cval)
+    dtype = np.dtype(t.dtype)
+    if dtype.name not in _RANK_TYPES:
+        return None
+    if ndim == 1:
+        if dtype.name not in _RANK_1D_TYPES:
+            return None
+        info = np.iinfo(dtype)
+        if mode == "constant" and not (cval.is_integer() and info.min <= cval <= info.max):
+            return None
+    eng = _up(t.array)
+    return None if eng is None else eng.rank_filter(sizes, rank, mode=mode, cval=cval)
+
+
 #: the named filters the engine reads, by the name their kernel spec records
 _KERNELS = {
     "gaussian_filter": _gaussian,
@@ -383,6 +470,9 @@ _KERNELS = {
     "maximum_filter": _size_filter,
     "grey_erosion": _size_filter,
     "grey_dilation": _size_filter,
+    "median_filter": _rank,
+    "rank_filter": _rank,
+    "percentile_filter": _rank,
 }
 
 
@@ -462,10 +552,16 @@ def read(array, key):
         return None                             # path, with its own error
     shape = list(view.shape)
     threads = _THREADS.get()
-    if threads == 1:
-        return view.read([0] * len(shape), shape, threads=1)     # on this thread
-    # several threads: inside a write, on its one pool (decision DR-5, see _scope)
-    from ._scope import current
-    scope = current()
-    pool = None if scope is None else scope.pool()
-    return view.read([0] * len(shape), shape, threads=threads, pool=pool)
+    # values that depend on where the read starts (UsePythonPath, see the module notes):
+    # the Python path reads them, so both give the same values for every read
+    use_python = getattr(_engine.engine(), "UsePythonPath", ())
+    try:
+        if threads == 1:
+            return view.read([0] * len(shape), shape, threads=1)     # on this thread
+        # several threads: inside a write, on its one pool (decision DR-5, see _scope)
+        from ._scope import current
+        scope = current()
+        pool = None if scope is None else scope.pool()
+        return view.read([0] * len(shape), shape, threads=threads, pool=pool)
+    except use_python:
+        return None

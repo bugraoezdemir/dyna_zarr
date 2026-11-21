@@ -368,6 +368,20 @@ pub fn min_max1d_on<T: Element, U: Element>(
     span: Span,
     output: &mut [U],
 ) -> Result<(), FilterError> {
+    // Harter's loop keeps a NaN or drops it depending on the values before it, so the
+    // values after a NaN depend on where the line starts: only a part from the line's
+    // start (scipy's start) is scipy's
+    if span.out_start > 0
+        && size > 1
+        && (mode.cval().is_nan() || input.iter().any(|v| v.to_f64().is_nan()))
+    {
+        return Err(FilterError::line_start(&format!(
+            "a sliding {} through a NaN, from position {} of {}",
+            if minimum { "minimum" } else { "maximum" },
+            span.out_start,
+            span.len
+        )));
+    }
     let lay = layout(
         input.len(),
         shape,
@@ -466,5 +480,66 @@ mod tests {
                 assert_eq!(out[q * LANE + i], want[q]);
             }
         }
+    }
+
+    #[test]
+    fn a_nan_after_the_line_start_is_refused() {
+        // scipy's values after a NaN depend on the line's start: a part from inside the
+        // array is refused (the caller reads it another way); from the start it is fine
+        let x = [3.0, f64::NAN, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0];
+        let mut out = [0f64; 4];
+        let part = Span {
+            len: 8,
+            start: 0,
+            out_start: 2,
+            out_len: 4,
+        };
+        let e = min_max1d_on(
+            false,
+            &x,
+            &[8],
+            0,
+            3,
+            0,
+            true,
+            Mode::Reflect,
+            part,
+            &mut out,
+        )
+        .unwrap_err();
+        assert!(e.from_line_start(), "{e}");
+        let first = Span {
+            out_start: 0,
+            ..part
+        };
+        min_max1d_on(
+            false,
+            &x,
+            &[8],
+            0,
+            3,
+            0,
+            true,
+            Mode::Reflect,
+            first,
+            &mut out,
+        )
+        .unwrap();
+        // no NaN: any part
+        let y = [3.0, 7.0, 1.0, 4.0, 1.0, 5.0, 9.0, 2.0];
+        min_max1d_on(
+            false,
+            &y,
+            &[8],
+            0,
+            3,
+            0,
+            true,
+            Mode::Reflect,
+            part,
+            &mut out,
+        )
+        .unwrap();
+        assert_eq!(out, [1.0, 1.0, 1.0, 1.0]);
     }
 }

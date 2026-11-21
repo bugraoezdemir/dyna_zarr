@@ -312,6 +312,68 @@ fn chains(
     })
 }
 
+/// scipy.ndimage's n-D rank filter (`NI_RankFilter`) into `output` (the input's type):
+/// the element of rank `rank` among the positions of a footprint of `shape` (all of it,
+/// or those `mask` marks, C order) shifted by `origin`. scipy's own dispatch (rank 0 and
+/// the last rank to minimum_filter / maximum_filter, 1-D arrays to another routine) is
+/// the caller's.
+#[pyfunction]
+#[pyo3(signature = (input, shape, rank, output, mask = None, origin = None, mode = "reflect", cval = 0.0, threads = 1))]
+#[allow(clippy::too_many_arguments)]
+fn rank_filter(
+    py: Python<'_>,
+    input: &Bound<'_, PyAny>,
+    shape: Vec<usize>,
+    rank: usize,
+    output: &Bound<'_, PyAny>,
+    mask: Option<Vec<bool>>,
+    origin: Option<Vec<isize>>,
+    mode: &str,
+    cval: f64,
+    threads: usize,
+) -> PyResult<()> {
+    let (i, o) = (Mem::of(input, false)?, Mem::of(output, true)?);
+    checked(&i, &o)?;
+    if i.dtype != o.dtype {
+        return Err(FilterError::new_err(format!(
+            "output {} for input {}: the input's type",
+            o.dtype, i.dtype
+        )));
+    }
+    let origin = origin.unwrap_or_else(|| vec![0; shape.len()]);
+    let fp = fl::Footprint {
+        shape,
+        mask,
+        origin,
+    };
+    let mode = mode_of(mode, cval)?;
+    let dims = i.shape.clone();
+    let (ia, ib) = i.range();
+    let (oa, ob) = o.range();
+    threaded(py, threads, || {
+        macro_rules! go {
+            ($t:ty) => {
+                run::<$t, $t>(ia, ib - ia, oa, ob - oa, |x, y| {
+                    fl::rank_filter_on(threads > 1, x, &dims, fp, rank, mode, y)
+                })
+            };
+        }
+        match i.dtype.as_str() {
+            "uint8" => go!(u8),
+            "int8" => go!(i8),
+            "uint16" => go!(u16),
+            "int16" => go!(i16),
+            "uint32" => go!(u32),
+            "int32" => go!(i32),
+            "uint64" => go!(u64),
+            "int64" => go!(i64),
+            "float32" => go!(f32),
+            "float64" => go!(f64),
+            t => Err(fl::FilterError::new(format!("{t} is not supported"))),
+        }
+    })
+}
+
 /// The correlation weights of scipy.ndimage.gaussian_filter1d (its kernel reversed).
 #[pyfunction]
 fn gaussian_weights(sigma: f64, order: usize, radius: usize) -> Vec<f64> {
@@ -331,6 +393,7 @@ pub fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_function(wrap_pyfunction!(correlate1d, &m)?)?;
     m.add_function(wrap_pyfunction!(gaussian_filter, &m)?)?;
     m.add_function(wrap_pyfunction!(chains, &m)?)?;
+    m.add_function(wrap_pyfunction!(rank_filter, &m)?)?;
     m.add_function(wrap_pyfunction!(gaussian_weights, &m)?)?;
     m.add_function(wrap_pyfunction!(numpy_sum, &m)?)?;
     Ok(m)

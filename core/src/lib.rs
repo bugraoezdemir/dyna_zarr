@@ -85,6 +85,7 @@ fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(arrays::reset_memory_peak, m)?)?;
     m.add_function(wrap_pyfunction!(allocator_purge_delay_ms, m)?)?;
     m.add("ReadError", m.py().get_type::<arrays::ReadError>())?;
+    m.add("UsePythonPath", m.py().get_type::<arrays::UsePythonPath>())?;
     m.add_function(wrap_pyfunction!(arrays::concatenate, m)?)?;
     m.add_function(wrap_pyfunction!(arrays::stack, m)?)?;
     // dyna_zarr_core.transforms (DR2): an attribute, so `from dyna_zarr_core import

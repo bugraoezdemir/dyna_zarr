@@ -127,17 +127,7 @@ impl Separable {
             let (before, after) = p.reach();
             let lo_p = cur.0[a] as i64 - before as i64;
             let hi_p = cur.1[a] as i64 + after as i64;
-            let (mut lo, mut hi) = (lo_p.max(0), hi_p.min(n));
-            // positions past the edges read what the mode maps them to
-            for q in (lo_p..0.min(hi_p)).chain(n.max(lo_p)..hi_p) {
-                if lo == 0 && hi == n {
-                    break;
-                }
-                if let Some(g) = p.mode.index(q, n) {
-                    lo = lo.min(g);
-                    hi = hi.max(g + 1);
-                }
-            }
+            let (lo, hi) = mapped_range(p.mode, n, lo_p, hi_p);
             cur.0[a] = lo as u64;
             cur.1[a] = hi as u64;
             out.push(cur.clone());
@@ -210,7 +200,7 @@ impl Separable {
                 } else {
                     run()
                 };
-                done.map_err(|e| ReadError::new(e.0))?;
+                done.map_err(ReadError::filter)?;
                 cur = next;
             }
             // `cur` is this chain's region
@@ -230,7 +220,7 @@ impl Separable {
         }
         let mut res = acc.unwrap_or_default();
         if let Some(c) = self.combine {
-            c.finish(&mut res).map_err(|e| ReadError::new(e.0))?;
+            c.finish(&mut res).map_err(ReadError::filter)?;
         }
         // `res` is the region, C-ordered
         let item = std::mem::size_of::<T>();
@@ -287,6 +277,23 @@ impl Separable {
         let (_, b) = self.plan(start, &stop);
         (0..n).map(|k| b.1[k] - b.0[k]).product::<u64>() * self.src.dtype().size() as u64 * 2
     }
+}
+
+/// The positions of an axis of length `n` that positions `lo_p .. hi_p` read: those
+/// inside the axis, and those the mode maps the ones past an edge to (wrap reaches the
+/// far end).
+pub(crate) fn mapped_range(mode: FilterMode, n: i64, lo_p: i64, hi_p: i64) -> (i64, i64) {
+    let (mut lo, mut hi) = (lo_p.max(0), hi_p.min(n));
+    for q in (lo_p..0.min(hi_p)).chain(n.max(lo_p)..hi_p) {
+        if lo == 0 && hi == n {
+            break;
+        }
+        if let Some(g) = mode.index(q, n) {
+            lo = lo.min(g);
+            hi = hi.max(g + 1);
+        }
+    }
+    (lo, hi)
 }
 
 /// The part `want` of a C-ordered block `data` that holds the box `have`.

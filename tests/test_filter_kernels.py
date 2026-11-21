@@ -340,3 +340,109 @@ def test_running_passes_on_threads_change_nothing():
         for axis in range(3):
             chain = [[(axis, kind, [size], 0, "mirror")]]
             _same_bits(_chains_out(x, chain, threads=4), _chains_out(x, chain))
+
+
+# ----------------------------------------------------------------- step 4 (DR7)
+# scipy's n-D rank filter (NI_RankFilter): what rank_filter, median_filter and
+# percentile_filter run for arrays of two or more dimensions and ranks other than the
+# first and the last (scipy sends those to minimum_filter / maximum_filter).
+
+RANK_SHAPES = [(1, 1), (1, 7), (2, 3), (5, 1, 4), (3, 4, 5), (6, 9, 11), (2, 1, 3, 2, 3)]
+
+
+def _rank_data(shape, dtype, seed):
+    """Few distinct values (many ties); floats with NaN, -0.0 and 0.0 scattered; 64-bit
+    integers beyond 2**53, where scipy's double buffer rounds them."""
+    rng = np.random.default_rng(seed)
+    if np.dtype(dtype).kind == "f":
+        x = rng.integers(-4, 5, size=shape).astype(dtype)
+        flat = x.reshape(-1)
+        pick = rng.random(flat.size)
+        flat[pick < 0.04] = np.nan
+        flat[(pick >= 0.04) & (pick < 0.12)] = -0.0
+        return x
+    x = _data(shape, dtype, seed) // 50 * 50
+    if np.dtype(dtype).itemsize == 8:
+        big = np.array(2**60 if dtype == "int64" else 2**63 + 2**61, dtype=dtype)
+        x = (x + big).astype(dtype)
+    return x
+
+
+def _footprints(ndim, seed):
+    rng = np.random.default_rng(seed)
+    full3 = np.ones((3,) * ndim, bool)
+    even = np.ones((2,) + (4,) * (ndim - 1), bool)
+    mask = rng.random((3,) * ndim) < 0.6
+    mask.reshape(-1)[0] = mask.reshape(-1)[-1] = True
+    return [(full3, (0,) * ndim), (even, (0,) + (-1,) * (ndim - 1)), (mask, (1,) + (0,) * (ndim - 1))]
+
+
+def _rank_out(x, fp, rank, origin=None, mode="reflect", cval=0.0, threads=1):
+    out = np.empty_like(x)
+    filters.rank_filter(x, list(fp.shape), rank, out, mask=[bool(b) for b in fp.reshape(-1)],
+                        origin=list(origin) if origin is not None else None, mode=mode,
+                        cval=cval, threads=threads)
+    return out
+
+
+@pytest.mark.parametrize("dtype", TYPES)
+@pytest.mark.parametrize("mode", MODES)
+def test_rank_filter_equals_scipy(dtype, mode):
+    """Every rank but the first and last, any footprint and origin; NaN, signed zeros and
+    ties as scipy (its quickselect on the footprint-ordered buffer)."""
+    for k, shape in enumerate(RANK_SHAPES):
+        x = _rank_data(shape, dtype, seed=k)
+        for fp, origin in _footprints(len(shape), seed=k):
+            size = int(fp.sum())
+            for rank in sorted({1, size // 2, size - 2}):
+                if not 0 < rank < size - 1:
+                    continue
+                want = ndi.rank_filter(x, rank, footprint=fp, mode=mode, cval=3.5,
+                                       origin=origin)
+                got = _rank_out(x, fp, rank, origin, mode, 3.5)
+                _same_bits(got, want, f"{shape} {fp.shape} rank {rank}")
+
+
+@pytest.mark.skipif(not X86, reason="scipy's cast of cval wraps on x86-64 only")
+@pytest.mark.parametrize("dtype", ["uint8", "int8", "uint16", "float32"])
+@pytest.mark.parametrize("cval", [-1.5, 300.0, 1e10, float("nan"), -0.0])
+def test_rank_filter_casts_cval_as_scipy(dtype, cval):
+    """scipy casts cval to the array's type before selecting ((type)cval in C)."""
+    x = _rank_data((6, 9, 11), dtype, seed=3)
+    fp = np.ones((3, 3, 3), bool)
+    for rank in (1, 13, 25):
+        want = ndi.rank_filter(x, rank, footprint=fp, mode="constant", cval=cval)
+        _same_bits(_rank_out(x, fp, rank, mode="constant", cval=cval), want, f"rank {rank}")
+
+
+@pytest.mark.parametrize("dtype", ["uint16", "float32", "float64"])
+def test_median_and_percentile_ranks_equal_scipy(dtype):
+    """median_filter and percentile_filter are rank filters of scipy's computed rank."""
+    x = _rank_data((20, 30, 40), dtype, seed=9)
+    for size in [(3, 3, 3), (1, 5, 5), (4, 2, 3)]:
+        fp = np.ones(size, bool)
+        n = int(fp.sum())
+        _same_bits(_rank_out(x, fp, n // 2), ndi.median_filter(x, size), f"median {size}")
+        for p in (10.0, 37.5, 90.0):
+            rank = int(float(n) * p / 100.0)
+            if 0 < rank < n - 1:
+                _same_bits(_rank_out(x, fp, rank), ndi.percentile_filter(x, p, size),
+                           f"percentile {p} {size}")
+
+
+def test_rank_filter_on_threads_changes_nothing():
+    x = _rank_data((30, 40, 300), "float32", seed=14)
+    fp = np.ones((3, 5, 3), bool)
+    _same_bits(_rank_out(x, fp, 22, threads=4), _rank_out(x, fp, 22))
+    _same_bits(_rank_out(x, fp, 22, threads=4), ndi.median_filter(x, (3, 5, 3)))
+
+
+def test_rank_filter_errors_name_the_way_out():
+    x = np.zeros((4, 5), "float32")
+    out = np.empty_like(x)
+    with pytest.raises(filters.FilterError, match="rank 9 for a footprint of 9"):
+        filters.rank_filter(x, [3, 3], 9, out)
+    with pytest.raises(filters.FilterError, match="invalid origin"):
+        filters.rank_filter(x, [3, 3], 4, out, origin=[2, 0])
+    with pytest.raises(filters.FilterError, match="the input's type"):
+        filters.rank_filter(x, [3, 3], 4, np.empty((4, 5), "float64"))
