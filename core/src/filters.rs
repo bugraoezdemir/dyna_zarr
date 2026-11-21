@@ -374,6 +374,43 @@ fn rank_filter(
     })
 }
 
+/// scipy.ndimage.correlate (`convolve=True`: convolve) with an n-D kernel `weights` of
+/// `shape` (C order) into `output` (the input's type, float32 or float64).
+#[pyfunction]
+#[pyo3(signature = (input, shape, weights, output, origin = None, mode = "reflect", cval = 0.0, convolve = false, threads = 1))]
+#[allow(clippy::too_many_arguments)]
+fn correlate(
+    py: Python<'_>,
+    input: &Bound<'_, PyAny>,
+    shape: Vec<usize>,
+    weights: Vec<f64>,
+    output: &Bound<'_, PyAny>,
+    origin: Option<Vec<isize>>,
+    mode: &str,
+    cval: f64,
+    convolve: bool,
+    threads: usize,
+) -> PyResult<()> {
+    let (i, o) = (Mem::of(input, false)?, Mem::of(output, true)?);
+    checked(&i, &o)?;
+    let origin = origin.unwrap_or_else(|| vec![0; shape.len()]);
+    let mode = mode_of(mode, cval)?;
+    let dims = i.shape.clone();
+    threaded(py, threads, || {
+        typed!(i, o, |x, y| fl::correlate_on(
+            threads > 1,
+            x,
+            &dims,
+            shape.clone(),
+            &weights,
+            origin.clone(),
+            mode,
+            convolve,
+            y
+        ))
+    })
+}
+
 /// The correlation weights of scipy.ndimage.gaussian_filter1d (its kernel reversed).
 #[pyfunction]
 fn gaussian_weights(sigma: f64, order: usize, radius: usize) -> Vec<f64> {
@@ -394,6 +431,7 @@ pub fn module(py: Python<'_>) -> PyResult<Bound<'_, PyModule>> {
     m.add_function(wrap_pyfunction!(gaussian_filter, &m)?)?;
     m.add_function(wrap_pyfunction!(chains, &m)?)?;
     m.add_function(wrap_pyfunction!(rank_filter, &m)?)?;
+    m.add_function(wrap_pyfunction!(correlate, &m)?)?;
     m.add_function(wrap_pyfunction!(gaussian_weights, &m)?)?;
     m.add_function(wrap_pyfunction!(numpy_sum, &m)?)?;
     Ok(m)

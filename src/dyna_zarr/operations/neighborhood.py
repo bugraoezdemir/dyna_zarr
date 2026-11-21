@@ -358,7 +358,8 @@ def convolve(array, weights, boundary="reflect", cval=0.0, device=None):
     w, depth = _kernel_depth(weights, array.ndim)
     func = lambda b: ndimage_namespace(b).convolve(
         b, array_namespace(b).asarray(w), mode=boundary, cval=cval)
-    return map_overlap(array, func, depth, boundary=boundary, name="convolve", device=device)
+    return _named(array, func, depth, boundary, "convolve", device,
+                  {"name": "convolve", "weights": w, "mode": boundary, "cval": cval})
 
 
 def correlate(array, weights, boundary="reflect", cval=0.0, device=None):
@@ -367,7 +368,8 @@ def correlate(array, weights, boundary="reflect", cval=0.0, device=None):
     w, depth = _kernel_depth(weights, array.ndim)
     func = lambda b: ndimage_namespace(b).correlate(
         b, array_namespace(b).asarray(w), mode=boundary, cval=cval)
-    return map_overlap(array, func, depth, boundary=boundary, name="correlate", device=device)
+    return _named(array, func, depth, boundary, "correlate", device,
+                  {"name": "correlate", "weights": w, "mode": boundary, "cval": cval})
 
 
 def laplace(array, boundary="reflect", device=None, **kw):

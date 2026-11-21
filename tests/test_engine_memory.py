@@ -103,6 +103,11 @@ CHAINS = {
     "rank-wrap": lambda a: a.rank_filter([3, 5, 3], 20, mode="wrap"),
     "rank-split": lambda a: a.rank_filter([1, 5, 5], 12, max_read_mb=0.05),
     "rank-of-mean": lambda a: a.downsample([1, 2, 2], "mean").rank_filter([3, 3, 3], 13),
+    # the n-D correlation (step 5): odd, even and convolved, constant mode, split
+    "correlate": lambda a: a.correlate([3, 3, 3], [0.5 - (i % 5) / 4 for i in range(27)]),
+    "convolve-even": lambda a: a.correlate([2, 4, 3], [(i % 7) / 3 for i in range(24)],
+                                           mode="constant", cval=-1.5, convolve=True),
+    "correlate-split": lambda a: a.correlate([1, 5, 5], [1.0] * 25, max_read_mb=0.05),
 }
 
 

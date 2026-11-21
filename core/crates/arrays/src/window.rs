@@ -1,8 +1,9 @@
-//! The rank filter as a lazy view (Workplan WP15, task DR7 step 4): scipy.ndimage's n-D
-//! rank filter from `dyna-zarr-filters` (what rank_filter, median_filter and
-//! percentile_filter run on arrays of two or more dimensions), with scipy's values.
+//! Filters with an n-D window as lazy views (Workplan WP15, task DR7 steps 4 and 5),
+//! from `dyna-zarr-filters`, with scipy.ndimage's values: the rank filter (what
+//! rank_filter, median_filter and percentile_filter run on arrays of two or more
+//! dimensions) and the correlation with an n-D kernel (correlate, convolve).
 //!
-//! A region is read as its input box: the region grown by the footprint's reach, cut back
+//! A region is read as its input box: the region grown by the window's reach, cut back
 //! at the array's edges, plus the positions the mode maps the reach past an edge to. The
 //! kernel extends that box at the edges as scipy does, so any region gives the values of
 //! the whole filtered array.
@@ -23,26 +24,98 @@ pub use fl::Footprint;
 /// A box: start and stop per axis.
 type Box_ = (Vec<u64>, Vec<u64>);
 
-/// The element of rank `rank` among a footprint's positions around each element of `src`.
-pub struct Rank {
+/// The filter a [`Window`] runs.
+enum Kernel {
+    Rank(fl::RankFilter),
+    Correlate(fl::Correlate),
+}
+
+impl Kernel {
+    fn reach(&self, axis: usize) -> (usize, usize) {
+        match self {
+            Self::Rank(f) => f.reach(axis),
+            Self::Correlate(f) => f.reach(axis),
+        }
+    }
+
+    fn bytes(&self, in_len: &[usize], out_len: &[usize], item: usize) -> (u64, u64) {
+        match self {
+            Self::Rank(f) => f.bytes(in_len, out_len, item),
+            Self::Correlate(f) => f.bytes(out_len),
+        }
+    }
+
+    fn run<T: Select>(
+        &self,
+        parallel: bool,
+        input: &[T],
+        shape: &[usize],
+        spans: &[fl::Span],
+        output: &mut [T],
+    ) -> Result<(), fl::FilterError> {
+        match self {
+            Self::Rank(f) => f.run_on(parallel, input, shape, spans, output),
+            Self::Correlate(f) => f.run_on(parallel, input, shape, spans, output),
+        }
+    }
+}
+
+/// A filter with an n-D window around each element of `src`, in its type.
+pub struct Window {
     src: SourceRef,
-    filter: fl::RankFilter,
+    kernel: Kernel,
     mode: fl::Mode,
     max_read: u64,
 }
 
-impl Rank {
-    pub fn new(
+impl Window {
+    /// The element of rank `rank` among a footprint's positions (scipy's n-D rank
+    /// filter).
+    pub fn rank(
         src: SourceRef,
         footprint: Footprint,
         rank: usize,
         mode: fl::Mode,
     ) -> Result<Self, ReadError> {
+        Self::check(&src, footprint.shape.len(), "a rank filter")?;
+        let filter = fl::RankFilter::new(footprint, rank, mode).map_err(ReadError::filter)?;
+        Ok(Self::of(src, Kernel::Rank(filter), mode))
+    }
+
+    /// scipy.ndimage.correlate with `weights` of `shape` (C order) shifted by `origin`;
+    /// `convolve`: scipy.ndimage.convolve.
+    pub fn correlate(
+        src: SourceRef,
+        shape: Vec<usize>,
+        weights: &[f64],
+        origin: Vec<isize>,
+        mode: fl::Mode,
+        convolve: bool,
+    ) -> Result<Self, ReadError> {
+        Self::check(&src, shape.len(), "a correlation")?;
+        let c = if convolve {
+            fl::Correlate::convolve(shape, weights, origin, mode)
+        } else {
+            fl::Correlate::new(shape, weights, origin, mode)
+        }
+        .map_err(ReadError::filter)?;
+        Ok(Self::of(src, Kernel::Correlate(c), mode))
+    }
+
+    fn of(src: SourceRef, kernel: Kernel, mode: fl::Mode) -> Self {
+        Self {
+            src,
+            kernel,
+            mode,
+            max_read: DEFAULT_MAX_READ,
+        }
+    }
+
+    fn check(src: &SourceRef, ndim: usize, what: &str) -> Result<(), ReadError> {
         let n = src.shape().len();
-        if footprint.shape.len() != n {
+        if ndim != n {
             return Err(ReadError::new(format!(
-                "a {}-d footprint for a {n}-d array",
-                footprint.shape.len()
+                "a {ndim}-d window for a {n}-d array"
             )));
         }
         match src.dtype() {
@@ -55,21 +128,12 @@ impl Rank {
             | DType::UInt32
             | DType::UInt64
             | DType::Float32
-            | DType::Float64 => {}
-            other => {
-                return Err(ReadError::new(format!(
-                    "a rank filter of {} is not supported",
-                    other.name()
-                )))
-            }
+            | DType::Float64 => Ok(()),
+            other => Err(ReadError::new(format!(
+                "{what} of {} is not supported",
+                other.name()
+            ))),
         }
-        let filter = fl::RankFilter::new(footprint, rank, mode).map_err(ReadError::filter)?;
-        Ok(Self {
-            src,
-            filter,
-            mode,
-            max_read: DEFAULT_MAX_READ,
-        })
     }
 
     pub fn with_max_read(mut self, bytes: u64) -> Self {
@@ -83,7 +147,7 @@ impl Rank {
         let n = shape.len();
         let (mut lo, mut hi) = (vec![0u64; n], vec![0u64; n]);
         for a in 0..n {
-            let (before, after) = self.filter.reach(a);
+            let (before, after) = self.kernel.reach(a);
             let lo_p = start[a] as i64 - before as i64;
             let hi_p = stop[a] as i64 + after as i64;
             let (l, h) = mapped_range(self.mode, shape[a] as i64, lo_p, hi_p);
@@ -116,10 +180,7 @@ impl Rank {
             .collect();
         let mut res = vec![T::default(); r.iter().product::<u64>() as usize];
         let parallel = threads > 1;
-        let mut run = || {
-            self.filter
-                .run_on(parallel, &data, &shape, &spans, &mut res)
-        };
+        let mut run = || self.kernel.run(parallel, &data, &shape, &spans, &mut res);
         let done = if parallel {
             install(threads, &mut run)?
         } else {
@@ -140,7 +201,7 @@ impl Rank {
     }
 
     /// One piece at its fullest: the read box with what reading it costs, or the read
-    /// box, the kernel's buffers (`RankFilter::bytes`) and the result.
+    /// box, the kernel's buffers (its `bytes`) and the result.
     fn part_cost(&self, start: &[u64], r: &[u64], threads: usize) -> Result<u64, ReadError> {
         if r.contains(&0) {
             return Ok(0);
@@ -153,7 +214,7 @@ impl Rank {
         let out_len: Vec<usize> = r.iter().map(|&v| v as usize).collect();
         let raw = in_len.iter().map(|&v| v as u64).product::<u64>() * item;
         let reading = raw + self.src.cost(&bs, &be, threads)?;
-        let (shared, each) = self.filter.bytes(&in_len, &out_len, item as usize);
+        let (shared, each) = self.kernel.bytes(&in_len, &out_len, item as usize);
         let region = r.iter().product::<u64>() * item;
         let computing = raw + shared + threads.max(1) as u64 * each + region;
         Ok(reading.max(computing) + SMALL)
@@ -169,7 +230,7 @@ impl Rank {
     }
 }
 
-impl Source for Rank {
+impl Source for Window {
     fn shape(&self) -> &[u64] {
         self.src.shape()
     }
@@ -201,7 +262,7 @@ impl Source for Rank {
             DType::UInt64 => self.part::<u64>(s, r, o, threads),
             DType::Float32 => self.part::<f32>(s, r, o, threads),
             DType::Float64 => self.part::<f64>(s, r, o, threads),
-            other => Err(ReadError::new(format!("a rank filter of {}", other.name()))),
+            other => Err(ReadError::new(format!("filtering {}", other.name()))),
         };
         split(start, &r, out, self.max_read, &bytes, &run)
     }
@@ -289,7 +350,7 @@ mod tests {
         for mode in modes {
             let mut want = vec![0f32; data.len()];
             fl::rank_filter_on(false, &data, &shape, fp.clone(), 25, mode, &mut want).unwrap();
-            let view = Rank::new(src.clone(), fp.clone(), 25, mode).unwrap();
+            let view = Window::rank(src.clone(), fp.clone(), 25, mode).unwrap();
             for (s, e) in [
                 ([0u64, 0, 0], [7u64, 9, 11]),
                 ([0, 0, 0], [1, 1, 1]),
@@ -312,7 +373,7 @@ mod tests {
                 }
             }
             // split reads give the same values
-            let split = Rank::new(src.clone(), fp.clone(), 25, mode)
+            let split = Window::rank(src.clone(), fp.clone(), 25, mode)
                 .unwrap()
                 .with_max_read(800);
             let got = read(&split, &[0, 0, 0], &[7, 9, 11], 2).unwrap();
@@ -321,6 +382,58 @@ mod tests {
                 .zip(&want)
                 .all(|(a, b)| a.to_bits() == b.to_bits());
             assert!(same, "{mode:?} split");
+        }
+    }
+
+    #[test]
+    fn a_correlation_region_equals_the_whole() {
+        let shape = [7usize, 9, 11];
+        let data: Vec<f32> = (0..693).map(|v| ((v * 7919) % 23) as f32 - 11.5).collect();
+        let src: SourceRef = Arc::new(Mem {
+            shape: shape.iter().map(|&s| s as u64).collect(),
+            data: data.clone(),
+        });
+        let w: Vec<f64> = (0..24).map(|i| ((i * 5) % 7) as f64 / 3.0 - 1.0).collect();
+        for convolve in [false, true] {
+            for mode in [fl::Mode::Reflect, fl::Mode::Wrap, fl::Mode::Constant(1.5)] {
+                let mut want = vec![0f32; data.len()];
+                fl::correlate_on(
+                    false,
+                    &data,
+                    &shape,
+                    vec![2, 3, 4],
+                    &w,
+                    vec![0, 1, -1],
+                    mode,
+                    convolve,
+                    &mut want,
+                )
+                .unwrap();
+                let view = Window::correlate(
+                    src.clone(),
+                    vec![2, 3, 4],
+                    &w,
+                    vec![0, 1, -1],
+                    mode,
+                    convolve,
+                )
+                .unwrap()
+                .with_max_read(900);
+                for (s, e) in [([0u64, 0, 0], [7u64, 9, 11]), ([2, 3, 4], [5, 6, 9])] {
+                    let got = read(&view, &s, &e, 3).unwrap();
+                    let got = as_f32(&got);
+                    let mut q = 0;
+                    for i in s[0]..e[0] {
+                        for j in s[1]..e[1] {
+                            for l in s[2]..e[2] {
+                                let wv = want[((i * 9 + j) * 11 + l) as usize];
+                                assert_eq!(got[q].to_bits(), wv.to_bits(), "{mode:?} {s:?}");
+                                q += 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

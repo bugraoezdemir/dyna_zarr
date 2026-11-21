@@ -1,4 +1,4 @@
-"""dyna's named filters read by the native engine (Workplan WP15, task DR7 steps 2-4).
+"""dyna's named filters read by the native engine (Workplan WP15, task DR7 steps 2-5).
 
 gaussian_filter records which filter it is on its MapOverlapTransform; dyna_zarr's
 _lowering builds the engine's separable view from scipy's own kernel weights. Every case
@@ -414,3 +414,75 @@ def test_step4_written_as_python(tmp_path):
     _same(out[True], out[False])
     want = ndi.percentile_filter(ndi.median_filter(data, (3, 5, 5), mode="mirror"), 80, 3)
     np.testing.assert_array_equal(out[True], want)
+
+
+
+# --------------------------------------------------------------------- step 5 (DR7)
+
+def _kernel(shape, seed=0, zeros=False):
+    w = np.random.default_rng(seed).uniform(-1, 1, shape)
+    if zeros:
+        w.reshape(-1)[::4] = 0.0
+    return w
+
+
+STEP5 = {
+    "correlate": (lambda a, m, kw: o.correlate(a, _kernel((3, 3, 3)), boundary=m, **kw),
+                  lambda d, m, kw: ndi.correlate(d, _kernel((3, 3, 3)), mode=m, **kw)),
+    "convolve": (lambda a, m, kw: o.convolve(a, _kernel((3, 3, 3), 1), boundary=m, **kw),
+                 lambda d, m, kw: ndi.convolve(d, _kernel((3, 3, 3), 1), mode=m, **kw)),
+    "correlate-even": (lambda a, m, kw: o.correlate(a, _kernel((2, 3, 4), 2), boundary=m, **kw),
+                       lambda d, m, kw: ndi.correlate(d, _kernel((2, 3, 4), 2), mode=m, **kw)),
+    "convolve-even": (lambda a, m, kw: o.convolve(a, _kernel((2, 4, 1), 3, True), boundary=m,
+                                                  **kw),
+                      lambda d, m, kw: ndi.convolve(d, _kernel((2, 4, 1), 3, True), mode=m,
+                                                    **kw)),
+    "convolve-int": (lambda a, m, kw: o.convolve(a, np.ones((1, 3, 3), "int64"), boundary=m,
+                                                 **kw),
+                     lambda d, m, kw: ndi.convolve(d, np.ones((1, 3, 3), "int64"), mode=m,
+                                                   **kw)),
+}
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "int16", "uint16", "int32", "uint64", "float32",
+                                   "float64"])
+@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "constant"])
+@pytest.mark.parametrize("name", list(STEP5))
+def test_step5_filters_read_as_python_and_scipy(tmp_path, dtype, mode, name):
+    build, ref = STEP5[name]
+    kw = {"cval": -3.5} if mode == "constant" else {}
+    data = _with_specials(_data(SHAPE, dtype))
+    v = build(_zarr(tmp_path / "a.zarr", data), mode, kw)
+    assert _lowering.lowered(v) is not None
+    want = ref(data, mode, kw)
+    for key in _keys(v.shape):
+        e, p = _both(lambda: np.asarray(v._read_direct(key)))
+        _same(e, p)
+        np.testing.assert_array_equal(e, want[key])
+        if e.dtype.kind == "f":
+            np.testing.assert_array_equal(np.signbit(e), np.signbit(want[key]))
+
+
+def test_step5_complex_weights_keep_the_python_path(tmp_path):
+    a = _zarr(tmp_path / "a.zarr", _data(SHAPE, "float32"))
+    w = _kernel((3, 3, 3)) + 0j
+    assert _lowering.lowered(o.correlate(a, w)) is None
+    assert _lowering.lowered(o.convolve(a, w, boundary="wrap")) is None
+
+
+def test_step5_written_as_python(tmp_path):
+    """A convolution of a median written in regions, engine against Python path."""
+    data = _data((12, 96, 80), "uint16")
+    a = _zarr(tmp_path / "a.zarr", data, chunks=(4, 32, 32))
+    w = _kernel((3, 5, 5), 7)
+    v = o.convolve(o.median_filter(a, 3), w, boundary="nearest")
+    assert _lowering.lowered(v) is not None
+    out = {}
+    for on in (True, False):
+        _engine.set_engine(on)
+        path = tmp_path / f"out-{on}.zarr"
+        io.write(v, str(path), chunks=(4, 32, 32), max_threads=3, memory_budget_mb=24)
+        out[on] = zarr.open_array(str(path), mode="r")[...]
+    _same(out[True], out[False])
+    np.testing.assert_array_equal(out[True], ndi.convolve(ndi.median_filter(data, 3), w,
+                                                          mode="nearest"))

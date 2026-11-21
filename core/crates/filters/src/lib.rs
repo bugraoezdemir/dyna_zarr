@@ -16,15 +16,19 @@
 
 mod correlate;
 mod gaussian;
+mod ndcorrelate;
 mod pass;
 mod rank;
 mod running;
+mod window;
 
 pub use correlate::{correlate1d, correlate1d_on, pass_bytes, Span};
 pub use gaussian::{gaussian_filter, gaussian_weights, numpy_sum, radius};
+pub use ndcorrelate::{correlate_on, Correlate};
 pub use pass::{separable, terms, Combine, Line, Pass};
-pub use rank::{rank_filter_on, Footprint, RankFilter, Select};
+pub use rank::{rank_filter_on, RankFilter, Select};
 pub use running::{min_max1d_on, running_pass_bytes, uniform1d_on};
+pub use window::Footprint;
 
 /// The crate's version, as `dyna_zarr_core` reports it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -147,6 +151,13 @@ pub trait Element: Copy + Send + Sync + 'static {
     /// "integer indefinite" value (the lowest integer), as on x86-64. ARM compilers
     /// saturate instead, so scipy's own results differ there for values out of range.
     fn from_f64(v: f64) -> Self;
+    /// scipy's `CASE_FILTER_OUT_SAFE`, which its n-D filters use for unsigned outputs:
+    /// `v > -1 ? (type)v : -(type)(-v)`. The same as [`Element::from_f64`] except for
+    /// uint64 below -2^63 (signed and floating-point types: `from_f64`).
+    #[inline(always)]
+    fn from_f64_safe(v: f64) -> Self {
+        Self::from_f64(v)
+    }
     /// `self + other` as numpy adds in this type (integers wrap).
     fn add_wrapping(self, other: Self) -> Self;
     /// `self * other` as numpy multiplies in this type (integers wrap).
@@ -201,6 +212,13 @@ macro_rules! element {
             None
         }
     };
+    (@arith uint $t:ty) => {
+        element!(@arith int $t);
+        #[inline(always)]
+        fn from_f64_safe(v: f64) -> Self {
+            unsigned_safe::<$t>(v)
+        }
+    };
     (@arith float $t:ty) => {
         #[inline(always)]
         fn add_wrapping(self, other: Self) -> Self {
@@ -217,15 +235,15 @@ macro_rules! element {
 }
 
 element! {
-    u8, "uint8", int, |v| cvtt32(v) as u8;
+    u8, "uint8", uint, |v| cvtt32(v) as u8;
     i8, "int8", int, |v| cvtt32(v) as i8;
-    u16, "uint16", int, |v| cvtt32(v) as u16;
+    u16, "uint16", uint, |v| cvtt32(v) as u16;
     i16, "int16", int, |v| cvtt32(v) as i16;
     // 32-bit integers: unsigned through the 64-bit conversion, as compilers emit it
-    u32, "uint32", int, |v| cvtt64(v) as u32;
+    u32, "uint32", uint, |v| cvtt64(v) as u32;
     i32, "int32", int, |v| cvtt32(v);
     // the usual unsigned 64-bit sequence: values from 2^63 up are shifted down first
-    u64, "uint64", int, |v| if v < 9_223_372_036_854_775_808.0 {
+    u64, "uint64", uint, |v| if v < 9_223_372_036_854_775_808.0 {
         cvtt64(v) as u64
     } else {
         (cvtt64(v - 9_223_372_036_854_775_808.0) as u64) ^ (1 << 63)
@@ -233,6 +251,33 @@ element! {
     i64, "int64", int, |v| cvtt64(v);
     f32, "float32", float, |v| v as f32;
     f64, "float64", float, |v| v;
+}
+
+/// Unsigned types: scipy's safe cast for real (see [`Element::from_f64_safe`]).
+pub(crate) trait Unsigned: Element {
+    fn negate(self) -> Self;
+}
+
+macro_rules! unsigned_safe {
+    ($($t:ty),*) => {$(
+        impl Unsigned for $t {
+            fn negate(self) -> Self {
+                self.wrapping_neg()
+            }
+        }
+    )*};
+}
+
+unsigned_safe!(u8, u16, u32, u64);
+
+/// `v > -1 ? (type)v : -(type)(-v)` for an unsigned type.
+#[inline(always)]
+pub(crate) fn unsigned_safe<U: Unsigned>(v: f64) -> U {
+    if v > -1.0 {
+        U::from_f64(v)
+    } else {
+        U::from_f64(-v).negate()
+    }
 }
 
 #[cfg(test)]

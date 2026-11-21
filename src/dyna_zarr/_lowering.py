@@ -26,7 +26,7 @@ What the engine takes over, and only where it gives the Python path's exact valu
   to 32 bits. The Gaussians run scipy's own kernel weights in scipy's order.
   median_filter, rank_filter and percentile_filter (step 4) for any numeric type on
   arrays of two or more dimensions, and for integers up to 32 bits on 1-D arrays (see
-  _rank).
+  _rank). correlate and convolve with a real n-D kernel (step 5), any numeric type.
 
   Not wrap: the Python path wraps each read's box around itself rather than the array,
   so its values depend on the region read, and the engine (which wraps around the
@@ -459,6 +459,27 @@ def _rank(t, spec):
     return None if eng is None else eng.rank_filter(sizes, rank, mode=mode, cval=cval)
 
 
+def _correlate(t, spec):
+    """correlate and convolve with an n-D kernel: scipy's weights as float64 (C order);
+    the engine reverses them and shifts the origins for convolve as scipy does. Complex
+    weights keep the Python path (scipy splits them into real and imaginary parts)."""
+    w = np.asarray(spec["weights"])
+    if w.dtype.kind not in "biuf" or w.ndim != t.array.ndim or 0 in w.shape:
+        return None
+    if np.dtype(t.dtype).name not in _RANK_TYPES:
+        return None
+    try:
+        cval = float(spec["cval"])
+    except (TypeError, ValueError):
+        return None
+    eng = _up(t.array)
+    if eng is None:
+        return None
+    flat = np.ascontiguousarray(w, dtype=np.float64).reshape(-1)
+    return eng.correlate(list(w.shape), flat.tolist(), mode=spec["mode"], cval=cval,
+                         convolve=spec["name"] == "convolve")
+
+
 #: the named filters the engine reads, by the name their kernel spec records
 _KERNELS = {
     "gaussian_filter": _gaussian,
@@ -473,6 +494,8 @@ _KERNELS = {
     "median_filter": _rank,
     "rank_filter": _rank,
     "percentile_filter": _rank,
+    "correlate": _correlate,
+    "convolve": _correlate,
 }
 
 

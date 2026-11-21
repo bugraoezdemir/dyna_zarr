@@ -197,11 +197,14 @@ def test_errors_name_the_way_out():
 # Passes are given as (axis, kind, values, origin, mode) to filters.chains.
 
 
-def _same_bits(got, want, msg=""):
-    """Equal values, NaN where NaN, and the same sign of zero."""
+def _same_bits(got, want, msg="", nan_sign=True):
+    """Equal values, NaN where NaN, and the same sign of zero (and of NaN, unless
+    ``nan_sign`` is False)."""
     np.testing.assert_array_equal(got, want, err_msg=msg)
     if got.dtype.kind == "f":
-        np.testing.assert_array_equal(np.signbit(got), np.signbit(want), err_msg=msg)
+        keep = np.ones(got.shape, bool) if nan_sign else ~np.isnan(want)
+        np.testing.assert_array_equal(np.signbit(got)[keep], np.signbit(want)[keep],
+                                      err_msg=msg)
 
 
 def _floats_with_specials(shape, dtype, seed):
@@ -446,3 +449,91 @@ def test_rank_filter_errors_name_the_way_out():
         filters.rank_filter(x, [3, 3], 4, out, origin=[2, 0])
     with pytest.raises(filters.FilterError, match="the input's type"):
         filters.rank_filter(x, [3, 3], 4, np.empty((4, 5), "float64"))
+
+
+
+# ----------------------------------------------------------------- step 5 (DR7)
+# scipy's correlate / convolve with an n-D kernel (NI_Correlate): weights at most
+# DBL_EPSILON dropped, sums in double in the kernel's C order, cval as it is.
+
+CORR_SHAPES = [(1,), (13,), (1, 7), (2, 3), (5, 1, 4), (3, 4, 5), (6, 9, 11), (2, 1, 3, 2, 3)]
+
+
+def _kernels(ndim, seed):
+    """An odd kernel, an even one with an origin, and one with zeros, tiny and NaN
+    weights (scipy drops them all)."""
+    rng = np.random.default_rng(seed)
+    odd = rng.uniform(-1, 1, (3,) * ndim)
+    even = rng.uniform(-1, 1, (2,) + (4,) * (ndim - 1))
+    sparse = rng.uniform(-1, 1, (3,) * ndim)
+    flat = sparse.reshape(-1)
+    flat[::3] = 0.0
+    if flat.size > 2:
+        flat[1], flat[-1] = 1e-17, np.nan
+    return [(odd, (0,) * ndim), (even, (0,) + (-1,) * (ndim - 1)),
+            (sparse, (1,) + (0,) * (ndim - 1))]
+
+
+def _correlate_out(x, w, origin=None, mode="reflect", cval=0.0, convolve=False, threads=1,
+                   out_dtype=None):
+    out = np.empty(x.shape, out_dtype or x.dtype)
+    filters.correlate(x, list(w.shape), [float(v) for v in w.reshape(-1)], out,
+                      origin=list(origin) if origin is not None else None, mode=mode,
+                      cval=cval, convolve=convolve, threads=threads)
+    return out
+
+
+@pytest.mark.skipif(not X86, reason="integer results out of range wrap on x86-64 only")
+@pytest.mark.parametrize("dtype", TYPES)
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("convolve", [False, True])
+def test_correlate_and_convolve_equal_scipy(dtype, mode, convolve):
+    """Every type (integers wrapping on overflow, unsigned through scipy's safe cast),
+    kernels odd and even, with origins, NaN and infinities in float data."""
+    ref = ndi.convolve if convolve else ndi.correlate
+    for k, shape in enumerate(CORR_SHAPES):
+        x = _floats_with_specials(shape, dtype, k) if np.dtype(dtype).kind == "f" \
+            else _data(shape, dtype, k)
+        if x.dtype.kind == "f" and x.size > 6:
+            x.reshape(-1)[3] = np.inf
+        for w, origin in _kernels(len(shape), seed=k):
+            want = ref(x, w, mode=mode, cval=-2.5, origin=origin)
+            got = _correlate_out(x, w, origin, mode, -2.5, convolve)
+            # Where a sum meets two different NaNs (one from the data, one made by
+            # inf - inf, which x86 makes negative), IEEE leaves which one an addition
+            # passes on, and compilers may swap an addition's operands: the sign of such
+            # a NaN can differ from scipy's. Every other bit is compared.
+            _same_bits(got, want, f"{shape} {w.shape} {origin}", nan_sign=False)
+
+
+@pytest.mark.parametrize("dtype", ["uint8", "int16", "float32"])
+@pytest.mark.parametrize("out_dtype", ["float32", "float64"])
+def test_correlate_into_a_float_output_equals_scipy(dtype, out_dtype):
+    x = _data((6, 9, 11), dtype, 4)
+    w = np.random.default_rng(4).uniform(-1, 1, (3, 2, 3))
+    want = ndi.correlate(x, w, output=np.dtype(out_dtype), mode="nearest")
+    _same_bits(_correlate_out(x, w, mode="nearest", out_dtype=out_dtype), want)
+
+
+def test_correlate_with_no_weight_left_gives_zeros():
+    x = _data((5, 6), "uint16", 1)
+    w = np.array([[0.0, 1e-17], [np.nan, -2e-16]])
+    _same_bits(_correlate_out(x, w), ndi.correlate(x, w))
+
+
+def test_correlate_on_threads_changes_nothing():
+    x = _floats_with_specials((30, 40, 300), "float32", seed=14)
+    w = np.random.default_rng(2).uniform(-1, 1, (3, 5, 3))
+    _same_bits(_correlate_out(x, w, threads=4), _correlate_out(x, w))
+    _same_bits(_correlate_out(x, w, threads=4, convolve=True), ndi.convolve(x, w))
+
+
+def test_correlate_errors_name_the_way_out():
+    x = np.zeros((4, 5), "float32")
+    out = np.empty_like(x)
+    with pytest.raises(filters.FilterError, match="5 weights for a kernel of shape"):
+        filters.correlate(x, [2, 3], [1.0] * 5, out)
+    with pytest.raises(filters.FilterError, match="invalid origin"):
+        filters.correlate(x, [3, 3], [1.0] * 9, out, origin=[2, 0])
+    with pytest.raises(filters.FilterError, match="a 1-d kernel for a 2-d array"):
+        filters.correlate(x, [3], [1.0] * 3, out)

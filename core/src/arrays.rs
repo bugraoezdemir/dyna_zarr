@@ -539,7 +539,38 @@ impl Array {
             mask,
             origin,
         };
-        let mut f = ar::Rank::new(self.src.clone(), fp, rank, mode).map_err(err)?;
+        let mut f = ar::Window::rank(self.src.clone(), fp, rank, mode).map_err(err)?;
+        if let Some(mb) = max_read_mb {
+            f = f.with_max_read((mb * 1048576.0) as u64);
+        }
+        Ok(Self::view(f))
+    }
+
+    /// scipy.ndimage.correlate with an n-D kernel (Workplan DR7 step 5): `weights` of
+    /// `shape` (C order) shifted by `origin`, the array extended at its edges by `mode`;
+    /// `convolve=True` is scipy.ndimage.convolve (the kernel reversed, origins negated).
+    /// Any region gives the values of the whole filtered array. Lazy.
+    #[pyo3(signature = (shape, weights, origin = None, mode = "reflect", cval = 0.0, convolve = false, max_read_mb = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn correlate(
+        &self,
+        shape: Vec<usize>,
+        weights: Vec<f64>,
+        origin: Option<Vec<isize>>,
+        mode: &str,
+        cval: f64,
+        convolve: bool,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let mode = ar::FilterMode::parse(mode, cval).ok_or_else(|| {
+            ReadError::new_err(format!(
+                "mode {mode:?}: use \"reflect\", \"mirror\", \"nearest\", \"wrap\" or \"constant\""
+            ))
+        })?;
+        let origin = origin.unwrap_or_else(|| vec![0; shape.len()]);
+        let mut f =
+            ar::Window::correlate(self.src.clone(), shape, &weights, origin, mode, convolve)
+                .map_err(err)?;
         if let Some(mb) = max_read_mb {
             f = f.with_max_read((mb * 1048576.0) as u64);
         }
