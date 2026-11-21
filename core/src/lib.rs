@@ -88,6 +88,9 @@ fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("UsePythonPath", m.py().get_type::<arrays::UsePythonPath>())?;
     m.add_function(wrap_pyfunction!(arrays::concatenate, m)?)?;
     m.add_function(wrap_pyfunction!(arrays::stack, m)?)?;
+    // pointwise operations (DR7 step 7)
+    m.add_function(wrap_pyfunction!(arrays::pointwise, m)?)?;
+    m.add_function(wrap_pyfunction!(arrays::pointwise_apply, m)?)?;
     // dyna_zarr_core.transforms (DR2): an attribute, so `from dyna_zarr_core import
     // transforms` works; registered in sys.modules too, for `import dyna_zarr_core.transforms`
     let sub = transforms::module(m.py())?;

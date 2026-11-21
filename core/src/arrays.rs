@@ -13,7 +13,7 @@ use pyo3::buffer::PyBuffer;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyEllipsis, PySlice, PyTuple};
+use pyo3::types::{PyBytes, PyEllipsis, PySlice, PyTuple};
 
 create_exception!(dyna_zarr_core, ReadError, PyValueError);
 // The engine cannot give dyna's Python-path values for this read (they depend on where
@@ -642,4 +642,57 @@ pub fn stack(arrays: Vec<PyRef<'_, Array>>, axis: usize) -> PyResult<Array> {
     Ok(Array::view(
         ar::Concat::stack(sources(arrays), axis).map_err(err)?,
     ))
+}
+
+/// One operand of a pointwise operation: an Array, or the bytes of one element.
+fn operand(o: &Bound<'_, PyAny>) -> PyResult<ar::Operand> {
+    if let Ok(a) = o.cast::<Array>() {
+        return Ok(ar::Operand::Array(a.borrow().src.clone()));
+    }
+    if let Ok(b) = o.cast::<PyBytes>() {
+        return Ok(ar::Operand::Scalar(b.as_bytes().to_vec()));
+    }
+    Err(PyTypeError::new_err(
+        "a pointwise operand is an Array or the bytes of one element",
+    ))
+}
+
+/// `op` (a NumPy ufunc name, "where" or "clip") in the loop type `loop_dtype` on
+/// `operands`, with NumPy's values (Workplan DR7 step 7): each operand an Array (all of
+/// one shape; converted to the loop type when read, `where`'s condition to bool) or the
+/// bytes of one element of the loop type. The result has the loop type, or bool for the
+/// comparisons, the logical operations and the tests. A read above `max_read_mb` of
+/// operands and result is split first. Lazy.
+#[pyfunction]
+#[pyo3(signature = (op, operands, loop_dtype, max_read_mb = None))]
+pub fn pointwise(
+    op: &str,
+    operands: Vec<Bound<'_, PyAny>>,
+    loop_dtype: &str,
+    max_read_mb: Option<f64>,
+) -> PyResult<Array> {
+    let t = ar::DType::parse(loop_dtype).map_err(err)?;
+    let ops = operands.iter().map(operand).collect::<PyResult<Vec<_>>>()?;
+    let mut p = ar::Pointwise::new(op, ops, t).map_err(err)?;
+    if let Some(mb) = max_read_mb {
+        p = p.with_max_read((mb * 1048576.0) as u64);
+    }
+    Ok(Array::view(p))
+}
+
+/// The pointwise kernel on bytes, without arrays: `op` in `loop_dtype` on `n`
+/// elements, each operand `(bytes, scalar)` (n elements of its type, or one when
+/// `scalar`). The result's bytes. What dyna checks the engine with against NumPy.
+#[pyfunction]
+pub fn pointwise_apply<'py>(
+    py: Python<'py>,
+    op: &str,
+    operands: Vec<(Bound<'py, PyBytes>, bool)>,
+    n: usize,
+    loop_dtype: &str,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let t = ar::DType::parse(loop_dtype).map_err(err)?;
+    let ops: Vec<(&[u8], bool)> = operands.iter().map(|(b, s)| (b.as_bytes(), *s)).collect();
+    let out = ar::pointwise_apply(op, t, &ops, n).map_err(err)?;
+    Ok(PyBytes::new(py, &out))
 }

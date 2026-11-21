@@ -108,6 +108,18 @@ CHAINS = {
     "convolve-even": lambda a: a.correlate([2, 4, 3], [(i % 7) / 3 for i in range(24)],
                                            mode="constant", cval=-1.5, convolve=True),
     "correlate-split": lambda a: a.correlate([1, 5, 5], [1.0] * 25, max_read_mb=0.05),
+    # pointwise operations (step 7): a scalar, two arrays cast to the loop type, where on
+    # a comparison of a filter, split
+    "pointwise-scalar": lambda a: core.pointwise(
+        "multiply", [a, np.float32(0.5).tobytes()], "float32"),
+    "pointwise-two": lambda a: core.pointwise(
+        "subtract", [a.astype("int32"), a.downsample([1, 1, 1], "mean")], "float64"),
+    "pointwise-where": lambda a: core.pointwise(
+        "where", [core.pointwise("greater", [a.rank_filter([3, 3, 3], 13),
+                                             np.uint16(2000).tobytes()], "uint16"),
+                  a, np.uint16(0).tobytes()], "uint16"),
+    "pointwise-split": lambda a: core.pointwise(
+        "add", [a, a], "uint16", max_read_mb=0.05),
 }
 
 

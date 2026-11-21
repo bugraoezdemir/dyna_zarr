@@ -84,7 +84,7 @@ CASES = {
 
 
 @pytest.mark.parametrize("dtype", ["uint8", "uint16", "int16", "float32", "float64"])
-@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "constant"])
+@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "wrap", "constant"])
 @pytest.mark.parametrize("case", list(CASES))
 def test_gaussian_reads_as_python_and_scipy(tmp_path, dtype, mode, case):
     sigma, kw = CASES[case]
@@ -139,8 +139,6 @@ def test_chains_read_as_python(tmp_path, chain):
 
 #: calls the engine does not take: they keep the Python path (and still read as before)
 STAYS = {
-    # the Python path wraps each read's box around itself, not the array (see _lowering)
-    "wrap": lambda a: o.gaussian_filter(a, 1.0, boundary="wrap"),
     "radius": lambda a: o.gaussian_filter(a, 1.0, radius=2),
     "output": lambda a: o.gaussian_filter(a, 1.0, output=np.float64),
     "user-function": lambda a: o.map_overlap(a, lambda b: ndi.gaussian_filter(b, 1.0), 4),
@@ -151,7 +149,6 @@ STAYS = {
     "median-footprint": lambda a: o.median_filter(a, 3, footprint=np.ones((3, 3, 3), bool)),
     "percentile-float32": lambda a: o.percentile_filter(a, np.float32(30.0), 3),
     "minimum-origin": lambda a: o.minimum_filter(a, 3, origin=1),
-    "gradient-wrap": lambda a: o.gaussian_gradient_magnitude(a, 1.0, boundary="wrap"),
 }
 
 
@@ -243,7 +240,7 @@ def _with_specials(data):
 
 @pytest.mark.parametrize("dtype", ["uint8", "int16", "uint16", "int32", "float32",
                                    "float64"])
-@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "constant"])
+@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "wrap", "constant"])
 @pytest.mark.parametrize("name", list(STEP3))
 def test_step3_filters_read_as_python_and_scipy(tmp_path, dtype, mode, name):
     build, takes = STEP3[name]
@@ -329,7 +326,7 @@ def _ties_and_specials(shape, dtype, seed=0):
 
 @pytest.mark.parametrize("dtype", ["uint8", "int8", "uint16", "int32", "uint64", "int64",
                                    "float32", "float64"])
-@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "constant"])
+@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "wrap", "constant"])
 @pytest.mark.parametrize("name", list(STEP4))
 def test_step4_filters_read_as_python_and_scipy(tmp_path, dtype, mode, name):
     build, ref = STEP4[name]
@@ -446,7 +443,7 @@ STEP5 = {
 
 @pytest.mark.parametrize("dtype", ["uint8", "int16", "uint16", "int32", "uint64", "float32",
                                    "float64"])
-@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "constant"])
+@pytest.mark.parametrize("mode", ["reflect", "mirror", "nearest", "wrap", "constant"])
 @pytest.mark.parametrize("name", list(STEP5))
 def test_step5_filters_read_as_python_and_scipy(tmp_path, dtype, mode, name):
     build, ref = STEP5[name]

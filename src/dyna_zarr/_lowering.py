@@ -27,10 +27,12 @@ What the engine takes over, and only where it gives the Python path's exact valu
   median_filter, rank_filter and percentile_filter (step 4) for any numeric type on
   arrays of two or more dimensions, and for integers up to 32 bits on 1-D arrays (see
   _rank). correlate and convolve with a real n-D kernel (step 5), any numeric type.
+- pointwise operations whose values NumPy defines exactly (step 7): arithmetic,
+  comparisons, logic, bit operations, rounding, sqrt, where and clip, each checked once
+  against the NumPy dyna runs with (see _lowering_pointwise).
 
-  Not wrap: the Python path wraps each read's box around itself rather than the array,
-  so its values depend on the region read, and the engine (which wraps around the
-  array) would differ from it. Not uniform_filter of floats: scipy's running sum rounds
+  Every mode, wrap included (the Python path takes a wrapped halo from the far end of
+  the axis, as the engine does). Not uniform_filter of floats: scipy's running sum rounds
   differently depending on where a line starts, which on the Python path is the read
   box (with extended values at its inner edges), so those values depend on the region
   read too; integer sums are exact, whatever the start.
@@ -251,9 +253,14 @@ def _coarsen(core, t):
 
 
 def _map_blocks(core, t):
-    """Only a cast made by ``astype`` (marked ``cast_to``) whose values NumPy defines."""
+    """A cast made by ``astype`` (marked ``cast_to``) whose values NumPy defines, or a
+    pointwise operation whose values NumPy defines exactly (step 7, see
+    _lowering_pointwise)."""
     to = getattr(t, "cast_to", None)
-    if to is None or len(t.operands) != 1:
+    if to is None:
+        from . import _lowering_pointwise
+        return _lowering_pointwise.build(core, t, _up)
+    if len(t.operands) != 1:
         return None
     src = t.operands[0]
     if not hasattr(src, "_transform"):
@@ -278,8 +285,8 @@ def _map_overlap(core, t):
     return None if build is None else build(t, spec)
 
 
-#: the modes in which the engine gives the Python path's values (not wrap: see above)
-_FILTER_MODES = {"reflect", "mirror", "nearest", "constant"}
+#: the modes in which the engine gives the Python path's values (scipy's five)
+_FILTER_MODES = {"reflect", "mirror", "nearest", "wrap", "constant"}
 
 
 def _gaussian_chain(ndim, sigma, order, mode, truncate):

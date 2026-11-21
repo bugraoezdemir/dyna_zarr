@@ -9,6 +9,11 @@ own halo, the result is independent of the region size that drove it -- i.e. chu
 invariant, and exact vs applying the function to the whole array (given ``depth`` >= the
 function's radius and a matching ``boundary``).
 
+At an edge of the array the halo is what the array has there, and the function applies
+``boundary`` itself, as it would to the whole array. ``wrap`` is the exception: the
+function would wrap the block around itself, so a wrap read takes the halo from the far
+end of the axis instead (see _wrapped_runs).
+
 This is the ``conservative . unary . neighbourhood`` taxonomy cell.
 """
 
@@ -109,7 +114,7 @@ class MapOverlapTransform(Transform):
             key = (key,)
         key = key + (slice(None),) * (ndim - len(key))
 
-        read_slices = []      # region to read from the input (clamped to bounds, step 1)
+        read_runs = []        # per axis, the runs of input indices read, joined in order
         pad_widths = []       # (before, after) padding that restores the halo at true edges
         crop_slices = []      # crop the func output back to the core region + apply step
         squeeze_axes = []
@@ -162,8 +167,19 @@ class MapOverlapTransform(Transform):
             d_lo = min(d, astart)
             d_hi = min(d, size - astop)
 
-            # read the ALIGNED core +/- halo (already within [0, size) by the cap)
-            read_slices.append(slice(astart - d_lo, astop + d_hi))
+            # wrap: the function would wrap the block around ITSELF, not the array, so
+            # a halo that stops at an edge must come from the far end of the axis. The
+            # block then holds the whole halo on both sides and the function's own wrap
+            # at the block's edges reaches only the halo, which the crop drops. A block
+            # that spans the whole axis anyway (both sides capped) is the axis itself,
+            # and the function's wrap is then the array's.
+            if self.boundary == "wrap" and (astart - d > 0 or astop + d < size) \
+                    and (d_lo < d or d_hi < d):
+                d_lo = d_hi = d
+                read_runs.append(_wrapped_runs(astart - d, astop + d, size))
+            else:
+                # read the ALIGNED core +/- halo (already within [0, size) by the cap)
+                read_runs.append([slice(astart - d_lo, astop + d_hi)])
             pad_widths.append((0, 0))
             # The aligned core sits at block[d_lo : d_lo+(astop-astart)] -- d_lo, the
             # halo actually present on the leading side, NOT the requested depth.
@@ -172,8 +188,7 @@ class MapOverlapTransform(Transform):
                 slice(d_lo + (start - astart), d_lo + (stop - astart), step))
             location.append((astart, astop))
 
-        block = to_device(self.array._read_direct(tuple(read_slices)),
-                          resolve_device(self.device))
+        block = to_device(_read_runs(self.array, read_runs), resolve_device(self.device))
         xp = array_namespace(block)
         if any(pb or pa for pb, pa in pad_widths):
             mode, pad_kw = _BOUNDARY_TO_NPPAD[self.boundary]
@@ -186,6 +201,33 @@ class MapOverlapTransform(Transform):
         for a in sorted(squeeze_axes, reverse=True):
             out = xp.squeeze(out, axis=a)
         return out
+
+
+def _wrapped_runs(lo, hi, size):
+    """The input indices ``lo .. hi`` (hi excluded) taken modulo ``size``, as slices of
+    consecutive indices in order: a halo past an edge continues at the far end, and one
+    longer than the axis repeats it."""
+    runs = []
+    p = lo
+    while p < hi:
+        q = p % size
+        n = min(hi - p, size - q)
+        runs.append(slice(q, q + n))
+        p += n
+    return runs
+
+
+def _read_runs(array, runs):
+    """Read the box whose indices along axis ``a`` are the slices ``runs[a]``, joined in
+    order (one read when every axis has a single slice)."""
+    def part(axis, prefix):
+        if axis == len(runs):
+            return array._read_direct(tuple(prefix))
+        pieces = [part(axis + 1, prefix + [r]) for r in runs[axis]]
+        if len(pieces) == 1:
+            return pieces[0]
+        return array_namespace(pieces[0]).concatenate(pieces, axis=axis)
+    return part(0, [])
 
 
 # --------------------------------------------------------------------------- #
