@@ -3,7 +3,7 @@
 
 use rayon::prelude::*;
 
-use crate::madd;
+use crate::{madd, madd_tap, unfused_taps};
 use crate::{Element, FilterError, Mode};
 
 /// Which part of an axis a pass reads and writes, in the whole array's positions.
@@ -325,16 +325,18 @@ impl Kernel<'_> {
                 for (a, b) in acc.iter_mut().zip(&buf[s1..s1 + m]) {
                     *a = b * w[s1];
                 }
+                let unfused = unfused_taps(s1);
                 for j in (1..=s1).rev() {
                     let wj = w[s1 - j];
+                    let plain = s1 - j < unfused;
                     let (lo, hi) = (&buf[s1 - j..s1 - j + m], &buf[s1 + j..s1 + j + m]);
                     if self.sym == 1 {
                         for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
-                            *a = madd(*a, l + h, wj);
+                            *a = madd_tap(*a, l + h, wj, plain);
                         }
                     } else {
                         for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
-                            *a = madd(*a, l - h, wj);
+                            *a = madd_tap(*a, l - h, wj, plain);
                         }
                     }
                 }
@@ -367,16 +369,18 @@ impl Kernel<'_> {
                 for (a, v) in acc.iter_mut().zip(row(c)) {
                     *a = v * w[s1];
                 }
+                let unfused = unfused_taps(s1);
                 for j in (1..=s1).rev() {
                     let wj = w[s1 - j];
+                    let plain = s1 - j < unfused;
                     let (lo, hi) = (row(c - j), row(c + j));
                     if self.sym == 1 {
                         for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
-                            *a = madd(*a, l + h, wj);
+                            *a = madd_tap(*a, l + h, wj, plain);
                         }
                     } else {
                         for ((a, l), h) in acc.iter_mut().zip(lo).zip(hi) {
-                            *a = madd(*a, l - h, wj);
+                            *a = madd_tap(*a, l - h, wj, plain);
                         }
                     }
                 }

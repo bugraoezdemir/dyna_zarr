@@ -291,6 +291,38 @@ pub(crate) fn madd(acc: f64, x: f64, w: f64) -> f64 {
     }
 }
 
+/// How many taps of a symmetric or antisymmetric kernel of half-width `size1` scipy's
+/// compiled `NI_Correlate1D` adds WITHOUT fusing, counted from the outermost tap in; the
+/// others go through [`madd`]. Read from the machine code of scipy 1.17.1's macOS arm64
+/// wheel (clang): for `size1 >= 10` its loop is vectorised, the first `size1 & !7` taps
+/// in a vector body whose products are rounded before the strict, in-order adds, the
+/// rest in the fused scalar loop; shorter kernels run the fused scalar loop alone.
+/// Elsewhere 0: x86-64 never fuses, and Linux aarch64 (GCC) is not verified, so there
+/// every tap is fused as [`madd`] does. `--cfg scipy_fma` follows macOS arm64 on any
+/// target, to test it on x86-64.
+#[inline(always)]
+pub(crate) fn unfused_taps(size1: usize) -> usize {
+    if cfg!(any(
+        scipy_fma,
+        all(target_arch = "aarch64", target_os = "macos")
+    )) && size1 >= 10
+    {
+        size1 & !7
+    } else {
+        0
+    }
+}
+
+/// `acc + x * w`, fused unless `plain` (a tap of scipy's vector body, [`unfused_taps`]).
+#[inline(always)]
+pub(crate) fn madd_tap(acc: f64, x: f64, w: f64, plain: bool) -> f64 {
+    if plain {
+        acc + x * w
+    } else {
+        madd(acc, x, w)
+    }
+}
+
 /// `v > -1 ? (type)v : -(type)(-v)` for an unsigned type.
 #[inline(always)]
 pub(crate) fn unsigned_safe<U: Unsigned>(v: f64) -> U {
