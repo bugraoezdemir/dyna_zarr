@@ -19,6 +19,34 @@ mod transforms;
 static GLOBAL: dyna_zarr_arrays::memory::Counting<mimalloc::MiMalloc> =
     dyna_zarr_arrays::memory::Counting(mimalloc::MiMalloc);
 
+/// mimalloc hands memory a thread freed back to the system this many milliseconds later
+/// (mimalloc's own default is 10). A read thread frees a chunk's buffers every few
+/// milliseconds, so with 10 ms each thread held several freed buffers at once: a float32
+/// write with 4 engine threads at a 32 MB budget grew by 32-34 MB where the engine had
+/// planned 26 (its own live memory 7.7 MB), and macOS CI went over the peak test's limit.
+/// Measured on Windows (2026-11-20): 1 ms -> 29-30 MB, reads as fast as with 10 ms;
+/// 0 -> 26 MB, but reads 25-50% slower (every chunk's buffer mapped fresh again).
+/// `MIMALLOC_PURGE_DELAY` in the environment wins.
+const PURGE_DELAY_MS: std::os::raw::c_long = 1;
+/// `mi_option_purge_delay` in mimalloc v2's mimalloc.h (the enum's 16th member); the
+/// binding names no constant for it. tests/test_engine_memory.py checks that this option
+/// reads mimalloc's default of 10 when the environment sets it.
+const MI_OPTION_PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+
+fn set_purge_delay() {
+    if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+        // SAFETY: mi_option_set only stores the value; mimalloc reads it on later purges
+        unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, PURGE_DELAY_MS) }
+    }
+}
+
+/// mimalloc's purge delay in milliseconds, as the engine's allocator uses it.
+#[pyfunction]
+fn allocator_purge_delay_ms() -> i64 {
+    // SAFETY: reads an option
+    unsafe { libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY) as i64 }
+}
+
 use std::path::PathBuf;
 
 use pyo3::exceptions::PyValueError;
@@ -43,6 +71,7 @@ fn array_info<'py>(py: Python<'py>, path: PathBuf) -> PyResult<Bound<'py, PyDict
 
 #[pymodule]
 fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    set_purge_delay();
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     m.add("TRANSFORMS_VERSION", dyna_zarr_transforms::VERSION)?;
     m.add("ARRAYS_VERSION", dyna_zarr_arrays::VERSION)?;
@@ -53,6 +82,7 @@ fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(arrays::memory_in_use, m)?)?;
     m.add_function(wrap_pyfunction!(arrays::memory_peak, m)?)?;
     m.add_function(wrap_pyfunction!(arrays::reset_memory_peak, m)?)?;
+    m.add_function(wrap_pyfunction!(allocator_purge_delay_ms, m)?)?;
     m.add("ReadError", m.py().get_type::<arrays::ReadError>())?;
     m.add_function(wrap_pyfunction!(arrays::concatenate, m)?)?;
     m.add_function(wrap_pyfunction!(arrays::stack, m)?)?;

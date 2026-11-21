@@ -115,9 +115,13 @@ def test_validation():
     assert ops.coarsen(x, (1, 1), "mean") is x
 
 
-def test_written_and_budgeted_by_what_it_reads(tmp_path, capsys):
+def test_written_and_budgeted_by_what_it_reads(tmp_path, capsys, monkeypatch):
     """io.write shapes a coarsen region in OUTPUT elements but budgets it by what it
-    READS (prod(factors) per output element): a worker is 2 x read + out."""
+    READS (prod(factors) per output element): a worker is 2 x read + out. That is the
+    Python path's model; the engine budgets a region by its own cost
+    (test_write_threads.py)."""
+    from dyna_zarr import _engine
+    monkeypatch.setattr(_engine, "_choice", False)
     a = np.random.default_rng(2).integers(0, 1000, (64, 64, 64), dtype="uint16")
     z = zarr.create_array(str(tmp_path / "s.zarr"), shape=a.shape, chunks=(16, 16, 16),
                           dtype=a.dtype)

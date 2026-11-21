@@ -831,6 +831,7 @@ class DynamicArray:
         there in one go (see _lowering); otherwise as below.
         """
         from . import _lowering
+        from ._scope import ts_source
         data = _lowering.read(self, key)
         if data is not None:
             return data
@@ -838,7 +839,8 @@ class DynamicArray:
             # Direct read from source
             if self._is_tensorstore:
                 # TensorStore: call .read().result() for async operations
-                return self._ts_array[key].read().result()
+                # inside a write: reopened within its max_threads (see _scope)
+                return ts_source(self._ts_array)[key].read().result()
             else:
                 # Zarr: direct indexing
                 return self._zarr_array[key]
