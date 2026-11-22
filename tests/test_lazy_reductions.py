@@ -35,14 +35,17 @@ from dyna_zarr.io import RepeatedReductionWarning
 
 @pytest.fixture
 def source_reads(monkeypatch):
-    """Counter of elements read from untransformed (source) arrays."""
+    """Counter of elements read from the store: by a source array on the Python path, or
+    by an array dyna's native engine reads whole (its sources are then read in Rust and
+    never pass through here; a lowered gaussian_filter, Workplan DR7)."""
+    from dyna_zarr import _lowering
     lock = threading.Lock()
     count = {"n": 0}
     orig = DynamicArray._read_direct
 
     def counting(self, key):
         out = orig(self, key)
-        if self._transform is None:
+        if self._transform is None or _lowering.lowered(self) is not None:
             with lock:
                 count["n"] += int(np.asarray(out).size)
         return out

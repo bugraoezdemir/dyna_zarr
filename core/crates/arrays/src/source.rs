@@ -22,6 +22,12 @@ pub trait Source: Send + Sync {
         None
     }
 
+    /// This array as a pointwise view, if it is one: a pointwise view over it merges it
+    /// into its own expression.
+    fn as_pointwise(&self) -> Option<&crate::pointwise::Pointwise> {
+        None
+    }
+
     /// Read the region `start .. stop` into `out` (its region shape is `stop - start`),
     /// with `threads` (see [`crate::pool`]: at most `threads` pieces holding memory at
     /// once; 1 runs on the calling thread).

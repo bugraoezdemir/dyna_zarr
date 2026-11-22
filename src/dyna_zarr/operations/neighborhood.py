@@ -9,6 +9,11 @@ own halo, the result is independent of the region size that drove it -- i.e. chu
 invariant, and exact vs applying the function to the whole array (given ``depth`` >= the
 function's radius and a matching ``boundary``).
 
+At an edge of the array the halo is what the array has there, and the function applies
+``boundary`` itself, as it would to the whole array. ``wrap`` is the exception: the
+function would wrap the block around itself, so a wrap read takes the halo from the far
+end of the axis instead (see _wrapped_runs).
+
 This is the ``conservative . unary . neighbourhood`` taxonomy cell.
 """
 
@@ -68,8 +73,12 @@ class MapOverlapTransform(Transform):
     """
 
     def __init__(self, array, func, depth, boundary="reflect", dtype=None, name=None,
-                 device=None, block_info=False, align=None):
+                 device=None, block_info=False, align=None, kernel=None):
         super().__init__()
+        #: which named filter ``func`` is, with its arguments (``{"name": ..., ...}``), set
+        #: by the filters below; dyna's native engine reads a transform it recognises
+        #: (Workplan DR7, see _lowering). A ``func`` alone is never recognised.
+        self.kernel = kernel
         if boundary not in _BOUNDARY_TO_NPPAD:
             raise ValueError(f"unknown boundary {boundary!r}; expected one of "
                              f"{sorted(_BOUNDARY_TO_NPPAD)}")
@@ -105,7 +114,7 @@ class MapOverlapTransform(Transform):
             key = (key,)
         key = key + (slice(None),) * (ndim - len(key))
 
-        read_slices = []      # region to read from the input (clamped to bounds, step 1)
+        read_runs = []        # per axis, the runs of input indices read, joined in order
         pad_widths = []       # (before, after) padding that restores the halo at true edges
         crop_slices = []      # crop the func output back to the core region + apply step
         squeeze_axes = []
@@ -158,8 +167,19 @@ class MapOverlapTransform(Transform):
             d_lo = min(d, astart)
             d_hi = min(d, size - astop)
 
-            # read the ALIGNED core +/- halo (already within [0, size) by the cap)
-            read_slices.append(slice(astart - d_lo, astop + d_hi))
+            # wrap: the function would wrap the block around ITSELF, not the array, so
+            # a halo that stops at an edge must come from the far end of the axis. The
+            # block then holds the whole halo on both sides and the function's own wrap
+            # at the block's edges reaches only the halo, which the crop drops. A block
+            # that spans the whole axis anyway (both sides capped) is the axis itself,
+            # and the function's wrap is then the array's.
+            if self.boundary == "wrap" and (astart - d > 0 or astop + d < size) \
+                    and (d_lo < d or d_hi < d):
+                d_lo = d_hi = d
+                read_runs.append(_wrapped_runs(astart - d, astop + d, size))
+            else:
+                # read the ALIGNED core +/- halo (already within [0, size) by the cap)
+                read_runs.append([slice(astart - d_lo, astop + d_hi)])
             pad_widths.append((0, 0))
             # The aligned core sits at block[d_lo : d_lo+(astop-astart)] -- d_lo, the
             # halo actually present on the leading side, NOT the requested depth.
@@ -168,8 +188,7 @@ class MapOverlapTransform(Transform):
                 slice(d_lo + (start - astart), d_lo + (stop - astart), step))
             location.append((astart, astop))
 
-        block = to_device(self.array._read_direct(tuple(read_slices)),
-                          resolve_device(self.device))
+        block = to_device(_read_runs(self.array, read_runs), resolve_device(self.device))
         xp = array_namespace(block)
         if any(pb or pa for pb, pa in pad_widths):
             mode, pad_kw = _BOUNDARY_TO_NPPAD[self.boundary]
@@ -182,6 +201,33 @@ class MapOverlapTransform(Transform):
         for a in sorted(squeeze_axes, reverse=True):
             out = xp.squeeze(out, axis=a)
         return out
+
+
+def _wrapped_runs(lo, hi, size):
+    """The input indices ``lo .. hi`` (hi excluded) taken modulo ``size``, as slices of
+    consecutive indices in order: a halo past an edge continues at the far end, and one
+    longer than the axis repeats it."""
+    runs = []
+    p = lo
+    while p < hi:
+        q = p % size
+        n = min(hi - p, size - q)
+        runs.append(slice(q, q + n))
+        p += n
+    return runs
+
+
+def _read_runs(array, runs):
+    """Read the box whose indices along axis ``a`` are the slices ``runs[a]``, joined in
+    order (one read when every axis has a single slice)."""
+    def part(axis, prefix):
+        if axis == len(runs):
+            return array._read_direct(tuple(prefix))
+        pieces = [part(axis + 1, prefix + [r]) for r in runs[axis]]
+        if len(pieces) == 1:
+            return pieces[0]
+        return array_namespace(pieces[0]).concatenate(pieces, axis=axis)
+    return part(0, [])
 
 
 # --------------------------------------------------------------------------- #
@@ -240,47 +286,99 @@ def map_overlap(array, func, depth, boundary="reflect", dtype=None, name=None, d
     )
 
 
+def _named(array, func, depth, boundary, name, device, kernel):
+    """map_overlap for one of the named filters below, recording which it is (``kernel``)
+    so the native engine can read it."""
+    return array._with_transform(
+        MapOverlapTransform(array, func, depth, boundary=boundary, name=name,
+                            device=device, kernel=kernel))
+
+
+#: gaussian_filter keywords the engine follows; any other keeps the Python path
+_GAUSSIAN_KW = {"order", "cval"}
+
+
 def gaussian_filter(array, sigma, boundary="reflect", truncate=4.0, device=None, **kw):
     depth = _gaussian_depth(sigma, array.ndim, truncate)
     func = lambda b: ndimage_namespace(b).gaussian_filter(
         b, sigma=sigma, mode=boundary, truncate=truncate, **kw)
-    return map_overlap(array, func, depth, boundary=boundary, name="gaussian_filter", device=device)
+    kernel = None
+    if set(kw) <= _GAUSSIAN_KW:
+        kernel = {"name": "gaussian_filter", "sigma": sigma, "order": kw.get("order", 0),
+                  "mode": boundary, "cval": kw.get("cval", 0.0), "truncate": truncate}
+    return _named(array, func, depth, boundary, "gaussian_filter", device, kernel)
+
+
+#: keywords the engine follows for the filters below; any other keeps the Python path
+_CVAL_KW = {"cval"}
+
+
+def _size_kernel(name, size, boundary, kw):
+    """The kernel spec of a filter with a window of ``size`` (None: not for the engine)."""
+    if not set(kw) <= _CVAL_KW:
+        return None
+    return {"name": name, "size": size, "mode": boundary, "cval": kw.get("cval", 0.0)}
 
 
 def uniform_filter(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).uniform_filter(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="uniform_filter", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "uniform_filter",
+                  device, _size_kernel("uniform_filter", size, boundary, kw))
 
 
 def median_filter(array, size, boundary="reflect", device=None, **kw):
+    """Median of each ``size`` window (scipy.ndimage.median_filter)."""
     func = lambda b: ndimage_namespace(b).median_filter(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="median_filter", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "median_filter",
+                  device, _size_kernel("median_filter", size, boundary, kw))
+
+
+def rank_filter(array, rank, size, boundary="reflect", device=None, **kw):
+    """The element of rank ``rank`` (0 the smallest, -1 the largest) of each ``size``
+    window (scipy.ndimage.rank_filter)."""
+    func = lambda b: ndimage_namespace(b).rank_filter(b, rank, size=size, mode=boundary, **kw)
+    kernel = _size_kernel("rank_filter", size, boundary, kw)
+    if kernel is not None:
+        kernel["rank"] = rank
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "rank_filter",
+                  device, kernel)
+
+
+def percentile_filter(array, percentile, size, boundary="reflect", device=None, **kw):
+    """The ``percentile`` (0 to 100, or -100 to 0 counted from the top) of each ``size``
+    window, as scipy picks it: the element of rank ``int(n * percentile / 100)`` of the
+    window's n values (scipy.ndimage.percentile_filter)."""
+    func = lambda b: ndimage_namespace(b).percentile_filter(
+        b, percentile, size=size, mode=boundary, **kw)
+    kernel = _size_kernel("percentile_filter", size, boundary, kw)
+    if kernel is not None:
+        kernel["percentile"] = percentile
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "percentile_filter",
+                  device, kernel)
 
 
 def minimum_filter(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).minimum_filter(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="minimum_filter", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "minimum_filter", device,
+                  _size_kernel("minimum_filter", size, boundary, kw))
 
 
 def maximum_filter(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).maximum_filter(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="maximum_filter", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "maximum_filter", device,
+                  _size_kernel("maximum_filter", size, boundary, kw))
 
 
 def grey_erosion(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).grey_erosion(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="grey_erosion", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "grey_erosion", device,
+                  _size_kernel("grey_erosion", size, boundary, kw))
 
 
 def grey_dilation(array, size, boundary="reflect", device=None, **kw):
     func = lambda b: ndimage_namespace(b).grey_dilation(b, size=size, mode=boundary, **kw)
-    return map_overlap(array, func, _size_depth(size, array.ndim), boundary=boundary,
-                       name="grey_dilation", device=device)
+    return _named(array, func, _size_depth(size, array.ndim), boundary, "grey_dilation", device,
+                  _size_kernel("grey_dilation", size, boundary, kw))
 
 
 def _kernel_depth(weights, ndim):
@@ -302,7 +400,8 @@ def convolve(array, weights, boundary="reflect", cval=0.0, device=None):
     w, depth = _kernel_depth(weights, array.ndim)
     func = lambda b: ndimage_namespace(b).convolve(
         b, array_namespace(b).asarray(w), mode=boundary, cval=cval)
-    return map_overlap(array, func, depth, boundary=boundary, name="convolve", device=device)
+    return _named(array, func, depth, boundary, "convolve", device,
+                  {"name": "convolve", "weights": w, "mode": boundary, "cval": cval})
 
 
 def correlate(array, weights, boundary="reflect", cval=0.0, device=None):
@@ -311,15 +410,18 @@ def correlate(array, weights, boundary="reflect", cval=0.0, device=None):
     w, depth = _kernel_depth(weights, array.ndim)
     func = lambda b: ndimage_namespace(b).correlate(
         b, array_namespace(b).asarray(w), mode=boundary, cval=cval)
-    return map_overlap(array, func, depth, boundary=boundary, name="correlate", device=device)
+    return _named(array, func, depth, boundary, "correlate", device,
+                  {"name": "correlate", "weights": w, "mode": boundary, "cval": cval})
 
 
 def laplace(array, boundary="reflect", device=None, **kw):
     """Laplace filter via the second-derivative [1, -2, 1] stencil (scipy.ndimage.laplace).
     Fixed radius 1 on every axis."""
     func = lambda b: ndimage_namespace(b).laplace(b, mode=boundary, **kw)
-    return map_overlap(array, func, (1,) * array.ndim, boundary=boundary,
-                       name="laplace", device=device)
+    kernel = None
+    if set(kw) <= _CVAL_KW:
+        kernel = {"name": "laplace", "mode": boundary, "cval": kw.get("cval", 0.0)}
+    return _named(array, func, (1,) * array.ndim, boundary, "laplace", device, kernel)
 
 
 def gaussian_laplace(array, sigma, boundary="reflect", truncate=4.0, device=None, **kw):
@@ -328,8 +430,8 @@ def gaussian_laplace(array, sigma, boundary="reflect", truncate=4.0, device=None
     depth = _gaussian_depth(sigma, array.ndim, truncate)
     func = lambda b: ndimage_namespace(b).gaussian_laplace(
         b, sigma=sigma, mode=boundary, truncate=truncate, **kw)
-    return map_overlap(array, func, depth, boundary=boundary,
-                       name="gaussian_laplace", device=device)
+    return _named(array, func, depth, boundary, "gaussian_laplace", device,
+                  _gaussian_kernel("gaussian_laplace", sigma, boundary, truncate, kw))
 
 
 def gaussian_gradient_magnitude(array, sigma, boundary="reflect", truncate=4.0,
@@ -339,13 +441,82 @@ def gaussian_gradient_magnitude(array, sigma, boundary="reflect", truncate=4.0,
     depth = _gaussian_depth(sigma, array.ndim, truncate)
     func = lambda b: ndimage_namespace(b).gaussian_gradient_magnitude(
         b, sigma=sigma, mode=boundary, truncate=truncate, **kw)
-    return map_overlap(array, func, depth, boundary=boundary,
-                       name="gaussian_gradient_magnitude", device=device)
+    return _named(array, func, depth, boundary, "gaussian_gradient_magnitude", device,
+                  _gaussian_kernel("gaussian_gradient_magnitude", sigma, boundary, truncate,
+                                   kw))
+
+
+def _gaussian_kernel(name, sigma, boundary, truncate, kw):
+    """The kernel spec of gaussian_laplace / gaussian_gradient_magnitude (None: not for
+    the engine)."""
+    if not set(kw) <= _CVAL_KW:
+        return None
+    return {"name": name, "sigma": sigma, "mode": boundary, "cval": kw.get("cval", 0.0),
+            "truncate": truncate}
+
+
+# --------------------------------------------------------------------------- #
+# Labels of a tiled mask (tilewise-ccl's Phase B)
+# --------------------------------------------------------------------------- #
+
+def _label_tiles_block(block, location, tables, tile, struct, dtype):
+    """Phase B on one read: every tile it holds (whole, by ``align=tile``) labeled on its
+    own with scipy.ndimage.label and mapped through its table."""
+    import itertools
+    from scipy import ndimage as ndi
+    ndim = len(tile)
+    starts = [lo for lo, _ in location]
+    stops = [hi for _, hi in location]
+    out = np.zeros(block.shape, dtype=dtype)
+    lo = [starts[a] // tile[a] for a in range(ndim)]
+    hi = [(stops[a] - 1) // tile[a] for a in range(ndim)]
+    if any(stops[a] <= starts[a] for a in range(ndim)):
+        return out
+    for tidx in itertools.product(*[range(lo[a], hi[a] + 1) for a in range(ndim)]):
+        # the tile's core, inside the read (align gives whole tiles; the last ones are
+        # clipped at the array's end, where the read stops too)
+        cs = [tidx[a] * tile[a] for a in range(ndim)]
+        ce = [min(cs[a] + tile[a], stops[a]) for a in range(ndim)]
+        sl = tuple(slice(cs[a] - starts[a], ce[a] - starts[a]) for a in range(ndim))
+        local, _ = ndi.label(np.asarray(block[sl]) > 0, structure=struct)
+        out[sl] = tables[tidx][local]
+    return out
+
+
+def label_tiles(mask, tables, tile_shape, connectivity=1, dtype=np.int32):
+    """The final labels of a tiled ``mask`` (tilewise-ccl's Phase B), lazily.
+
+    The mask is cut into tiles of ``tile_shape`` (the last ones clipped at the array's
+    end). Each tile's foreground (``mask > 0``) is labeled on its own with
+    ``scipy.ndimage.label`` and ``generate_binary_structure(ndim, connectivity)``, and
+    its local label ``l`` becomes ``tables[tile_index][l]``: ``tables`` maps every tile's
+    grid index (a tuple) to a 1-D array holding the background's entry and one per local
+    label (tilewise-ccl's Phase A builds them). ``dtype``: int32 or int64.
+
+    Every read covers whole tiles (``align=tile_shape``), since a tile's local labels
+    depend on the whole tile; io.write takes that alignment as its region size. dyna's
+    native engine reads it (Workplan DR7 step 8) with the same labels."""
+    tile = tuple(int(t) for t in tile_shape)
+    if len(tile) != mask.ndim or any(t < 1 for t in tile):
+        raise ValueError(f"label_tiles: tiles of {tile_shape} for an array of shape "
+                         f"{tuple(mask.shape)}")
+    from functools import partial
+    from scipy import ndimage as ndi
+    dtype = np.dtype(dtype)
+    if dtype not in (np.dtype(np.int32), np.dtype(np.int64)):
+        raise ValueError(f"label_tiles: labels as {dtype}; use int32 or int64")
+    struct = ndi.generate_binary_structure(mask.ndim, connectivity)
+    func = partial(_label_tiles_block, tables=tables, tile=tile, struct=struct, dtype=dtype)
+    kernel = {"name": "label_tiles", "tables": tables, "tile": tile,
+              "connectivity": int(connectivity), "dtype": dtype}
+    return mask._with_transform(
+        MapOverlapTransform(mask, func, 0, boundary="constant", dtype=dtype,
+                            name="label_tiles", block_info=True, align=tile, kernel=kernel))
 
 
 __all__ = [
-    "MapOverlapTransform", "map_overlap",
-    "gaussian_filter", "uniform_filter", "median_filter",
+    "MapOverlapTransform", "map_overlap", "label_tiles",
+    "gaussian_filter", "uniform_filter", "median_filter", "rank_filter", "percentile_filter",
     "minimum_filter", "maximum_filter", "grey_erosion", "grey_dilation",
     "convolve", "correlate",
     "laplace", "gaussian_laplace", "gaussian_gradient_magnitude",

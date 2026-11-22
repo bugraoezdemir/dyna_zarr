@@ -125,6 +125,15 @@ def test_neighborhood(kind):
             r = fn(f, np.ones((3,) * nd, "f4") / 3 ** nd)
         elif "sigma" in params:
             r = fn(f, 1)
+        elif "rank" in params:
+            r = fn(f, 1, size=3)
+        elif "percentile" in params:
+            r = fn(f, 50, size=3)
+        elif "tables" in params:
+            # label_tiles: one tile, the whole array, a table for each of its components
+            from scipy import ndimage as ndi
+            n = ndi.label(np.asarray(f.compute()) > 0)[1]
+            r = fn(f, {(0,) * nd: np.arange(n + 1, dtype="int32")}, f.shape, 1)
         elif "size" in params:
             r = fn(f, size=3)
         else:

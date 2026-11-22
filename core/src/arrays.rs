@@ -13,12 +13,19 @@ use pyo3::buffer::PyBuffer;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyIndexError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyEllipsis, PySlice, PyTuple};
+use pyo3::types::{PyBytes, PyEllipsis, PySlice, PyTuple};
 
 create_exception!(dyna_zarr_core, ReadError, PyValueError);
+// The engine cannot give dyna's Python-path values for this read (they depend on where
+// the read starts): dyna reads it with the Python path.
+create_exception!(dyna_zarr_core, UsePythonPath, ReadError);
 
 fn err(e: ar::ReadError) -> PyErr {
-    ReadError::new_err(e.message)
+    if e.python_path {
+        UsePythonPath::new_err(e.message)
+    } else {
+        ReadError::new_err(e.message)
+    }
 }
 
 /// A fixed set of threads that reads run on (Workplan decision DR-5). A write makes one
@@ -450,6 +457,166 @@ impl Array {
         }
     }
 
+    /// A separable filter (Workplan DR7): `passes` applied in order, each
+    /// `(axis, weights, mode)` a scipy.ndimage.correlate1d along one axis with scipy's
+    /// values, in this array's element type after every pass (as scipy.ndimage). `mode`
+    /// is reflect, mirror, nearest, wrap or constant (filled with `cval`). Any region
+    /// gives the values of the whole filtered array. Lazy: nothing is read until asked.
+    #[pyo3(signature = (passes, cval = 0.0, max_read_mb = None))]
+    fn separable(
+        &self,
+        passes: Vec<(usize, Vec<f64>, String)>,
+        cval: f64,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let passes = passes
+            .into_iter()
+            .map(|(axis, weights, mode)| {
+                let mode = ar::FilterMode::parse(&mode, cval).ok_or_else(|| {
+                    ReadError::new_err(format!(
+                        "mode {mode:?}: use \"reflect\", \"mirror\", \"nearest\", \"wrap\" or \"constant\""
+                    ))
+                })?;
+                Ok(ar::Pass::correlate(axis, weights, mode))
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let mut f = ar::Separable::new(self.src.clone(), passes).map_err(err)?;
+        if let Some(mb) = max_read_mb {
+            f = f.with_max_read((mb * 1048576.0) as u64);
+        }
+        Ok(Self::view(f))
+    }
+
+    /// A filter of one or more chains of passes (Workplan DR7), each pass
+    /// `(axis, kind, values, origin, mode)`: kind "correlate" (values: the weights),
+    /// "uniform", "minimum" or "maximum" (values: [size]). Each chain runs on this array
+    /// as scipy.ndimage runs a separable filter; several chains are combined by `combine`:
+    /// "sum" (scipy's generic_laplace) or "hypot" (generic_gradient_magnitude, floats
+    /// only). Any region gives the values of the whole filtered array. Lazy.
+    #[pyo3(signature = (chains, combine = None, cval = 0.0, max_read_mb = None))]
+    fn filter(
+        &self,
+        chains: Vec<Vec<crate::filters::PassSpec>>,
+        combine: Option<&str>,
+        cval: f64,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let chains = crate::filters::chains_of(chains, cval).map_err(ReadError::new_err)?;
+        let combine = crate::filters::combine_of(combine).map_err(ReadError::new_err)?;
+        let mut f = ar::Separable::terms(self.src.clone(), chains, combine).map_err(err)?;
+        if let Some(mb) = max_read_mb {
+            f = f.with_max_read((mb * 1048576.0) as u64);
+        }
+        Ok(Self::view(f))
+    }
+
+    /// scipy.ndimage's n-D rank filter (Workplan DR7 step 4): the element of rank `rank`
+    /// among the positions of a footprint of `shape` (all of it, or those `mask` marks,
+    /// C order) shifted by `origin`, the array extended at its edges by `mode`. What
+    /// scipy's rank_filter, median_filter and percentile_filter run for arrays of two or
+    /// more dimensions and ranks other than the first and the last. Any region gives the
+    /// values of the whole filtered array. Lazy.
+    #[pyo3(signature = (shape, rank, mask = None, origin = None, mode = "reflect", cval = 0.0, max_read_mb = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn rank_filter(
+        &self,
+        shape: Vec<usize>,
+        rank: usize,
+        mask: Option<Vec<bool>>,
+        origin: Option<Vec<isize>>,
+        mode: &str,
+        cval: f64,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let mode = ar::FilterMode::parse(mode, cval).ok_or_else(|| {
+            ReadError::new_err(format!(
+                "mode {mode:?}: use \"reflect\", \"mirror\", \"nearest\", \"wrap\" or \"constant\""
+            ))
+        })?;
+        let origin = origin.unwrap_or_else(|| vec![0; shape.len()]);
+        let fp = ar::Footprint {
+            shape,
+            mask,
+            origin,
+        };
+        let mut f = ar::Window::rank(self.src.clone(), fp, rank, mode).map_err(err)?;
+        if let Some(mb) = max_read_mb {
+            f = f.with_max_read((mb * 1048576.0) as u64);
+        }
+        Ok(Self::view(f))
+    }
+
+    /// scipy.ndimage.correlate with an n-D kernel (Workplan DR7 step 5): `weights` of
+    /// `shape` (C order) shifted by `origin`, the array extended at its edges by `mode`;
+    /// `convolve=True` is scipy.ndimage.convolve (the kernel reversed, origins negated).
+    /// Any region gives the values of the whole filtered array. Lazy.
+    #[pyo3(signature = (shape, weights, origin = None, mode = "reflect", cval = 0.0, convolve = false, max_read_mb = None))]
+    #[allow(clippy::too_many_arguments)]
+    fn correlate(
+        &self,
+        shape: Vec<usize>,
+        weights: Vec<f64>,
+        origin: Option<Vec<isize>>,
+        mode: &str,
+        cval: f64,
+        convolve: bool,
+        max_read_mb: Option<f64>,
+    ) -> PyResult<Array> {
+        let mode = ar::FilterMode::parse(mode, cval).ok_or_else(|| {
+            ReadError::new_err(format!(
+                "mode {mode:?}: use \"reflect\", \"mirror\", \"nearest\", \"wrap\" or \"constant\""
+            ))
+        })?;
+        let origin = origin.unwrap_or_else(|| vec![0; shape.len()]);
+        let mut f =
+            ar::Window::correlate(self.src.clone(), shape, &weights, origin, mode, convolve)
+                .map_err(err)?;
+        if let Some(mb) = max_read_mb {
+            f = f.with_max_read((mb * 1048576.0) as u64);
+        }
+        Ok(Self::view(f))
+    }
+
+    /// The final labels of this mask in tiles of `tile` (tilewise-ccl's Phase B, Workplan
+    /// DR7 step 8): each tile's foreground (`v > 0`) labeled as scipy.ndimage.label does
+    /// with `generate_binary_structure(ndim, connectivity)`, its local label l mapped to
+    /// `tables[offsets[k] + l]` for tile k (tiles in C order of the grid). `tables` and
+    /// `offsets` are the bytes of int64 arrays; `dtype` "int32" or "int64". Lazy; a read
+    /// labels every tile it overlaps whole.
+    #[pyo3(signature = (tile, connectivity, tables, offsets, dtype = "int32"))]
+    fn label_tiles(
+        &self,
+        tile: Vec<u64>,
+        connectivity: usize,
+        tables: &Bound<'_, PyBytes>,
+        offsets: &Bound<'_, PyBytes>,
+        dtype: &str,
+    ) -> PyResult<Array> {
+        let ints = |b: &Bound<'_, PyBytes>, what: &str| -> PyResult<Vec<i64>> {
+            let b = b.as_bytes();
+            if b.len() % 8 != 0 {
+                return Err(ReadError::new_err(format!(
+                    "{what}: not the bytes of int64s"
+                )));
+            }
+            Ok(b.as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_ne_bytes(*c))
+                .collect())
+        };
+        let tables = ints(tables, "tables")?;
+        let offsets = ints(offsets, "offsets")?
+            .into_iter()
+            .map(|v| usize::try_from(v).map_err(|_| ReadError::new_err("a negative offset")))
+            .collect::<PyResult<Vec<usize>>>()?;
+        let t = ar::DType::parse(dtype).map_err(err)?;
+        Ok(Self::view(
+            ar::TileLabels::new(self.src.clone(), &tile, connectivity, tables, offsets, t)
+                .map_err(err)?,
+        ))
+    }
+
     /// The array resampled onto a grid of `shape`: output index o takes the value at
     /// input index `matrix · o` (scipy.ndimage.affine_transform's convention: the matrix
     /// maps output to input). `matrix`: n rows of n + 1 (the last column the offset) or
@@ -515,4 +682,57 @@ pub fn stack(arrays: Vec<PyRef<'_, Array>>, axis: usize) -> PyResult<Array> {
     Ok(Array::view(
         ar::Concat::stack(sources(arrays), axis).map_err(err)?,
     ))
+}
+
+/// One operand of a pointwise operation: an Array, or the bytes of one element.
+fn operand(o: &Bound<'_, PyAny>) -> PyResult<ar::Operand> {
+    if let Ok(a) = o.cast::<Array>() {
+        return Ok(ar::Operand::Array(a.borrow().src.clone()));
+    }
+    if let Ok(b) = o.cast::<PyBytes>() {
+        return Ok(ar::Operand::Scalar(b.as_bytes().to_vec()));
+    }
+    Err(PyTypeError::new_err(
+        "a pointwise operand is an Array or the bytes of one element",
+    ))
+}
+
+/// `op` (a NumPy ufunc name, "where" or "clip") in the loop type `loop_dtype` on
+/// `operands`, with NumPy's values (Workplan DR7 step 7): each operand an Array (all of
+/// one shape; converted to the loop type when read, `where`'s condition to bool) or the
+/// bytes of one element of the loop type. The result has the loop type, or bool for the
+/// comparisons, the logical operations and the tests. A read above `max_read_mb` of
+/// operands and result is split first. Lazy.
+#[pyfunction]
+#[pyo3(signature = (op, operands, loop_dtype, max_read_mb = None))]
+pub fn pointwise(
+    op: &str,
+    operands: Vec<Bound<'_, PyAny>>,
+    loop_dtype: &str,
+    max_read_mb: Option<f64>,
+) -> PyResult<Array> {
+    let t = ar::DType::parse(loop_dtype).map_err(err)?;
+    let ops = operands.iter().map(operand).collect::<PyResult<Vec<_>>>()?;
+    let mut p = ar::Pointwise::new(op, ops, t).map_err(err)?;
+    if let Some(mb) = max_read_mb {
+        p = p.with_max_read((mb * 1048576.0) as u64);
+    }
+    Ok(Array::view(p))
+}
+
+/// The pointwise kernel on bytes, without arrays: `op` in `loop_dtype` on `n`
+/// elements, each operand `(bytes, scalar)` (n elements of its type, or one when
+/// `scalar`). The result's bytes. What dyna checks the engine with against NumPy.
+#[pyfunction]
+pub fn pointwise_apply<'py>(
+    py: Python<'py>,
+    op: &str,
+    operands: Vec<(Bound<'py, PyBytes>, bool)>,
+    n: usize,
+    loop_dtype: &str,
+) -> PyResult<Bound<'py, PyBytes>> {
+    let t = ar::DType::parse(loop_dtype).map_err(err)?;
+    let ops: Vec<(&[u8], bool)> = operands.iter().map(|(b, s)| (b.as_bytes(), *s)).collect();
+    let out = ar::pointwise_apply(op, t, &ops, n).map_err(err)?;
+    Ok(PyBytes::new(py, &out))
 }

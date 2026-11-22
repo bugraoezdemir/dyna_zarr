@@ -23,6 +23,8 @@ half = "2"
 # the stored metadata out as JSON
 serde_json = "1"
 dyna-zarr-transforms = { path = "../transforms" }
+# the filter kernels the Separable view runs (DR7)
+dyna-zarr-filters = { path = "../filters" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -164,17 +164,45 @@ def test_fused_budget_counts_the_widest_dtype(tmp_path, capsys):
 
 
 def test_fused_budget_counts_the_halo(tmp_path, capsys):
-    """A halo op reads the padded region, and the budget must pay for that."""
+    """A halo op reads the padded region, and the budget must pay for that: the Python
+    path's worker (the padded region read and filtered, and the output). With dyna's
+    native engine on, a gaussian_filter is read by the engine and planned with the
+    engine's own cost (Workplan DR7), checked in the next test."""
+    from dyna_zarr import _engine
     from dyna_zarr import operations as ops
-    arr = ops.gaussian_filter(_src(tmp_path).astype("float32"), 1.0)
-    depth = dyna_io_module._chain_halo_depth(arr, 3)
-    assert depth and min(depth) > 0
-    padded = int(np.prod([min(16 + 2 * d, 32) for d in depth])) * 4
-    worker = 2 * padded + 16 ** 3 * 4
-    io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
-             region_shape=(16, 16, 16), zarr_format=2,
-             max_threads=32, memory_budget_mb=4 * worker / 2**20)
-    assert _fused_workers(capsys.readouterr().out) == 4
+    saved = _engine._choice
+    _engine.set_engine(False)
+    try:
+        arr = ops.gaussian_filter(_src(tmp_path).astype("float32"), 1.0)
+        depth = dyna_io_module._chain_halo_depth(arr, 3)
+        assert depth and min(depth) > 0
+        padded = int(np.prod([min(16 + 2 * d, 32) for d in depth])) * 4
+        worker = 2 * padded + 16 ** 3 * 4
+        io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
+                 region_shape=(16, 16, 16), zarr_format=2,
+                 max_threads=32, memory_budget_mb=4 * worker / 2**20)
+        assert _fused_workers(capsys.readouterr().out) == 4
+    finally:
+        _engine._choice = saved
+
+
+def test_engine_cost_counts_the_halo(tmp_path):
+    """The engine's cost of a filtered region holds at least the region padded by the
+    kernel's reach (sigma 1: radius 4 on every side), in the filter's element type."""
+    pytest.importorskip("dyna_zarr_core")
+    from dyna_zarr import _engine, _lowering
+    from dyna_zarr import operations as ops
+    saved = _engine._choice
+    _engine.set_engine(True)
+    try:
+        arr = ops.gaussian_filter(_src(tmp_path).astype("float32"), 1.0)
+        eng = _lowering.lowered(arr)
+        if eng is None or not hasattr(eng, "separable"):
+            pytest.skip("this dyna-zarr-core does not read filters")
+        start, stop = [8, 8, 8], [24, 24, 24]
+        assert eng.cost(start, stop, threads=1) >= 24 ** 3 * 4
+    finally:
+        _engine._choice = saved
 
 
 def test_fused_memory_budget_is_a_ceiling_not_a_target(tmp_path, capsys):

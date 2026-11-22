@@ -264,7 +264,7 @@ The operation set contains around **150 operations**, available as `dyna_zarr.op
 |---|---|
 | Pointwise math and comparisons | `sqrt`, `clip`, `add`, `where`, `isfinite` |
 | Reductions and statistics | `min`, `max`, `sum`, `mean`, `std`, `histogram`, `unique` |
-| Neighborhood filters | `gaussian_filter`, `median_filter`, `convolve`, `gaussian_laplace` |
+| Neighborhood filters | `gaussian_filter`, `median_filter`, `percentile_filter`, `convolve`, `gaussian_laplace` |
 | Structural operations | `concatenate`, `stack`, `transpose`, `reshape`, `flatten`, `pad`, `flip` |
 | Differences and scans | `diff`, `gradient`, `cumsum`, `cummax` |
 | Downsampling | `coarsen` |

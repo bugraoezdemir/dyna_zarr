@@ -212,12 +212,23 @@ def isinf(array): return map_blocks(np.isinf, array, name="isinf")
 def isnan(array): return map_blocks(np.isnan, array, name="isnan")
 
 
+def _record(out, *args):
+    """Mark a pointwise operation built on a lambda with what it is, for dyna's native
+    engine (``("clip", a_min, a_max)``, ``("round", decimals)``; see
+    _lowering_pointwise)."""
+    if getattr(out, "_transform", None) is not None:
+        out._transform.pointwise = args
+    return out
+
+
 def round(array, decimals=0):
-    return map_blocks(lambda x: np.round(x, decimals=decimals), array, name="round")
+    out = map_blocks(lambda x: np.round(x, decimals=decimals), array, name="round")
+    return _record(out, "round", decimals)
 
 
 def clip(array, a_min=None, a_max=None):
-    return map_blocks(lambda x: np.clip(x, a_min, a_max), array, name="clip")
+    out = map_blocks(lambda x: np.clip(x, a_min, a_max), array, name="clip")
+    return _record(out, "clip", a_min, a_max)
 
 
 def astype(array, dtype):

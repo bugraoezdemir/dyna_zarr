@@ -85,12 +85,14 @@ CHAINS = {
     "mean-of-slice": lambda a: o.coarsen(a[:, 3:, :], (1, 2, 2))[:, ::2],
     "mean-of-mean": lambda a: o.coarsen(o.coarsen(a, (1, 2, 2)), (2, 2, 2)),
     "levels-chain": lambda a: o.transpose(o.coarsen(a.astype("float64"), (2, 2, 2)), (1, 2, 0)),
+    # pointwise (DR7 step 7; tests/test_engine_pointwise.py has the rest)
+    "add": lambda a: a + 1,
 }
 
 #: chains with a link the engine lacks: Python on top, the engine below where it can
 MIXED = {
     "median": lambda a: o.coarsen(a, (2, 2, 2), "median"),
-    "add": lambda a: a + 1,
+    "sin": lambda a: o.sin(a),
     "float-to-int": lambda a: a.astype("float32").astype("uint8"),
     "map_overlap": lambda a: a.map_overlap(lambda b: b * 2, depth=1),
     "flip": lambda a: o.flip(a, 1),

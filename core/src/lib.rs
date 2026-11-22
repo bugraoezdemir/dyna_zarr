@@ -8,6 +8,7 @@
 //! Python path as the reference the tests compare with.
 
 mod arrays;
+mod filters;
 mod transforms;
 
 /// mimalloc for everything Rust allocates in this module (Python's own memory is not
@@ -84,8 +85,12 @@ fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(arrays::reset_memory_peak, m)?)?;
     m.add_function(wrap_pyfunction!(allocator_purge_delay_ms, m)?)?;
     m.add("ReadError", m.py().get_type::<arrays::ReadError>())?;
+    m.add("UsePythonPath", m.py().get_type::<arrays::UsePythonPath>())?;
     m.add_function(wrap_pyfunction!(arrays::concatenate, m)?)?;
     m.add_function(wrap_pyfunction!(arrays::stack, m)?)?;
+    // pointwise operations (DR7 step 7)
+    m.add_function(wrap_pyfunction!(arrays::pointwise, m)?)?;
+    m.add_function(wrap_pyfunction!(arrays::pointwise_apply, m)?)?;
     // dyna_zarr_core.transforms (DR2): an attribute, so `from dyna_zarr_core import
     // transforms` works; registered in sys.modules too, for `import dyna_zarr_core.transforms`
     let sub = transforms::module(m.py())?;
@@ -94,5 +99,13 @@ fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
         .import("sys")?
         .getattr("modules")?
         .set_item("dyna_zarr_core.transforms", &sub)?;
+    // dyna_zarr_core.filters (DR7), registered the same way
+    let sub = filters::module(m.py())?;
+    m.add_submodule(&sub)?;
+    m.py()
+        .import("sys")?
+        .getattr("modules")?
+        .set_item("dyna_zarr_core.filters", &sub)?;
+    m.add("FILTERS_VERSION", dyna_zarr_filters::VERSION)?;
     Ok(())
 }

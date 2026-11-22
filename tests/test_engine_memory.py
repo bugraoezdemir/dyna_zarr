@@ -38,12 +38,19 @@ def arrays(tmp_path_factory):
         z[...] = data
         return core.Array.open(str(tmp / name))
 
-    return {
+    out = {
         "v2-blosc": write("v2", (4, 32, 32), 2, compressors=numcodecs.Blosc(cname="lz4")),
         "v3-zstd": write("v3", (4, 32, 32), compressors=zc.ZstdCodec(level=3)),
         "v3-none": write("v3n", (4, 32, 32), compressors=None),
         "v3-sharded": write("sh", (2, 16, 16), shards=(4, 32, 64)),
     }
+    # The engine's shared pools of 2, 4, 8 and 16 threads, made before any measurement:
+    # the first read with a thread count creates its pool (about 30 KB kept for the
+    # process), which is not that read's memory. Without this, whichever case first
+    # used 4 threads measured 30 KB more (a filter read, run alone, went 286 bytes over).
+    for t in (2, 4, 8, 16):
+        out["v3-zstd"].downsample([2, 2, 2], "mean").read([0, 0, 0], [6, 48, 64], threads=t)
+    return out
 
 
 def _rotation():
@@ -72,7 +79,77 @@ CHAINS = {
     "mean-split": lambda a: a.downsample([2, 2, 2], "mean", max_read_mb=0.02),
     "gaussian-split": lambda a: a.downsample([2, 2, 2], "gaussian", max_read_mb=0.05),
     "resample-split": lambda a: a.resample(_rotation(), list(a.shape), "linear", max_read_mb=0.02),
+    # separable filters (DR7): Gaussian passes of radius 2, 4 and 8, in three modes
+    "filter": lambda a: a.separable(_filter_passes("reflect", "mirror", "nearest")),
+    # wrap reaches the far end of the axis: the box spans it whole near an edge
+    "filter-wrap": lambda a: a.separable(_filter_passes("wrap", "constant", "wrap")),
+    "filter-split": lambda a: a.separable(_filter_passes("reflect", "reflect", "reflect"),
+                                          max_read_mb=0.05),
+    "filter-of-mean": lambda a: a.downsample([1, 2, 2], "mean")
+    .separable(_filter_passes("mirror", "mirror", "mirror")),
+    # running passes (a maximum, a minimum with an origin, a uniform window)
+    "filter-running": lambda a: a.filter([[(0, "maximum", [3], 0, "reflect"),
+                                           (1, "minimum", [4], -1, "mirror"),
+                                           (2, "uniform", [5], 0, "nearest")]]),
+    # chains combined: a laplace (sum) and a gradient magnitude (hypot, floats)
+    "filter-sum": lambda a: a.filter([[(k, "correlate", [1.0, -2.0, 1.0], 0, "reflect")]
+                                      for k in range(3)], combine="sum"),
+    "filter-hypot": lambda a: a.astype("float32").filter(
+        [[(k, "correlate", list(core.filters.gaussian_weights(1.0, int(k == d), 4)), 0,
+           "mirror") for k in range(3)] for d in range(3)], combine="hypot"),
+    # the n-D rank filter (step 4): a median, an even box in constant mode, wrap, split
+    "rank": lambda a: a.rank_filter([3, 3, 3], 13),
+    "rank-even": lambda a: a.rank_filter([2, 4, 5], 17, mode="constant", cval=7.0),
+    "rank-wrap": lambda a: a.rank_filter([3, 5, 3], 20, mode="wrap"),
+    "rank-split": lambda a: a.rank_filter([1, 5, 5], 12, max_read_mb=0.05),
+    "rank-of-mean": lambda a: a.downsample([1, 2, 2], "mean").rank_filter([3, 3, 3], 13),
+    # the n-D correlation (step 5): odd, even and convolved, constant mode, split
+    "correlate": lambda a: a.correlate([3, 3, 3], [0.5 - (i % 5) / 4 for i in range(27)]),
+    "convolve-even": lambda a: a.correlate([2, 4, 3], [(i % 7) / 3 for i in range(24)],
+                                           mode="constant", cval=-1.5, convolve=True),
+    "correlate-split": lambda a: a.correlate([1, 5, 5], [1.0] * 25, max_read_mb=0.05),
+    # pointwise operations (step 7): a scalar, two arrays cast to the loop type, where on
+    # a comparison of a filter, split
+    "pointwise-scalar": lambda a: core.pointwise(
+        "multiply", [a, np.float32(0.5).tobytes()], "float32"),
+    "pointwise-two": lambda a: core.pointwise(
+        "subtract", [a.astype("int32"), a.downsample([1, 1, 1], "mean")], "float64"),
+    "pointwise-where": lambda a: core.pointwise(
+        "where", [core.pointwise("greater", [a.rank_filter([3, 3, 3], 13),
+                                             np.uint16(2000).tobytes()], "uint16"),
+                  a, np.uint16(0).tobytes()], "uint16"),
+    "pointwise-split": lambda a: core.pointwise(
+        "add", [a, a], "uint16", max_read_mb=0.05),
+    # tiled labels (step 8): tiles of a threshold, whole and clipped at the array's end
+    "label-tiles": lambda a: _label_tiles(a, [4, 32, 32]),
+    "label-tiles-clipped": lambda a: _label_tiles(a, [5, 40, 50]),
 }
+
+
+def _label_tiles(a, tile):
+    """tilewise-ccl's Phase B over a threshold of ``a``, with tables as Phase A builds
+    them (every tile's local labels, here numbered on from the tiles before)."""
+    import itertools
+    from scipy import ndimage as ndi
+    mask = core.pointwise("greater", [a, np.uint16(3500).tobytes()], "uint16")
+    fg = mask.read([0] * a.ndim, list(a.shape))
+    struct = ndi.generate_binary_structure(a.ndim, 1)
+    grid = [-(-s // t) for s, t in zip(a.shape, tile)]
+    tables, offsets, nxt = [], [0], 1
+    for tidx in itertools.product(*[range(g) for g in grid]):
+        sl = tuple(slice(i * t, (i + 1) * t) for i, t in zip(tidx, tile))
+        n = ndi.label(fg[sl], structure=struct)[1]
+        tables.append(np.concatenate([[0], np.arange(nxt, nxt + n)]).astype(np.int64))
+        nxt += n
+        offsets.append(offsets[-1] + n + 1)
+    return mask.label_tiles(tile, 1, np.concatenate(tables).tobytes(),
+                            np.asarray(offsets, np.int64).tobytes())
+
+
+def _filter_passes(*modes):
+    w = core.filters.gaussian_weights
+    return [(0, w(0.5, 0, 2), modes[0]), (1, w(1.0, 0, 4), modes[1]),
+            (2, w(2.0, 1, 8), modes[2])]
 
 
 def _regions(v):
