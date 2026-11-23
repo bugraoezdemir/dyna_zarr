@@ -58,18 +58,18 @@ classifiers = [
 #     at all; newer tifffile on older zarr fails to instantiate.
 #   numpy>=1.26 - required by zarr 3.1.5.
 #   scipy>=1.10 - the first scipy installable alongside numpy>=1.26.
-#   tensorstore>=0.1.62 - the first built against NumPy 2; older wheels fail to import
-#     under NumPy 2 while declaring no upper bound, so pip would pair them with it.
-#   tensorstore != 0.1.77 .. 0.1.84 - those releases CRASH AT INTERPRETER EXIT
-#     (0xC0000409) after any S3 access on Windows: the work completes, but the process
-#     exits with a failure code, breaking scripts and CI. Reproduced with tensorstore
-#     alone (no dyna) against an S3 emulator; 0.1.62, 0.1.71-0.1.76 and 0.1.85 exit
-#     cleanly. Excluded on every platform (Linux/macOS not verified either way).
-#   tensorstore != 0.1.85 - that release keeps memory while the levels below full
-#     resolution are built from the stored full-resolution level: one 959-plane well of
-#     14040 x 24551 climbed from 2.4 GB to 115 GB in 13 minutes on a cluster node (Linux);
-#     at that plane size 2.5 -> 7.9 GB in 50 s with 0.1.85, flat at 1.1-1.9 GB with
-#     0.1.86, every other package the same. 0.1.62-0.1.76 not measured for this.
+#   tensorstore>=0.1.86 - every earlier release can leave a write or an open waiting
+#     forever (TensorStore's thread pool loses a wakeup: a task is queued while every
+#     worker sleeps; fixed in 0.1.86 by its commit ed517180, the pool dates from 0.1.51).
+#     Several writes at once in one process (images of a plate written side by side,
+#     each with its own TensorStore context) hit it: 12 threads writing small zarr3
+#     arrays stopped for good after 1.7k-12k writes on 0.1.71, 0.1.76 and 0.1.81, with
+#     tensorstore alone; 0.1.86 ran 18,000 without a stop. 0.1.86 also leaves out what
+#     the older floor had to exclude: 0.1.77-0.1.84 crash at interpreter exit after any
+#     S3 access on Windows (0xC0000409), and 0.1.85 keeps memory while the levels below
+#     full resolution are built from the stored full-resolution level (one 959-plane
+#     well of 14040 x 24551 climbed from 2.4 GB to 115 GB in 13 minutes; flat on 0.1.86).
+#     0.1.86 has wheels for CPython 3.11-3.14 on Windows, Linux and macOS.
 #   zarr-zip>=0.1.0 - io.open_zip (Zarr written straight into a zip) writes through its
 #     ZipWriter, and reads a zip being written through its zarr-python store.
 # (The unpinned `tensorstore`/`tifffile` used to resolve to 0.1.0 / 0.1.0 at the floor.)
@@ -78,7 +78,7 @@ dependencies = [
     "zarr-zip>=0.1.0",
     "numpy>=1.26",
     "scipy>=1.10",
-    "tensorstore>=0.1.62,!=0.1.77,!=0.1.78,!=0.1.79,!=0.1.80,!=0.1.81,!=0.1.82,!=0.1.83,!=0.1.84,!=0.1.85",
+    "tensorstore>=0.1.86",
     "tifffile>=2025.5.21",
 ]
 

@@ -308,8 +308,7 @@ For new processing chains that fit dyna-zarr's slice-based model, using dyna-zar
 
 - Python 3.11 or newer.
 - Core dependencies include Zarr, NumPy, SciPy, TensorStore, and tifffile. The optional `zarrista` extra also requires NumPy 2.1 or newer.
-- TensorStore versions 0.1.77–0.1.84 are excluded because they have a known process-exit crash after S3 access in affected environments. The package dependency constraints enforce the supported range.
-- TensorStore 0.1.85 is excluded because it keeps memory while the coarser levels are built from the stored full-resolution level: a 959-plane image of 14040 x 24551 climbed from 2.4 GB to 115 GB in 13 minutes. 0.1.86 stays flat. If an environment already has 0.1.85, upgrade it: `pip install --upgrade "tensorstore>=0.1.86"`.
+- TensorStore 0.1.86 or newer is required. In every earlier release, a write can wait forever when several writes run at once in one process, for example the images of a plate written side by side: TensorStore's thread pool could lose a wakeup, which 0.1.86 fixed. Older releases had further problems too: 0.1.77–0.1.84 crash at process exit after S3 access, and 0.1.85 keeps memory while the coarser levels are built (a 959-plane image of 14040 x 24551 climbed from 2.4 GB to 115 GB). dyna-zarr warns at import when it finds an older TensorStore, which can happen in an environment pip did not update. Upgrade it with `pip install --upgrade "tensorstore>=0.1.86"`.
 
 Run the core tests locally:
 

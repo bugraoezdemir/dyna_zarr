@@ -44,19 +44,32 @@ from .operations._backend import (
     new_stream as _new_stream, use_stream as _use_stream,
 )
 
-#: tensorstore releases that keep memory while lower levels are built from the stored
-#: level 0 (pyproject excludes them; this catches an install that bypassed the pins:
-#: --no-deps, conda, an environment pip left alone).
+#: the oldest tensorstore dyna runs on (pyproject's floor, see the reasons there); the
+#: warning below catches an install that bypassed it: --no-deps, an editable install made
+#: before the floor rose, conda, an environment pip left alone.
+_TENSORSTORE_FLOOR = (0, 1, 86)
+#: releases that also keep memory while lower levels are built from the stored level 0
 _LEAKING_TENSORSTORE = ("0.1.85",)
 
 
-def _warn_leaking_tensorstore(version) -> bool:
-    """Warn when *version* is a tensorstore in ``_LEAKING_TENSORSTORE``; True when it is."""
-    if version not in _LEAKING_TENSORSTORE:
+def _version_tuple(version):
+    """``"0.1.86"`` -> ``(0, 1, 86)``; None when *version* does not start that way."""
+    import re
+    found = re.match(r"(\d+)\.(\d+)\.(\d+)", str(version or ""))
+    return tuple(int(g) for g in found.groups()) if found else None
+
+
+def _warn_old_tensorstore(version) -> bool:
+    """Warn when *version* is a tensorstore below ``_TENSORSTORE_FLOOR``; True when it is."""
+    found = _version_tuple(version)
+    if found is None or found >= _TENSORSTORE_FLOOR:
         return False
+    leak = (" It also keeps memory while the coarser levels of a pyramid are built: one "
+            "959-plane image of 14040 x 24551 climbed from 2.4 GB to 115 GB."
+            if version in _LEAKING_TENSORSTORE else "")
     warnings.warn(
-        f"tensorstore {version} keeps memory while the coarser levels of a pyramid are "
-        f"built: one 959-plane image of 14040 x 24551 climbed from 2.4 GB to 115 GB. "
+        f"tensorstore {version} can leave a write waiting forever when several writes run "
+        f"at once in one process (its thread pool loses a wakeup; fixed in 0.1.86).{leak} "
         f'Upgrade it: pip install --upgrade "tensorstore>=0.1.86"', UserWarning,
         stacklevel=3)
     return True
@@ -71,7 +84,7 @@ def _tensorstore_version():
         return None
 
 
-_warn_leaking_tensorstore(_tensorstore_version())
+_warn_old_tensorstore(_tensorstore_version())
 
 
 #: Smallest workable pipeline: 1 reader + 1 queued region + 1 in-flight write. `max_threads`
