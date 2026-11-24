@@ -105,6 +105,14 @@ def _common_grid(arrays):
     return tuple(first)
 
 
+def _promoted_dtype(arrays):
+    """The dtype ``np.concatenate`` / ``np.stack`` give ``arrays``: their dtypes
+    promoted (uint8 with uint16 is uint16). Every read of the combined array has this
+    dtype, whichever parts it touches, so a write never cuts the wider parts' values
+    to the first part's dtype (it used to report ``arrays[0].dtype``)."""
+    return np.result_type(*(np.dtype(a.dtype) for a in arrays))
+
+
 class ConcatenateTransform(Transform):
     """
     Lazy concatenation of multiple arrays along an axis.
@@ -130,7 +138,7 @@ class ConcatenateTransform(Transform):
 
         # A grid only if every input shares it (order-independent; see _common_grid).
         self.chunks = _common_grid(arrays)
-        self.dtype = arrays[0].dtype
+        self.dtype = _promoted_dtype(arrays)
 
         # Precompute cumulative sizes for fast lookup
         self._cumulative_sizes = [0]
@@ -204,6 +212,9 @@ class ConcatenateTransform(Transform):
             result = arrays_to_read[0][0]._read_direct(arrays_to_read[0][1])
         else:
             result = self._read_parts(arrays_to_read, normalized_key)
+        if result.dtype != self.dtype:
+            # a read inside one narrower part (or an empty one) still has the joined dtype
+            result = result.astype(self.dtype)
 
         # Re-apply the step on the concat axis (routing above read the contiguous span).
         if step != 1:
@@ -231,7 +242,7 @@ class ConcatenateTransform(Transform):
             return out[tuple(index)]
 
         total = sum(n for _, _, n in parts)
-        dtype = np.result_type(*(arr.dtype for arr, _, _ in parts))
+        dtype = self.dtype                   # all parts' dtypes, not only those read
         # unit-step slices of the concat axis; the other axes as the key asks
         shape = [total if i == axis else len(range(*k.indices(size)))
                  for i, (k, size) in enumerate(zip(key, self.shape))]
@@ -312,7 +323,7 @@ class StackTransform(Transform):
         # every input shares it (order-independent; see _common_grid).
         src = _common_grid(arrays)
         self.chunks = (src[:axis] + (1,) + src[axis:]) if src is not None else None
-        self.dtype = arrays[0].dtype
+        self.dtype = _promoted_dtype(arrays)
 
     def read(self, key):
         # Normalize key
@@ -328,8 +339,9 @@ class StackTransform(Transform):
 
         # Determine which arrays to read
         if _is_int_index(new_axis_key):
-            # Single array - the new axis is dropped
-            return self.arrays[new_axis_key]._read_direct(source_key)
+            # Single array - the new axis is dropped; it keeps the stacked dtype
+            part = self.arrays[new_axis_key]._read_direct(source_key)
+            return part if part.dtype == self.dtype else part.astype(self.dtype)
 
         # Slice on the new axis. Insert the stacked axis at its position among the
         # *surviving* source axes (earlier integer indices dropped their axes).
@@ -340,10 +352,11 @@ class StackTransform(Transform):
             # Empty selection: build an empty array of the correct per-part shape.
             sample = self.arrays[0]._read_direct(source_key)
             empty_shape = sample.shape[:insert_pos] + (0,) + sample.shape[insert_pos:]
-            return np.empty(empty_shape, dtype=sample.dtype)
+            return np.empty(empty_shape, dtype=self.dtype)
 
         parts = [self.arrays[i]._read_direct(source_key) for i in idxs]
-        return np.stack(parts, axis=insert_pos)
+        # all parts' dtypes, not only those read (np.stack promotes the read ones only)
+        return np.stack(parts, axis=insert_pos, dtype=self.dtype)
 
 
 def _positive_steps(key):
@@ -1153,14 +1166,20 @@ def expand_dims(array, axis):
 
 
 def concatenate(arrays, axis=0):
-    """Concatenate arrays along an existing axis."""
+    """Concatenate arrays along an existing axis.
+
+    The result's dtype is the inputs' dtypes promoted as ``np.concatenate`` promotes
+    them (uint8 with uint16 gives uint16), and every read has it."""
     if not arrays:
         raise ValueError("Need at least one array to concatenate")
     return arrays[0]._with_transform(ConcatenateTransform(tuple(arrays), axis))
 
 
 def stack(arrays, axis=0):
-    """Stack arrays along a new axis."""
+    """Stack arrays along a new axis.
+
+    The result's dtype is the inputs' dtypes promoted as ``np.stack`` promotes them,
+    and every read has it."""
     if not arrays:
         raise ValueError("Need at least one array to stack")
     return arrays[0]._with_transform(StackTransform(tuple(arrays), axis))
