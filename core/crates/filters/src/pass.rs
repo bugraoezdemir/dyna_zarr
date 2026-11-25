@@ -10,7 +10,7 @@
 //!   generic_gradient_magnitude adds their squares and takes the square root
 //!   (gaussian_gradient_magnitude).
 
-use crate::correlate::{correlate1d_on, pass_bytes};
+use crate::correlate::{correlate1d_on, correlate1d_stepped, pass_bytes};
 use crate::running::{min_max1d_on, running_pass_bytes, uniform1d_on};
 use crate::{Element, FilterError, Mode, Span};
 
@@ -109,6 +109,63 @@ impl Pass {
                 parallel, input, shape, axis, *size, *origin, *minimum, mode, span, output,
             ),
         }
+    }
+}
+
+impl Pass {
+    /// [`Pass::run_on`] keeping only every `step`-th output along the pass's axis:
+    /// output k is position `span.out_start + k * step` (`span.out_len` outputs), each
+    /// with the value the whole pass gives it. A correlation computes only those; a
+    /// running window (uniform, minimum, maximum) slides over every position anyway, so it
+    /// computes the run from the first to the last and keeps every `step`-th.
+    pub fn run_stepped<T: Element, U: Element + Default>(
+        &self,
+        parallel: bool,
+        input: &[T],
+        shape: &[usize],
+        span: Span,
+        step: usize,
+        output: &mut [U],
+    ) -> Result<(), FilterError> {
+        if step <= 1 || span.out_len == 0 {
+            return self.run_on(parallel, input, shape, span, output);
+        }
+        if let Line::Correlate { weights, origin } = &self.line {
+            return correlate1d_stepped(
+                parallel, input, shape, self.axis, weights, *origin, self.mode, span, step,
+                output,
+            );
+        }
+        let a = self.axis;
+        let outer: usize = shape[..a].iter().product();
+        let inner: usize = shape[a + 1..].iter().product();
+        let run = (span.out_len - 1) * step + 1;
+        let mut all = vec![U::default(); outer * run * inner];
+        self.run_on(
+            parallel,
+            input,
+            shape,
+            Span {
+                out_len: run,
+                ..span
+            },
+            &mut all,
+        )?;
+        if output.len() != outer * span.out_len * inner {
+            return Err(FilterError::new(format!(
+                "output of {} elements; the pass keeps {}",
+                output.len(),
+                outer * span.out_len * inner
+            )));
+        }
+        for o in 0..outer {
+            for k in 0..span.out_len {
+                let from = (o * run + k * step) * inner;
+                let to = (o * span.out_len + k) * inner;
+                output[to..to + inner].copy_from_slice(&all[from..from + inner]);
+            }
+        }
+        Ok(())
     }
 }
 

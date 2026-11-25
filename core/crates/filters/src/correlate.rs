@@ -59,7 +59,7 @@ pub(crate) struct Layout {
     pub(crate) in_len: usize,
     pub(crate) inner: usize,
     pub(crate) out_len: usize,
-    /// out_len + taps - 1: the extended line's length
+    /// (out_len - 1) x step + taps: the extended line's length
     pub(crate) ext: usize,
     /// for every entry b of the extended line (position out_start + b - (taps / 2 + origin)),
     /// its row in the block, or None for the fill (constant mode)
@@ -67,6 +67,7 @@ pub(crate) struct Layout {
 }
 
 /// Check a pass's arguments and build its [`Layout`]; None when the output is empty.
+/// Output `k` is position `span.out_start + k * step`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn layout(
     input_len: usize,
@@ -77,7 +78,11 @@ pub(crate) fn layout(
     mode: Mode,
     span: Span,
     output_len: usize,
+    step: usize,
 ) -> Result<Option<Layout>, FilterError> {
+    if step == 0 {
+        return Err(FilterError::new("an output step of 0"));
+    }
     let nd = shape.len();
     if axis >= nd {
         return Err(FilterError::new(format!(
@@ -99,7 +104,12 @@ pub(crate) fn layout(
         )));
     }
     let in_len = shape[axis];
-    if span.start + in_len > span.len || span.out_start + span.out_len > span.len {
+    let reach_out = if span.out_len == 0 {
+        0
+    } else {
+        (span.out_len - 1) * step + 1
+    };
+    if span.start + in_len > span.len || span.out_start + reach_out > span.len {
         return Err(FilterError::new(format!(
             "{span:?} for a block {in_len} long on axis {axis}"
         )));
@@ -118,7 +128,7 @@ pub(crate) fn layout(
     }
     // The extended line, as scipy's line buffer: entry b is position
     // out_start + b - (size1 + origin).
-    let ext = out_len + taps - 1;
+    let ext = (out_len - 1) * step + taps;
     let first = span.out_start as i64 - size1 as i64 - origin as i64;
     let rows = (0..ext)
         .map(|b| match mode.index(first + b as i64, span.len as i64) {
@@ -204,6 +214,29 @@ pub fn correlate1d_on<T: Element, U: Element>(
     span: Span,
     output: &mut [U],
 ) -> Result<(), FilterError> {
+    correlate1d_stepped(
+        parallel, input, shape, axis, weights, origin, mode, span, 1, output,
+    )
+}
+
+/// [`correlate1d_on`] computing only every `step`-th position: output `k` along `axis`
+/// is position `span.out_start + k * step` (`span.out_len` outputs). Each output is the
+/// sum scipy computes for it, in scipy's order; the positions between are not computed
+/// (a filter followed by a stride: a 2 x 2 Gaussian downscale does about a third of the
+/// work).
+#[allow(clippy::too_many_arguments)]
+pub fn correlate1d_stepped<T: Element, U: Element>(
+    parallel: bool,
+    input: &[T],
+    shape: &[usize],
+    axis: usize,
+    weights: &[f64],
+    origin: isize,
+    mode: Mode,
+    span: Span,
+    step: usize,
+    output: &mut [U],
+) -> Result<(), FilterError> {
     let fs = weights.len();
     let Some(lay) = layout(
         input.len(),
@@ -214,6 +247,7 @@ pub fn correlate1d_on<T: Element, U: Element>(
         mode,
         span,
         output.len(),
+        step,
     )?
     else {
         return Ok(());
@@ -236,7 +270,11 @@ pub fn correlate1d_on<T: Element, U: Element>(
             for (b, r) in buf.iter_mut().zip(&rows) {
                 *b = r.map_or(k.cval, |r| line[r].to_f64());
             }
-            k.line(buf, acc);
+            if step == 1 {
+                k.line(buf, acc);
+            } else {
+                k.line_stepped(buf, step, acc);
+            }
             for (d, v) in dst.iter_mut().zip(acc.iter()) {
                 *d = U::from_f64(*v);
             }
@@ -259,13 +297,15 @@ pub fn correlate1d_on<T: Element, U: Element>(
         // by lane. The input rows a block needs are read as f64 once into a scratch of
         // (BLOCK + n - 1) x LANE; every output element then sums them in scipy's order.
         let block = |scratch: &mut Vec<f64>, o: usize, qb: usize, dst: &mut [U]| {
+            // outputs q0 .. q0 + qn read the extended rows from q0 x step on
             let (q0, qn) = (qb * BLOCK, dst.len() / inner);
-            let need = qn + fs - 1;
+            let need = (qn - 1) * step + fs;
+            let r0 = q0 * step;
             scratch.resize(need * LANE, 0.0);
             let base = o * in_len * inner;
             for l0 in (0..inner).step_by(LANE) {
                 let m = LANE.min(inner - l0);
-                for (rr, r) in rows[q0..q0 + need].iter().enumerate() {
+                for (rr, r) in rows[r0..r0 + need].iter().enumerate() {
                     let srow = &mut scratch[rr * LANE..rr * LANE + m];
                     match r {
                         Some(r) => {
@@ -278,7 +318,7 @@ pub fn correlate1d_on<T: Element, U: Element>(
                     }
                 }
                 for qi in 0..qn {
-                    k.lanes(scratch, qi + size1, m, &mut dst[qi * inner + l0..][..m]);
+                    k.lanes(scratch, qi * step + size1, m, &mut dst[qi * inner + l0..][..m]);
                 }
             }
         };
@@ -351,6 +391,39 @@ impl Kernel<'_> {
                     for (a, b) in acc.iter_mut().zip(&buf[t..t + m]) {
                         *a = madd(*a, *b, wt);
                     }
+                }
+            }
+        }
+    }
+
+    /// [`Self::line`] for every `step`-th output only: output k is centred on entry
+    /// k x step + size1 of `buf`. Each output's operations, and their order, are the same.
+    #[inline]
+    fn line_stepped(&self, buf: &[f64], step: usize, acc: &mut [f64]) {
+        let (w, s1, s2) = (self.w, self.size1, self.size2);
+        match self.sym {
+            1 | -1 => {
+                let unfused = unfused_taps(s1);
+                for (k, a) in acc.iter_mut().enumerate() {
+                    let c = k * step + s1;
+                    let mut v = buf[c] * w[s1];
+                    for j in (1..=s1).rev() {
+                        let (l, h) = (buf[c - j], buf[c + j]);
+                        let x = if self.sym == 1 { l + h } else { l - h };
+                        v = madd_tap(v, x, w[s1 - j], s1 - j < unfused);
+                    }
+                    *a = v;
+                }
+            }
+            _ => {
+                let last = s1 + s2;
+                for (k, a) in acc.iter_mut().enumerate() {
+                    let b0 = k * step;
+                    let mut v = buf[b0 + last] * w[last];
+                    for (t, &wt) in w[..last].iter().enumerate() {
+                        v = madd(v, buf[b0 + t], wt);
+                    }
+                    *a = v;
                 }
             }
         }
@@ -507,5 +580,55 @@ mod tests {
         assert_eq!(symmetry(&[-1.0, 0.0, 1.0]), -1);
         assert_eq!(symmetry(&[1.0, 2.0]), 0);
         assert_eq!(symmetry(&[1.0, 2.0, 3.0]), 0);
+    }
+
+    #[test]
+    fn stepped_outputs_are_the_whole_pass_decimated() {
+        // a 3-d block, every axis, steps 2..4, symmetric / antisymmetric / neither, a
+        // region inside and at the edges: bit for bit the kept positions of the full pass
+        let shape = [7usize, 23, 19];
+        let n: usize = shape.iter().product();
+        let xf: Vec<f64> = (0..n).map(|v| ((v * 7919) % 1013) as f64 / 7.0).collect();
+        let xi: Vec<u16> = (0..n).map(|v| ((v * 7919) % 60000) as u16).collect();
+        let weights: [&[f64]; 4] = [
+            &[0.0625, 0.25, 0.375, 0.25, 0.0625],
+            &[-0.5, 0.0, 0.5],
+            &[0.1, 0.5, 0.2, 0.15],
+            &[0.004, 0.054, 0.242, 0.4, 0.242, 0.054, 0.004],
+        ];
+        for w in weights {
+            for axis in 0..3 {
+                for step in [2usize, 3, 4] {
+                    for mode in [Mode::Reflect, Mode::Mirror, Mode::Nearest, Mode::Constant(2.5), Mode::Wrap] {
+                        let len = shape[axis];
+                        let full_f: Vec<f64> = whole(&xf, &shape, axis, w, mode);
+                        let full_i: Vec<u16> = whole(&xi, &shape, axis, w, mode);
+                        for phase in [0usize, 1] {
+                            let out_len = (len - phase).div_ceil(step);
+                            let mut oshape = shape;
+                            oshape[axis] = out_len;
+                            let m: usize = oshape.iter().product();
+                            let span = Span { len, start: 0, out_start: phase, out_len };
+                            let mut got_f = vec![0f64; m];
+                            let mut got_i = vec![0u16; m];
+                            correlate1d_stepped(false, &xf, &shape, axis, w, 0, mode, span, step, &mut got_f).unwrap();
+                            correlate1d_stepped(true, &xi, &shape, axis, w, 0, mode, span, step, &mut got_i).unwrap();
+                            let outer: usize = shape[..axis].iter().product();
+                            let inner: usize = shape[axis + 1..].iter().product();
+                            for o in 0..outer {
+                                for k in 0..out_len {
+                                    for l in 0..inner {
+                                        let a = (o * len + phase + k * step) * inner + l;
+                                        let b = (o * out_len + k) * inner + l;
+                                        assert_eq!(got_f[b].to_bits(), full_f[a].to_bits(), "{w:?} axis {axis} step {step} {mode:?}");
+                                        assert_eq!(got_i[b], full_i[a]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

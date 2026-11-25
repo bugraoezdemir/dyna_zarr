@@ -31,10 +31,20 @@ static POOLS: OnceLock<Mutex<HashMap<usize, Arc<rayon::ThreadPool>>>> = OnceLock
 
 /// A new pool of `threads` threads (at least 1), not shared with anyone.
 pub fn new_pool(threads: usize) -> Result<Arc<rayon::ThreadPool>, ReadError> {
+    new_pool_cached(threads, None)
+}
+
+/// A new pool of `threads` threads whose reads share `cache` (a write's decoded chunks,
+/// see [`crate::cache`]): every thread of the pool sees it, no other thread does.
+pub fn new_pool_cached(
+    threads: usize,
+    cache: Option<Arc<crate::cache::ChunkCache>>,
+) -> Result<Arc<rayon::ThreadPool>, ReadError> {
     let threads = threads.max(1);
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
         .thread_name(move |i| format!("dyna-zarr-core-{threads}-{i}"))
+        .start_handler(move |_| crate::cache::set_current(cache.clone()))
         .build()
         .map(Arc::new)
         .map_err(|e| ReadError::new(format!("cannot start {threads} threads: {e}")))

@@ -231,6 +231,9 @@ impl Window {
 }
 
 impl Source for Window {
+    fn reads_halo(&self) -> bool {
+        true
+    }
     fn shape(&self) -> &[u64] {
         self.src.shape()
     }

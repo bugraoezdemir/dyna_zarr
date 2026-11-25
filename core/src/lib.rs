@@ -80,6 +80,7 @@ fn dyna_zarr_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // lazy arrays (DR3)
     m.add_class::<arrays::Array>()?;
     m.add_class::<arrays::Pool>()?;
+    m.add_class::<arrays::Writer>()?;
     m.add_function(wrap_pyfunction!(arrays::memory_in_use, m)?)?;
     m.add_function(wrap_pyfunction!(arrays::memory_peak, m)?)?;
     m.add_function(wrap_pyfunction!(arrays::reset_memory_peak, m)?)?;

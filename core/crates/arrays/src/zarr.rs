@@ -18,7 +18,9 @@ use zarrs_zip::ZipStorageAdapter;
 use crate::dtype::DType;
 use crate::out::Out;
 use crate::pool::{install, new_pool};
-use crate::source::{bytes_of, region, Source, SMALL};
+use crate::blocks::Blocks;
+use crate::cache::ChunkCache;
+use crate::source::{bytes_of, c_strides, region, Source, SMALL};
 use crate::ReadError;
 
 /// Small allocations per chunk decoded (keys, subsets, codec state), on top of its
@@ -36,6 +38,8 @@ pub struct ZarrArray {
     unit: Vec<u64>,
     sharded: bool,
     zarr_format: u8,
+    /// Its id in a write's chunk cache.
+    id: u64,
 }
 
 impl ZarrArray {
@@ -116,6 +120,7 @@ impl ZarrArray {
             unit,
             sharded,
             zarr_format,
+            id: crate::cache::new_id(),
         })
     }
 
@@ -156,6 +161,84 @@ impl ZarrArray {
             .product()
     }
 
+    /// The region `start .. start + r` decoded straight into `out` (zarrs'
+    /// decode-into), at most `threads` units at once.
+    fn read_direct(
+        &self,
+        start: &[u64],
+        r: &[u64],
+        out: &Out,
+        threads: usize,
+    ) -> Result<(), ReadError> {
+        let r = r.to_vec();
+        let subset = ArraySubset::new_with_start_shape(start.to_vec(), r.clone())
+            .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
+        let target_subset = ArraySubset::new_with_start_shape(out.at.clone(), r)
+            .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
+        // SAFETY: the view covers only the region `out` was given, which no other
+        // concurrent read targets (the Out contract).
+        let mut view = unsafe {
+            ArrayBytesFixedDisjointView::new(out.buf, self.dtype.size(), &out.shape, target_subset)
+        }
+        .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
+        let options = Self::options(threads);
+        // one thread: on the calling thread, with no rayon work at all
+        let result = if threads <= 1 {
+            self.array
+                .retrieve_array_subset_into_opt(&subset, (&mut view).into(), &options)
+        } else {
+            install(threads, || {
+                self.array
+                    .retrieve_array_subset_into_opt(&subset, (&mut view).into(), &options)
+            })?
+        };
+        result.map_err(|e| ReadError::new(format!("{}: {e}", self.label)))
+    }
+
+
+    /// The region through `cache`: per unit it touches (the inner chunk when sharded),
+    /// the whole unit from the cache or decoded into it, and the region's part copied
+    /// out. At most `threads` units decoded at once, each with one thread.
+    fn read_cached(
+        &self,
+        cache: &ChunkCache,
+        start: &[u64],
+        r: &[u64],
+        out: &Out,
+        threads: usize,
+    ) -> Result<(), ReadError> {
+        let n = r.len();
+        let item = self.dtype.size();
+        let parts = Blocks::aligned(start, r, &self.unit);
+        crate::pool::pieces(parts.len(), threads, |k, _| {
+            let b = parts.get(k);
+            let first: Vec<u64> = (0..n).map(|i| start[i] + b[i].0).collect();
+            let index: Vec<u64> = (0..n).map(|i| first[i] / self.unit[i]).collect();
+            let origin: Vec<u64> = (0..n).map(|i| index[i] * self.unit[i]).collect();
+            let ushape: Vec<u64> = (0..n)
+                .map(|i| self.unit[i].min(self.shape[i] - origin[i]))
+                .collect();
+            let bytes = bytes_of(&ushape, item);
+            let data = cache.get_or_decode((self.id, index), bytes, || {
+                let mut buf = vec![0u8; bytes as usize];
+                {
+                    let o = Out::new(&mut buf, &ushape, &vec![0; n], self.dtype)?;
+                    self.read_direct(&origin, &ushape, &o, 1)?;
+                }
+                Ok(buf)
+            })?;
+            let strides = c_strides(&ushape, item);
+            let offset: usize = (0..n)
+                .map(|i| (first[i] - origin[i]) as usize * strides[i])
+                .sum();
+            let sub: Vec<u64> = b.iter().map(|(a, z)| z - a).collect();
+            let at: Vec<u64> = (0..n).map(|i| out.at[i] + b[i].0).collect();
+            out.moved(at)
+                .copy_from(&sub, &data[offset..], &strides, item, None);
+            Ok(())
+        })
+    }
+
     /// The shape of the first chunk (the read grid; with sharding, the shard).
     pub fn chunks(&self) -> &[u64] {
         &self.chunks
@@ -190,6 +273,9 @@ impl Source for ZarrArray {
         Some(self.unit.clone())
     }
 
+    /// Inside a write whose pool has a chunk cache ([`crate::cache`]): unit by unit
+    /// through it, each unit decoded whole once and its part copied. Otherwise decoded
+    /// straight into the destination.
     fn read_into(
         &self,
         start: &[u64],
@@ -202,30 +288,11 @@ impl Source for ZarrArray {
         if r.contains(&0) {
             return Ok(());
         }
-        let subset = ArraySubset::new_with_start_shape(start.to_vec(), r.clone())
-            .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
-        let target_subset = ArraySubset::new_with_start_shape(out.at.clone(), r)
-            .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
-        // SAFETY: the view covers only the region `out` was given, which no other
-        // concurrent read targets (the Out contract).
-        let mut view = unsafe {
-            ArrayBytesFixedDisjointView::new(out.buf, self.dtype.size(), &out.shape, target_subset)
+        match crate::cache::current() {
+            Some(cache) => self.read_cached(&cache, start, &r, out, threads),
+            None => self.read_direct(start, &r, out, threads),
         }
-        .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
-        let options = Self::options(threads);
-        // one thread: on the calling thread, with no rayon work at all
-        let result = if threads <= 1 {
-            self.array
-                .retrieve_array_subset_into_opt(&subset, (&mut view).into(), &options)
-        } else {
-            install(threads, || {
-                self.array
-                    .retrieve_array_subset_into_opt(&subset, (&mut view).into(), &options)
-            })?
-        };
-        result.map_err(|e| ReadError::new(format!("{}: {e}", self.label)))
     }
-
     /// Per unit decoded at once: its encoded bytes (at most about its decoded size), its
     /// decoded bytes and, for a partly read unit, the part taken out of it (measured:
     /// zarrs' partial decoders extract into a new buffer). Sharded: per shard open its
@@ -264,19 +331,24 @@ impl Source for ZarrArray {
         let units_open = units_open.min(n_units);
         let unit_bytes = bytes_of(&self.unit, self.dtype.size());
         let mut cost = units_open * (3 * unit_bytes + PER_CHUNK_EXTRA);
+        // the index: two u64 per inner chunk, read and decoded
+        let per_shard: u64 = (0..r.len())
+            .map(|i| self.chunks[i].div_ceil(self.unit[i]))
+            .product();
+        let index = if self.sharded { per_shard * 16 * 2 } else { 0 };
+        // through a write's chunk cache: up to `threads` units decoded at once, each on
+        // its own (a sharded unit reads its shard's index again); the cached units
+        // themselves are the write's, counted once in its budget
+        let cached = (t as u64).min(n_units) * (3 * unit_bytes + PER_CHUNK_EXTRA + index);
         if self.sharded {
             let shards_open = shards_open.min(n_chunks);
-            // the index: two u64 per inner chunk, read and decoded
-            let per_shard: u64 = (0..r.len())
-                .map(|i| self.chunks[i].div_ceil(self.unit[i]))
-                .product();
-            cost += shards_open * per_shard * 16 * 2;
+            cost += shards_open * index;
             if self.covers_a_chunk(start, &r) {
                 // encoded, at most about its decoded size plus a header per inner chunk
                 let shard = bytes_of(&self.chunks, self.dtype.size());
                 cost += shards_open * (shard + shard / 64 + per_shard * 64);
             }
         }
-        Ok(cost + SMALL)
+        Ok(cost.max(cached) + SMALL)
     }
 }

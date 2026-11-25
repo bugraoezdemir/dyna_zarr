@@ -113,7 +113,13 @@ def test_write_levels_plans_threads_with_the_engine_cost(sharded, tmp_path, caps
     threads = int(m.group(2))
     block = int(np.prod(region)) * 2
     per_thread = block + int(_lowering.lowered(v).cost([0, 0, 0], region, 1)) + block * (1 + 1 / 4)
-    assert threads == max(1, min(16, int(budget_mb * 2**20 // per_thread))), (line, per_thread)
+    # a filter's chunk cache comes off the budget first (test_engine_halo_cache)
+    along_last = -(-1024 // region[-1])
+    cache = sys.modules["dyna_zarr.io"]._halo_cache_bytes(v, region, along_last, 16,
+                                                         budget_mb * 2**20)
+    assert ("chunk cache" in line) == (cache > 0), line
+    assert threads == max(1, min(16, int((budget_mb * 2**20 - cache) // per_thread))), (
+        line, per_thread, cache)
 
 
 def test_write_levels_values_unchanged(sharded, tmp_path, engine):

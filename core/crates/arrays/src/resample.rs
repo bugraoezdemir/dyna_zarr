@@ -463,6 +463,9 @@ struct Job<'j, 'o> {
 }
 
 impl Source for Resample {
+    fn reads_halo(&self) -> bool {
+        true
+    }
     fn shape(&self) -> &[u64] {
         &self.shape
     }

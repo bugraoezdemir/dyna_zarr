@@ -322,7 +322,8 @@ def _run_fused(chunk_indices, input_shape, input_array, output, final_dtype, dev
                     data = _saturate_block(data, final_dtype)
                 if observe is not None:
                     observe(region, data)
-                output[region].write(data).result()
+                with engine_threads(region_threads):      # the engine writer's threads
+                    output[region].write(data).result()
                 del data
                 release()                     # glibc / macOS keep freed buffers (_release)
                 with lock:
@@ -1864,6 +1865,50 @@ def _region_cost(array, extent, shape, out_dtype):
             int(np.prod([int(e) for e in extent], dtype=np.int64)) * out_itemsize)
 
 
+#: the most a write's chunk cache takes without a memory budget (with one: a third of it)
+_HALO_CACHE_MAX = 512 << 20
+
+
+def _halo_cache_bytes(array, extent, along_last, threads, budget_bytes):
+    """Bytes of decoded chunks the engine keeps for a write over a filter or a
+    resampling (Workplan DR6, 2026-11-25), 0 for any other write.
+
+    A region's halo lies in its neighbours' chunks. Regions are written in C order (the
+    last axis fastest), so the neighbour before it along the second-to-last axis was
+    read ``along_last`` regions earlier: the cache holds about that many regions' input
+    and the ones in flight (``threads`` at most), halo included. Without it, every chunk
+    at a region's border was decoded once per region touching it (2.5 to 3.5 times for a
+    Gaussian downscale of real pyramids). Capped at a third of the budget, which the
+    caller then plans the regions without; and at ``_HALO_CACHE_MAX`` without a budget.
+    """
+    if not _reads_halo(array):
+        return 0
+    itemsize = int(_as_np_dtype(array.dtype).itemsize)
+    per_region = (int(np.prod([int(e) for e in extent], dtype=np.int64)) * itemsize
+                  * _chain_read_amplification(array))
+    want = int(1.5 * (int(along_last) + int(threads) + 2) * per_region)
+    cap = _HALO_CACHE_MAX if budget_bytes is None else int(budget_bytes // 3)
+    return max(0, min(want, cap))
+
+
+def _reads_halo(array):
+    """Whether the engine reads ``array`` and reading it reads a halo (a filter or a
+    resampling in the chain)."""
+    from . import _lowering
+    eng = _lowering.lowered(array)
+    return eng is not None and bool(getattr(eng, "reads_halo", False))
+
+
+def _claim_halo_cache(nbytes):
+    """Give the current write's engine pool a chunk cache of ``nbytes``: the bytes it
+    got (0 outside a write, or when its pool already runs without one)."""
+    if nbytes <= 0:
+        return 0
+    from ._scope import current
+    scope = current()
+    return int(nbytes) if scope is not None and scope.want_cache(nbytes) else 0
+
+
 def _plan_regions(array, bands, shape, max_threads, budget_bytes, python_bytes, out_bytes):
     """Decision DR-5's split of ``max_threads`` for io.write's fused loop:
     ``(regions in flight, threads per region, bytes of one region, fits)``.
@@ -2892,9 +2937,127 @@ def _open_output(spec: _OutputSpec):
     import tensorstore as ts
     scope = current_scope()
     if scope is None:
-        return ts.open(_ts_output_spec(spec), create=True).result()
-    # TensorStore's pools limited to the write's max_threads (decision DR-5, see _scope)
-    return ts.open(_ts_output_spec(spec), create=True, context=scope.ts_context()).result()
+        handle = ts.open(_ts_output_spec(spec), create=True).result()
+    else:
+        # TensorStore's pools limited to the write's max_threads (decision DR-5, _scope)
+        handle = ts.open(_ts_output_spec(spec), create=True,
+                         context=scope.ts_context()).result()
+    return _engine_output(spec, handle)
+
+
+class _EngineWrite:
+    """``out[region]`` of an :class:`_EngineOutput`: ``.write(data)`` stores the region
+    (done when it returns, so ``.result()`` has nothing to wait for); anything else is
+    TensorStore's view of the region."""
+
+    __slots__ = ("_out", "_region")
+
+    def __init__(self, out, region):
+        self._out, self._region = out, region
+
+    def write(self, data):
+        self._out.store(self._region, data)
+        return self
+
+    def result(self):
+        return None
+
+    def done(self):
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._out.handle[self._region], name)
+
+
+class _EngineOutput:
+    """A local output whose chunks the engine encodes and stores (zarrs, Workplan DR8),
+    behind TensorStore's write interface (``out[region].write(data).result()``), so
+    every writer (io.write's loops, write_levels) uses it unchanged.
+
+    TensorStore created the array, so its metadata is what dyna always wrote; zarrs
+    writes its chunks with the codecs that metadata names, without the GIL, on the
+    write's engine pool. Regions are cut on write units (the shard, when sharded) by the
+    writers, as for TensorStore. Anything but writing goes to the TensorStore handle.
+    """
+
+    def __init__(self, writer, handle):
+        self.writer, self.handle = writer, handle
+
+    def __getitem__(self, region):
+        return _EngineWrite(self, region)
+
+    def __getattr__(self, name):
+        return getattr(self.handle, name)
+
+    def store(self, region, data):
+        from . import _lowering
+        from ._scope import current
+        shape = tuple(int(x) for x in self.writer.shape)
+        box = _plain_box(region, shape)
+        if box is None:                                   # steps: TensorStore writes it
+            self.handle[region].write(data).result()
+            return
+        start, stop = box
+        want = np.dtype(self.writer.dtype)
+        data = np.asarray(data)
+        if data.dtype != want or not data.dtype.isnative:
+            data = data.astype(want.newbyteorder("="), copy=False)
+        extent = tuple(b - a for a, b in zip(start, stop))
+        if data.size == int(np.prod(extent, dtype=np.int64)):
+            data = data.reshape(extent)          # integer-indexed axes come back as 1
+        else:
+            data = np.broadcast_to(data, extent)  # a scalar or a broadcastable block
+        data = np.ascontiguousarray(data)
+        threads = max(1, int(_lowering._THREADS.get()))
+        scope = current()
+        pool = (None if scope is None or (threads == 1 and not scope.cache_bytes)
+                else scope.pool())
+        self.writer.store(list(start), data, threads=threads, pool=pool)
+
+
+def _plain_box(region, shape):
+    """``region`` (NumPy-style: slices, integers, an Ellipsis) as ``(start, stop)`` per
+    axis of ``shape``; None for a region with steps."""
+    key = region if isinstance(region, tuple) else (region,)
+    if any(k is Ellipsis for k in key):
+        i = next(j for j, k in enumerate(key) if k is Ellipsis)
+        key = key[:i] + (slice(None),) * (len(shape) - len(key) + 1) + key[i + 1:]
+    key = key + (slice(None),) * (len(shape) - len(key))
+    if len(key) != len(shape):
+        return None
+    start, stop = [], []
+    for k, n in zip(key, shape):
+        if isinstance(k, slice):
+            a, b, step = k.indices(n)
+            if step != 1:
+                return None
+            start.append(a)
+            stop.append(max(a, b))
+        elif isinstance(k, (int, np.integer)):
+            i = int(k) + (n if int(k) < 0 else 0)
+            start.append(i)
+            stop.append(i + 1)
+        else:
+            return None
+    return start, stop
+
+
+def _engine_output(spec, handle):
+    """``handle`` (a local TensorStore output just created), written by the engine when
+    it is on (decision 2026-11-25: whenever the engine is on, for local Zarr v2 / v3 /
+    sharded outputs); else, or when zarrs cannot write its codecs, ``handle`` itself."""
+    from . import _engine
+    if spec.remote or spec.zip_target is not None or not _engine.enabled():
+        return handle
+    if os.environ.get("DYNA_ZARR_ENGINE_WRITER", "1") == "0":
+        return handle
+    try:
+        writer = _engine.engine().Writer(str(spec.path))
+    except Exception as exc:                     # noqa: BLE001 - TensorStore writes it
+        _say(f"[Write] the engine cannot write {spec.path} ({exc}); TensorStore writes it",
+             flush=True)
+        return handle
+    return _EngineOutput(writer, handle)
 
 
 def _normalize_key(key, shape):
@@ -3679,10 +3842,22 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
                                   if decodes < before else "")
                                + (f"; {n} levels instead of {first_n} so that regions "
                                   f"hold whole read units" if n < first_n else ""))
+        # a chain over a filter keeps the chunks its regions' halos share (DR6), off the
+        # budget first unless one thread would not fit without it
+        along_last = -(-shape[-1] // region[-1])
+        cache_bytes = _halo_cache_bytes(
+            array, region, along_last, max_threads,
+            None if memory_budget_mb is None else float(memory_budget_mb) * 2**20)
+        if (cache_bytes and memory_budget_mb is not None
+                and float(memory_budget_mb) * 2**20 - cache_bytes < worker_cost(region)):
+            cache_bytes = 0
+        cache_bytes = _claim_halo_cache(cache_bytes)
+        if cache_bytes:
+            decode_note += f", chunk cache ~{cache_bytes / 2**20:.0f} MiB for the halos"
         if memory_budget_mb is not None:
             # as in io.write: the budget caps the threads (a ceiling, never a target)
             per_thread = max(1, int(worker_cost(region)))
-            affordable = int(float(memory_budget_mb) * 2**20 // per_thread)
+            affordable = int((float(memory_budget_mb) * 2**20 - cache_bytes) // per_thread)
             if affordable < 1:
                 _budget_too_small(memory_budget_mb, per_thread,
                                   f"one thread (a region of {region})",
@@ -3691,7 +3866,8 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
             max_threads = max(1, min(int(max_threads), affordable))
 
             def grow_to(mb, threads, now):
-                return max(now, min(int(threads), int(float(mb) * 2**20 // per_thread)))
+                return max(now, min(int(threads),
+                                    int((float(mb) * 2**20 - cache_bytes) // per_thread)))
         else:
             def grow_to(mb, threads, now):
                 return max(now, int(threads))
@@ -3743,15 +3919,24 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
         plan_note = ""
         planned_block = None
         slab = None
+        reserve = 0.0               # the budget kept for a filter's chunk cache
         if memory_budget_mb is not None and ndim >= 3:
             # the budget is what this write may ADD to the process (as in io.write); the
             # caller, who owns the process, accounts for what it already holds
             budget_bytes = float(memory_budget_mb) * 2**20
-            plan = _plan_xy_tiles(shape, factors, inner, level_shapes,
-                                  np.dtype(final_dtype).itemsize, budget_bytes,
-                                  src_unit, workers=max_threads, block_cost=worker_cost,
-                                  read_cost=cost, region_bytes=budget,
-                                  src_chunks=src_chunks)
+            # a chain over a filter keeps a third for its chunk cache (DR6), unless the
+            # smallest pass needs it
+            reserve = budget_bytes / 3 if _reads_halo(array) else 0.0
+
+            def xy_plan(b):
+                return _plan_xy_tiles(shape, factors, inner, level_shapes,
+                                      np.dtype(final_dtype).itemsize, b,
+                                      src_unit, workers=max_threads, block_cost=worker_cost,
+                                      read_cost=cost, region_bytes=budget,
+                                      src_chunks=src_chunks)
+            plan = xy_plan(budget_bytes - reserve)
+            if reserve and not plan["fits"]:
+                reserve, plan = 0.0, xy_plan(budget_bytes)
             n, max_threads, planned_block = plan["n"], plan["workers"], plan["block"]
             slab = plan["slab"]
             ty, tx = plan["tile"]
@@ -3789,6 +3974,13 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
                 u = lcm(c, w)
                 first.append(lim if c == lim else (u if u <= lim else min(w, lim)))
             block = grown(tuple(first), tile)
+        # blocks go row by row inside a tile: a block's halo reaches the row before it
+        cache_bytes = _halo_cache_bytes(
+            array, block, -(-tile[-1] // block[-1]), max_threads,
+            None if memory_budget_mb is None else 3 * reserve)
+        cache_bytes = _claim_halo_cache(cache_bytes)
+        if cache_bytes:
+            plan_note += f", chunk cache ~{cache_bytes / 2**20:.0f} MiB for the halos"
         handles = [_open_output(spec) for spec in specs[:n]]
         zip_outputs = [h for h in handles if hasattr(h, "unit_written")]
         if backend == "tensorstore":
@@ -4597,9 +4789,21 @@ def _write_array(
         # max_threads = every thread the write keeps busy (decision DR-5): regions in
         # flight x threads per region, TensorStore's pools limited to it (see _scope).
         # A budget caps the regions (a ceiling, never a target); the floor is one region.
-        workers, per_region, region_bytes, fits = _plan_regions(
-            input_array, chunk_indices, input_shape, requested_workers, budget_bytes,
+        # a write over a filter keeps the chunks its regions' halos share (DR6): the
+        # cache comes off the budget first, unless one region would not fit without it
+        cache_bytes = _halo_cache_bytes(input_array, _max_extent,
+                                        len({b[-1] for b in chunk_indices}),
+                                        requested_workers, budget_bytes)
+        plan = _plan_regions(
+            input_array, chunk_indices, input_shape, requested_workers,
+            None if budget_bytes is None else budget_bytes - cache_bytes,
             worker_bytes, out_bytes)
+        if cache_bytes and not plan[3]:
+            cache_bytes = 0
+            plan = _plan_regions(input_array, chunk_indices, input_shape,
+                                 requested_workers, budget_bytes, worker_bytes, out_bytes)
+        workers, per_region, region_bytes, fits = plan
+        cache_bytes = _claim_halo_cache(cache_bytes)
         if not fits:
             _budget_too_small(
                 memory_budget_mb, region_bytes,
@@ -4638,15 +4842,17 @@ def _write_array(
     # Everything above - output, regions, bands - is shared by both engines, so they write
     # exactly the same regions; only the execution loop below differs.
     if engine == "fused":
+        cache_note = (f", chunk cache ~{_mib(cache_bytes)} for the halos"
+                      if cache_bytes else "")
         if per_region > 1:
             _say(f"[Optimized] Engine: fused, {workers * per_region} threads ({workers} "
                  f"region{'s' if workers > 1 else ''} at a time, each read with "
                  f"{per_region} engine threads; ~{_mib(workers * region_bytes)} at "
-                 f"~{_mib(region_bytes)}/region)", flush=True)
+                 f"~{_mib(region_bytes)}/region{cache_note})", flush=True)
         else:
             _say(f"[Optimized] Engine: fused, {workers} threads (each reads and writes its "
                  f"own region; ~{_mib(workers * region_bytes)} at ~{_mib(region_bytes)}"
-                 f"/thread)", flush=True)
+                 f"/thread{cache_note})", flush=True)
         try:
             _run_fused(chunk_indices, input_shape, input_array, output, final_dtype_obj,
                        device, workers, early_tenth_timeout=early_tenth_timeout,

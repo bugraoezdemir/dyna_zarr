@@ -283,6 +283,9 @@ impl Mean {
 }
 
 impl Source for Mean {
+    fn reads_halo(&self) -> bool {
+        self.src.reads_halo()
+    }
     fn shape(&self) -> &[u64] {
         &self.shape
     }
@@ -374,6 +377,9 @@ impl Mean {
     fn blocks(&self, start: &[u64], r: &[u64], _threads: usize) -> Option<Blocks> {
         if r.contains(&0) {
             return None;
+        }
+        if self.src.reads_halo() {
+            return None; // over a filter: large pieces, not one per chunk (see split)
         }
         let grid = self.src.grid()?;
         let unit: Vec<u64> = (0..r.len())
@@ -756,6 +762,9 @@ impl Gaussian {
 }
 
 impl Source for Gaussian {
+    fn reads_halo(&self) -> bool {
+        true
+    }
     fn shape(&self) -> &[u64] {
         &self.shape
     }
