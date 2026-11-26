@@ -1679,6 +1679,20 @@ def _default_chunks(shape, dtype, target_mb=_DEFAULT_CHUNK_MB, input_chunks=None
     return tuple(chunk)
 
 
+def _storage_grid(array):
+    """The input grid an output may inherit: ``array.chunks``, or None when that grid
+    only stages a NumPy array in memory (from_array(numpy) without chunks=).
+
+    The staging grid is ~32 MiB over the trailing axes (1024 x 16384 for a 16k uint16
+    image), chosen for reads. Inherited, it wrote strips instead of dyna's ~1 MiB
+    near-cubes (Workplan D10). Region reads still align to it: only the choice of
+    output chunks ignores it.
+    """
+    if getattr(array, "_staging_grid", False):
+        return None
+    return getattr(array, "chunks", None)
+
+
 def _as_np_dtype(dt):
     """numpy dtype for ``dt``, which may be a TensorStore dtype.
 
@@ -2702,7 +2716,7 @@ def _resolve_output(array, output_path, *, max_threads, num_readers, chunks, chu
     # A neighbourhood op reads its region PLUS a halo on every side, so the region
     # has to be shaped against that work and not only against the I/O grid.
     final_chunks, solved_region, notes = _solve_grids(
-        tuple(array.shape), getattr(array, "chunks", None), final_dtype,
+        tuple(array.shape), _storage_grid(array), final_dtype,
         _widest_dtype(_chain_widest_dtype(array), final_dtype),
         chunks=chunks, chunk_mb=chunk_size_mb,
         region_shape=region_shape, region_mb=_solver_region_mb,
@@ -3719,7 +3733,7 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
     ndim = len(shape)
     final_dtype = _as_np_dtype(dtype) if dtype is not None else _as_np_dtype(array.dtype)
     budget = float(_DEFAULT_REGION_MB if region_size_mb is None else region_size_mb) * 2**20
-    base_chunks = getattr(array, "chunks", None)
+    base_chunks = _storage_grid(array)
 
     # --- resolve every output (validated, nothing created) ---------------------------
     specs, factors = [], []
