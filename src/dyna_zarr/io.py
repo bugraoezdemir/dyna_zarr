@@ -2285,8 +2285,9 @@ def _shard_assembly_ok(specs) -> bool:
 
 
 class _WholeChunkOutput:
-    """An unsharded output in the chunk-by-chunk mode: a completed chunk is a whole
-    write unit, written as it is."""
+    """An output in the chunk-by-chunk mode written through its own handle: unsharded,
+    a completed chunk is a whole write unit, written as it is; an engine-written sharded
+    one appends the inner chunk to its shard (see _EngineOutput)."""
 
     __slots__ = ("_handle",)
 
@@ -2297,6 +2298,30 @@ class _WholeChunkOutput:
         self._handle[region].write(np.ascontiguousarray(data)).result()
 
 
+class _EngineShardOutput:
+    """A sharded output in the chunk-by-chunk mode written by the engine: each completed
+    inner chunk is encoded and appended to its shard's file, and the shard's index is
+    written once, when its last inner chunk is in (``Writer.append``); ``finish`` closes
+    the shards still open."""
+
+    __slots__ = ("_out",)
+
+    def __init__(self, out):
+        self._out = out
+
+    def append_chunk(self, region, data):
+        box = _plain_box(region, tuple(int(x) for x in self._out.writer.shape))
+        want = np.dtype(self._out.writer.dtype)
+        data = np.asarray(data)
+        if data.dtype != want or not data.dtype.isnative:
+            data = data.astype(want.newbyteorder("="), copy=False)
+        extent = tuple(b - a for a, b in zip(*box))
+        self._out.writer.append(list(box[0]), np.ascontiguousarray(data.reshape(extent)))
+
+    def finish(self):
+        self._out.writer.finish_shards()
+
+
 def _chunk_output(spec, handle):
     """``append_chunk`` for a TensorStore-created output: dyna's shard writer for a
     sharded one (refused loudly if its metadata is not one it writes), else whole
@@ -2305,6 +2330,12 @@ def _chunk_output(spec, handle):
         return _WholeChunkOutput(handle)
     if spec.zip_target is not None:
         return handle.chunk_output()             # shards in temporary files, then the zip
+    if isinstance(handle, _EngineOutput):
+        # the engine writer appends each inner chunk to its shard, the shard's index
+        # written once when its last chunk is in
+        if handle.writer.appends:
+            return _EngineShardOutput(handle)
+        return _WholeChunkOutput(handle)      # zarrs' partial encoding, chunk by chunk
     from ._shard_writer import ShardAssembler
     return ShardAssembler(spec.path)
 
@@ -2916,7 +2947,8 @@ def _open_output(spec: _OutputSpec):
             ts.Context.Spec({"memory_key_value_store": {}}), parent=scope.ts_context())
         handle = ts.open(ts_spec, create=True, context=context).result()
         return ZipOutput(spec.zip_target, spec.zip_key, handle, shape=spec.shape,
-                         chunks=spec.chunks, shards=spec.shards, zarr_format=spec.zarr_format)
+                         chunks=spec.chunks, shards=spec.shards, zarr_format=spec.zarr_format,
+                         engine=_engine_writes(spec, zip_ok=True))
     if spec.existing is not None:
         # _resolve_output already refused everything but a zarr store with overwrite=True
         _delete_output(spec)
@@ -3040,6 +3072,41 @@ def _plain_box(region, shape):
         else:
             return None
     return start, stop
+
+
+def _engine_writes(spec, zip_ok: bool = False) -> bool:
+    """Whether ``_open_output`` will give ``spec``'s output to the engine writer (an
+    output into a zip too with ``zip_ok``: its units are then files moved into the zip)."""
+    from . import _engine
+    return (not spec.remote and (zip_ok or spec.zip_target is None)
+            and spec.backend == "tensorstore"
+            and os.environ.get("DYNA_ZARR_ENGINE_WRITER", "1") != "0" and _engine.enabled())
+
+
+def _writer_bytes(spec, extent, itemsize, threads=1):
+    """What the engine writer holds while storing a region of ``extent`` of ``spec``'s
+    output, beyond the region itself: per write unit in flight (at most ``threads``) its
+    encoded bytes and, when the region spans several units or part of a shard, a copy of
+    the unit's part; a shard's index; small allocations (16 KiB, as the engine's reads).
+    0 when TensorStore writes the output (its buffers are not counted: a known gap,
+    Workplan t-DR6)."""
+    if not _engine_writes(spec):
+        return 0
+    unit = spec.shards if spec.shards is not None else spec.chunks
+    if unit is None:
+        return 0
+    extent = [int(e) for e in extent]
+    sharded = spec.shards is not None and spec.chunks is not None
+    partial = sharded and any(e < int(u) for e, u in zip(extent, unit))
+    unit = [min(int(u), e) for u, e in zip(unit, extent)]
+    unit_bytes = int(np.prod(unit, dtype=np.int64)) * int(itemsize)
+    region_bytes = int(np.prod(extent, dtype=np.int64)) * int(itemsize)
+    units = int(np.prod([-(-e // u) for e, u in zip(extent, unit)], dtype=np.int64))
+    index = (32 * int(np.prod([-(-int(s) // int(c)) for s, c in zip(spec.shards, spec.chunks)],
+                              dtype=np.int64)) if sharded else 0)
+    per_unit = unit_bytes * (2 if units > 1 or partial else 1) + (16 << 10) + index
+    return int(min(max(1, min(int(threads), units)) * per_unit,
+                   2 * region_bytes + (16 << 10) + index))
 
 
 def _engine_output(spec, handle):
@@ -3721,10 +3788,16 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
     def worker_cost(region):
         """A write_levels worker's memory for one block: the block read (``read_cost``),
         and every level's output computed from it (with, for an output into a zip, the
-        encoded unit and its copy on the way in)."""
+        encoded unit and its copy on the way in; with the engine writer, its buffers)."""
         _, out_bytes = _region_cost(array, region, shape, final_dtype)
         levels_out = sum(out_bytes / float(np.prod(f, dtype=np.int64)) for f in factors)
-        return int(read_cost(region) + levels_out * (1 + zip_extra))
+        itemsize = np.dtype(final_dtype).itemsize
+        # chunk by chunk (shards larger than a block) the writer stores one completed
+        # inner chunk at a time; otherwise each level's block
+        writer = sum(_writer_bytes(sp, sp.chunks if streamed else
+                                   [-(-int(r) // int(k)) for r, k in zip(region, f)],
+                                   itemsize) for sp, f in zip(specs, factors))
+        return int(read_cost(region) + levels_out * (1 + zip_extra) + writer)
 
     def grown(start, limit):
         """``start`` grown to the budget, innermost axis first (contiguous reads), in
@@ -4759,6 +4832,9 @@ def _write_array(
         for _a, (_lo, _hi) in enumerate(_band):
             _max_extent[_a] = max(_max_extent[_a], min(_hi, input_shape[_a]) - _lo)
     read_bytes, out_bytes = _region_cost(array, _max_extent, input_shape, final_dtype_obj)
+    # the engine writer's buffers while it stores a region (one engine thread per region
+    # stores it; more only when few regions share max_threads, see _plan_regions)
+    out_bytes += _writer_bytes(spec, _max_extent, np.dtype(final_dtype_obj).itemsize)
     # A region being read and transformed holds the source data and the chain's result
     # (both in the widest dtype, over the halo-padded region) plus the output buffer.
     # Queued and in-flight regions (pipeline) hold only the output and its encoded copy.

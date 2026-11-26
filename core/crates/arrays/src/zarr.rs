@@ -12,7 +12,7 @@ use zarrs::array::{
 };
 use zarrs::filesystem::FilesystemStore;
 use zarrs::plugin::{ExtensionName, ZarrVersion};
-use zarrs::storage::{ReadableStorage, StoreKey};
+use zarrs::storage::{ReadableStorage, StorageError, StoreKey};
 use zarrs_zip::ZipStorageAdapter;
 
 use crate::dtype::DType;
@@ -27,6 +27,146 @@ use crate::ReadError;
 /// encoded and decoded bytes.
 const PER_CHUNK_EXTRA: u64 = 16 << 10;
 
+/// A local folder read as zarrs' file store reads it, with one difference: while reads
+/// of the array run, the files they open stay open and are shared (a sharded array's
+/// inner chunks come from few files, each then opened once instead of once per inner
+/// chunk). When no read runs, nothing is kept open, so a change on disk between reads is
+/// always seen (zarrs' own handle cache keeps handles for the store's lifetime).
+///
+/// Measured 2026-11-26 (MouseBrain v3, sharded, every 2nd pixel, write_levels' blocks of
+/// 8 inner chunks): opening the shard file per inner chunk made a block's read 8.0 ms at
+/// 4 threads (6.7 ms on one), against TensorStore's 5.8; with the files shared 6.2 ms.
+pub struct ReadStore {
+    base: std::path::PathBuf,
+    active: std::sync::atomic::AtomicUsize,
+    open: std::sync::Mutex<std::collections::HashMap<String, Option<Arc<(std::fs::File, u64)>>>>,
+}
+
+/// Ends a read of a [`ReadStore`] (the files close when the last read ends).
+pub struct Reading<'a>(&'a ReadStore);
+
+impl Drop for Reading<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        if self.0.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if let Ok(mut open) = self.0.open.lock() {
+                // a read that started meanwhile reopens what it needs
+                if self.0.active.load(Ordering::Acquire) == 0 {
+                    open.clear();
+                }
+            }
+        }
+    }
+}
+
+impl ReadStore {
+    fn new(base: &Path) -> Self {
+        Self {
+            base: base.to_path_buf(),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            open: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Files opened until the returned guard drops are shared by the reads running.
+    pub fn reading(&self) -> Reading<'_> {
+        self.active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Reading(self)
+    }
+
+    fn path(&self, key: &StoreKey) -> std::path::PathBuf {
+        let mut p = self.base.clone();
+        let k = key.as_str();
+        if !k.is_empty() {
+            p.push(k.strip_prefix('/').unwrap_or(k));
+        }
+        p
+    }
+
+    fn file(&self, key: &StoreKey) -> Result<Option<Arc<(std::fs::File, u64)>>, StorageError> {
+        let opened = || -> Result<Option<Arc<(std::fs::File, u64)>>, StorageError> {
+            match std::fs::File::open(self.path(key)) {
+                Ok(f) => {
+                    let size = f.metadata()?.len();
+                    Ok(Some(Arc::new((f, size))))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        };
+        if self.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return opened();
+        }
+        if let Some(f) = self.open.lock().ok().and_then(|m| m.get(key.as_str()).cloned()) {
+            return Ok(f);
+        }
+        let f = opened()?;
+        if let Ok(mut m) = self.open.lock() {
+            m.insert(key.as_str().to_string(), f.clone());
+        }
+        Ok(f)
+    }
+}
+
+/// `buf.len()` bytes of `f` from `offset`.
+fn read_exact_at(f: &std::fs::File, mut buf: &mut [u8], mut offset: u64) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(f, buf, offset)?;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(f, buf, offset)?;
+        if n == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "a read past the end of the file",
+            ));
+        }
+        buf = &mut buf[n..];
+        offset += n as u64;
+    }
+    Ok(())
+}
+
+impl zarrs::storage::ReadableStorageTraits for ReadStore {
+    fn get_partial_many<'a>(
+        &'a self,
+        key: &StoreKey,
+        byte_ranges: zarrs::storage::byte_range::ByteRangeIterator<'a>,
+    ) -> Result<zarrs::storage::MaybeBytesIterator<'a>, StorageError> {
+        use zarrs::storage::byte_range::{ByteRange, InvalidByteRangeError};
+        let Some(handle) = self.file(key)? else {
+            return Ok(None);
+        };
+        let (file, size) = (&handle.0, handle.1);
+        let out = byte_ranges
+            .map(|r| {
+                let offset = match r {
+                    ByteRange::FromStart(o, _) => o,
+                    ByteRange::Suffix(len) => size.saturating_sub(len),
+                };
+                let len = match r {
+                    ByteRange::FromStart(o, None) => size.checked_sub(o).ok_or_else(|| {
+                        StorageError::from(InvalidByteRangeError::new(r, size))
+                    })?,
+                    ByteRange::FromStart(_, Some(len)) | ByteRange::Suffix(len) => len,
+                };
+                let mut buf = vec![0u8; len as usize];
+                read_exact_at(file, &mut buf, offset)?;
+                Ok(zarrs::storage::Bytes::from(buf))
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(Box::new(out.into_iter())))
+    }
+
+    fn size_key(&self, key: &StoreKey) -> Result<Option<u64>, StorageError> {
+        Ok(std::fs::metadata(self.path(key)).ok().map(|m| m.len()))
+    }
+
+    fn supports_get_partial(&self) -> bool {
+        true
+    }
+}
+
 /// A Zarr array, opened read-only.
 pub struct ZarrArray {
     array: Array<dyn zarrs::storage::ReadableStorageTraits>,
@@ -40,14 +180,17 @@ pub struct ZarrArray {
     zarr_format: u8,
     /// Its id in a write's chunk cache.
     id: u64,
+    /// The local folder's files, shared while reads run (None: inside a zip).
+    files: Option<Arc<ReadStore>>,
 }
 
 impl ZarrArray {
     /// The array stored in the local folder `path`.
     pub fn open(path: &Path) -> Result<Self, ReadError> {
-        let store = FilesystemStore::new(path)
-            .map_err(|e| ReadError::new(format!("cannot open {}: {e}", path.display())))?;
-        Self::from_storage(Arc::new(store), "/", path.display().to_string())
+        let store = Arc::new(ReadStore::new(path));
+        let mut a = Self::from_storage(store.clone(), "/", path.display().to_string())?;
+        a.files = Some(store);
+        Ok(a)
     }
 
     /// The array at `inner` (a path inside the zip, "" for its root) in the zip file
@@ -121,6 +264,7 @@ impl ZarrArray {
             sharded,
             zarr_format,
             id: crate::cache::new_id(),
+            files: None,
         })
     }
 
@@ -256,6 +400,14 @@ impl ZarrArray {
 }
 
 impl Source for ZarrArray {
+    fn stores(&self, out: &mut Vec<Arc<ReadStore>>) {
+        if let Some(f) = &self.files {
+            if !out.iter().any(|g| Arc::ptr_eq(g, f)) {
+                out.push(f.clone());
+            }
+        }
+    }
+
     fn shape(&self) -> &[u64] {
         &self.shape
     }
@@ -288,6 +440,7 @@ impl Source for ZarrArray {
         if r.contains(&0) {
             return Ok(());
         }
+        let _reading = self.files.as_ref().map(|f| f.reading());
         match crate::cache::current() {
             Some(cache) => self.read_cached(&cache, start, &r, out, threads),
             None => self.read_direct(start, &r, out, threads),
@@ -350,5 +503,47 @@ impl Source for ZarrArray {
             }
         }
         Ok(cost.max(cached) + SMALL)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::read;
+    use zarrs::array::{data_type, ArrayBuilder};
+
+    fn write(dir: &Path, v: u16) {
+        let store = Arc::new(FilesystemStore::new(dir).unwrap());
+        let mut b = ArrayBuilder::new(vec![4, 64, 64], vec![4, 32, 32], data_type::uint16(), 0u16);
+        b.subchunk_shape(vec![4, 16, 16]);
+        let a = b.build(store, "/").unwrap();
+        a.store_metadata().unwrap();
+        let data = vec![v; 4 * 64 * 64];
+        a.store_array_subset(&ArraySubset::new_with_shape(vec![4, 64, 64]), data.as_slice()).unwrap();
+    }
+
+    #[test]
+    fn a_rewritten_array_is_read_anew_and_reads_share_files() {
+        let dir = std::env::temp_dir().join(format!("dyna_readstore_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        write(&dir, 7);
+        let a = ZarrArray::open(&dir).unwrap();
+        let first = read(&a, &[0, 0, 0], &[4, 64, 64], 4).unwrap();
+        assert!(first.chunks_exact(2).all(|b| u16::from_ne_bytes([b[0], b[1]]) == 7));
+        // nothing is kept open between reads
+        assert!(a.files.as_ref().unwrap().open.lock().unwrap().is_empty());
+        write(&dir, 9); // rewritten on disk, the same ZarrArray read again
+        let second = read(&a, &[0, 0, 0], &[4, 64, 64], 4).unwrap();
+        assert!(second.chunks_exact(2).all(|b| u16::from_ne_bytes([b[0], b[1]]) == 9));
+        // during a read, the shards' files are opened once and shared
+        let files = a.files.as_ref().unwrap();
+        {
+            let _r = files.reading();
+            read(&a, &[0, 0, 0], &[4, 64, 64], 2).unwrap();
+            assert_eq!(files.open.lock().unwrap().len(), 4); // 4 shards
+        }
+        assert!(files.open.lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

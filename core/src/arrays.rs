@@ -176,17 +176,60 @@ impl Writer {
         let w = self.writer.clone();
         let pool = pool.map(|p| p.pool.clone());
         py.detach(move || {
-            let run = move || {
-                // SAFETY: the buffer export above keeps the memory alive and unchanged
-                // in size for the call; it is only read
-                let b = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
-                w.store(&start, &shape, b, threads)
-            };
-            ar::pool::enter(threads, pool.as_deref(), run)?
+            // SAFETY: the buffer export above keeps the memory alive and unchanged in
+            // size for the call; it is only read
+            let b = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+            // on this (Python) thread: the writer takes its unit locks before the pool
+            w.store(&start, &shape, b, threads, pool.as_deref())
         })
         .map_err(err)?;
         drop(buf);
         Ok(())
+    }
+
+    /// Whether `append` can append inner chunks to this array's shards (a sharded array
+    /// with its index at the end).
+    #[getter]
+    fn appends(&self) -> bool {
+        self.writer.appends()
+    }
+
+    /// Append the inner chunk `data` (cut at the array's end) at `start` to its shard;
+    /// the shard's index is written when its last inner chunk is in (or by
+    /// `finish_shards`). Without the GIL.
+    fn append(&self, py: Python<'_>, start: Vec<u64>, data: Bound<'_, PyAny>) -> PyResult<()> {
+        let dtype = self.writer.dtype();
+        let name: String = data.getattr("dtype")?.getattr("name")?.extract()?;
+        let native: bool = data.getattr("dtype")?.getattr("isnative")?.extract()?;
+        let contiguous: bool = data.getattr("flags")?.getattr("c_contiguous")?.extract()?;
+        if name != dtype.name() || !native || !contiguous {
+            return Err(PyValueError::new_err(format!(
+                "data must be a C-contiguous {} NumPy array in native byte order",
+                dtype.name()
+            )));
+        }
+        let shape: Vec<u64> = data.getattr("shape")?.extract()?;
+        let bytes = data
+            .call_method1("reshape", (-1,))?
+            .call_method1("view", ("u1",))?;
+        let buf: PyBuffer<u8> = PyBuffer::get(&bytes)?;
+        let (ptr, len) = (buf.buf_ptr() as usize, buf.len_bytes());
+        let w = self.writer.clone();
+        py.detach(move || {
+            // SAFETY: the buffer export above keeps the memory alive and unchanged in
+            // size for the call; it is only read
+            let b = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+            w.append(&start, &shape, b)
+        })
+        .map_err(err)?;
+        drop(buf);
+        Ok(())
+    }
+
+    /// Close every shard still open (its index written).
+    fn finish_shards(&self, py: Python<'_>) -> PyResult<()> {
+        let w = self.writer.clone();
+        py.detach(move || w.finish_shards()).map_err(err)
     }
 
     fn __repr__(&self) -> String {
@@ -292,6 +335,10 @@ impl Array {
         let (ptr, len) = (buf.buf_ptr() as usize, buf.len_bytes());
         let src = self.src.clone();
         py.detach(move || {
+            // the read's pieces share the files they open (local arrays: ar::ReadStore)
+            let mut stores = Vec::new();
+            src.stores(&mut stores);
+            let _held: Vec<_> = stores.iter().map(|s| s.reading()).collect();
             let run = move || {
                 // SAFETY: the buffer export above keeps the memory alive and in place for
                 // the call; the region written lies inside it (Out::new and read_into

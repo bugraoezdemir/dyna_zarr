@@ -283,6 +283,9 @@ impl Mean {
 }
 
 impl Source for Mean {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn reads_halo(&self) -> bool {
         self.src.reads_halo()
     }
@@ -762,6 +765,9 @@ impl Gaussian {
 }
 
 impl Source for Gaussian {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn reads_halo(&self) -> bool {
         true
     }

@@ -135,3 +135,86 @@ def test_the_writer_refuses_what_it_cannot_store(tmp_path):
         w.store([3, 0, 0], np.zeros((2, 16, 16), "uint16"))                # past the end
     w.store([0, 0, 0], np.full((2, 16, 16), 7, "uint16"), threads=2)
     assert (np.asarray(zarr.open_array(src)[:2, :16, :16]) == 7).all()
+
+
+def test_big_shards_chunk_by_chunk_go_through_the_engine(tmp_path, monkeypatch):
+    """write_levels' bounded mode (shards larger than a region) appends inner chunks
+    to their shards with the engine writer (zarrs' partial encoding), not dyna's Python
+    shard assembler; the shards hold no dead space."""
+    import dyna_zarr._shard_writer as sw
+
+    def refused(*a, **k):
+        raise AssertionError("the Python shard assembler was used")
+    src = tmp_path / "src.zarr"
+    data = _data("uint16", (16, 128, 128))
+    zarr.create_array(str(src), shape=data.shape, chunks=(16, 64, 64),
+                      dtype="uint16")[:] = data
+    outs = lambda root: [{"path": f"{root}/0", "factors": (1, 1, 1),
+                          "shard_coefficients": (1, 2, 2), "chunks": (4, 32, 32)},
+                         {"path": f"{root}/1", "factors": (1, 2, 2),
+                          "shard_coefficients": (1, 2, 2), "chunks": (4, 32, 32)}]
+    a = io.read(str(src))
+    monkeypatch.setattr(sw, "ShardAssembler", refused)
+    with io.capture_messages() as messages:
+        io.write_levels(a, outs(tmp_path / "e"), method="mean", region_size_mb=0.02,
+                        zarr_format=3, max_threads=4)
+    assert any("appended to their shards" in m for m in messages), messages
+    monkeypatch.undo()
+    monkeypatch.setattr(_engine, "_choice", True)
+    monkeypatch.setenv("DYNA_ZARR_ENGINE_WRITER", "0")
+    io.write_levels(a, outs(tmp_path / "t"), method="mean", region_size_mb=0.02,
+                    zarr_format=3, max_threads=4)
+    for lvl in ("0", "1"):
+        e, t = str(tmp_path / "e" / lvl), str(tmp_path / "t" / lvl)
+        assert _meta(e) == _meta(t)
+        np.testing.assert_array_equal(np.asarray(zarr.open_array(e)[:]),
+                                      np.asarray(zarr.open_array(t)[:]))
+        size = lambda d: sum(os.path.getsize(os.path.join(r, f))
+                             for r, _, fs in os.walk(d) for f in fs)
+        assert size(e) <= size(t) * 1.02, (lvl, size(e), size(t))
+
+
+@pytest.mark.parametrize("fmt", ["v2", "v3", "sharded"])
+def test_zip_outputs_are_written_by_the_engine(tmp_path, monkeypatch, fmt):
+    """Inside a zip the engine writer stores the units as files next to it, each moved
+    into the zip when complete: the same entries, metadata and values as TensorStore's."""
+    import zipfile
+    from dyna_zarr import _zip
+    seen = []
+    orig = _zip.ZipOutput._engine_output
+
+    def spy(self, metadata):
+        out = orig(self, metadata)
+        seen.append(out is not None)
+        return out
+    monkeypatch.setattr(_zip.ZipOutput, "_engine_output", spy)
+    src = tmp_path / "src.zarr"
+    kw = {"zarr_format": 2} if fmt == "v2" else {}
+    if fmt == "sharded":
+        kw["shards"] = (6, 32, 64)
+    zarr.create_array(str(src), shape=(6, 70, 90), chunks=(2, 16, 32), dtype="uint16",
+                      **kw)[:] = _data("uint16")
+    a = io.read(str(src))
+
+    def write(name):
+        with io.open_zip(tmp_path / name) as z:
+            io.write(a, z / "0", max_threads=3)
+            io.write_levels(a, [{"path": z / "L1", "factors": (1, 2, 2)}], method="mean",
+                            max_threads=3)
+    write("e.zip")
+    assert seen and all(seen)
+    monkeypatch.setenv("DYNA_ZARR_ENGINE_WRITER", "0")
+    write("t.zip")
+    with zipfile.ZipFile(tmp_path / "e.zip") as ze, zipfile.ZipFile(tmp_path / "t.zip") as zt:
+        # entries sit under the zip's own name ("e/...", "t/...")
+        inner = lambda z: {n.split("/", 1)[1]: n for n in z.namelist() if "/" in n}
+        ne, nt = inner(ze), inner(zt)
+        assert sorted(ne) == sorted(nt)
+        for name in ne:
+            if name.endswith((".zarray", "zarr.json")):
+                assert json.loads(ze.read(ne[name])) == json.loads(zt.read(nt[name])), name
+    for key in ("0", "L1"):
+        e = io.read(str(tmp_path / "e.zip" / key)).compute()
+        t = io.read(str(tmp_path / "t.zip" / key)).compute()
+        np.testing.assert_array_equal(np.asarray(e), np.asarray(t))
+    assert not any(p.name.endswith("-units") for p in tmp_path.rglob("*"))

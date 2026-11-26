@@ -1598,6 +1598,11 @@ impl Pointwise {
 }
 
 impl Source for Pointwise {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        for l in &self.expr.leaves {
+            l.stores(out)
+        }
+    }
     fn reads_halo(&self) -> bool {
         self.expr.leaves.iter().any(|l| l.reads_halo())
     }

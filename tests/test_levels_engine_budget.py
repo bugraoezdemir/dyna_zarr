@@ -102,6 +102,8 @@ def test_write_levels_plans_threads_with_the_engine_cost(sharded, tmp_path, caps
     if not _engine.available():
         pytest.skip("dyna-zarr-core is not installed")
     monkeypatch.setattr(_engine, "_choice", True)
+    # TensorStore writes: the engine writer's buffers (io._writer_bytes) would add to it
+    monkeypatch.setenv("DYNA_ZARR_ENGINE_WRITER", "0")
     v = gaussian_filter(io.read(str(sharded)), (0.0, 1.0, 1.0))
     budget_mb = 110
     io.write_levels(v, [{"path": str(tmp_path / "0"), "factors": (1, 1, 1)},

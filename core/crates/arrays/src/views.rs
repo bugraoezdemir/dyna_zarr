@@ -79,6 +79,9 @@ impl Slice {
 }
 
 impl Source for Slice {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn reads_halo(&self) -> bool {
         self.src.reads_halo()
     }
@@ -244,6 +247,9 @@ impl Transpose {
 }
 
 impl Source for Transpose {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn reads_halo(&self) -> bool {
         self.src.reads_halo()
     }
@@ -321,6 +327,9 @@ impl ExpandDims {
 }
 
 impl Source for ExpandDims {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn reads_halo(&self) -> bool {
         self.src.reads_halo()
     }
@@ -407,6 +416,9 @@ impl Squeeze {
 }
 
 impl Source for Squeeze {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn reads_halo(&self) -> bool {
         self.src.reads_halo()
     }
@@ -507,6 +519,11 @@ impl Concat {
 }
 
 impl Source for Concat {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        for p in &self.parts {
+            p.stores(out)
+        }
+    }
     fn reads_halo(&self) -> bool {
         self.parts.iter().any(|p| p.reads_halo())
     }
@@ -586,6 +603,9 @@ impl Cast {
 }
 
 impl Source for Cast {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn reads_halo(&self) -> bool {
         self.src.reads_halo()
     }

@@ -15,6 +15,9 @@ How the data goes in. A zip entry's bytes are contiguous, so only finished piece
 - An array is created by TensorStore in a store held in memory (one per array). Every
   write unit (shard, else chunk) is moved into the zip, and freed, the moment the regions
   written into it cover it; the writers write whole units, so nothing waits.
+- With dyna's engine on, the engine writer (zarrs) stores the units instead, as files in
+  a temporary folder next to the zip, each moved into the zip when complete (TensorStore
+  still creates the array's metadata in memory).
 - Shards larger than the memory budget (io.write_levels' chunk-by-chunk mode) are
   assembled in temporary files next to the zip, and appended when their last chunk is in.
 
@@ -332,7 +335,7 @@ class ZipOutput:
     a unit already in the zip is never written again (refused)."""
 
     def __init__(self, target: ZipTarget, key: str, ts_handle, *, shape, chunks, shards,
-                 zarr_format):
+                 zarr_format, engine: bool = False):
         self.target, self.key = target, key
         self._ts = ts_handle
         self._kv = ts_handle.kvstore
@@ -345,10 +348,34 @@ class ZipOutput:
         self._lock = threading.Lock()
         self._assemblers = []
         self._finished = False
+        self._units_dir = None                    # the engine writer's unit files
+        self._engine = None
+        metadata = {}
         for name in self._kv.list().result():     # the array's metadata, at once
             name = name.decode()
-            self.target.write(self._entry(name), self._kv.read(name).result().value)
+            metadata[name] = self._kv.read(name).result().value
+            self.target.write(self._entry(name), metadata[name])
+        if engine:
+            self._engine = self._engine_output(metadata)
         target._add(self)
+
+    def _engine_output(self, metadata):
+        """The engine writer over a temporary folder holding this array's metadata."""
+        from . import _engine
+        from .io import _EngineOutput
+        folder = self.target.temp_dir() / f"{id(self):x}-units"
+        shutil.rmtree(folder, ignore_errors=True)
+        folder.mkdir(parents=True)
+        for name, value in metadata.items():
+            (folder / name).parent.mkdir(parents=True, exist_ok=True)
+            (folder / name).write_bytes(value)
+        try:
+            writer = _engine.engine().Writer(str(folder))
+        except Exception:                        # noqa: BLE001 - TensorStore writes it
+            shutil.rmtree(folder, ignore_errors=True)
+            return None
+        self._units_dir = folder
+        return _EngineOutput(writer, self._ts)
 
     @property
     def write_unit(self):
@@ -407,7 +434,10 @@ class ZipOutput:
         if again:
             raise ValueError(f"{self.target.path}/{self.key}: the {'shard' if self.unit != self.chunks else 'chunk'} "
                              f"{again[0]} is already in the zip; a zip entry is written once")
-        self._ts[key].write(np.ascontiguousarray(data)).result()
+        if self._engine is not None:
+            self._engine.store(key, data)
+        else:
+            self._ts[key].write(np.ascontiguousarray(data)).result()
         complete = []
         with self._lock:
             for u in units:
@@ -428,6 +458,11 @@ class ZipOutput:
         """Move the unit ``idx`` from memory into the zip (absent: all fill value, not
         stored, as on disk)."""
         name = self._unit_key(idx)
+        if self._units_dir is not None:
+            f = self._units_dir / name
+            if f.exists():
+                self.target.writer.write_from(self._entry(name), str(f), remove=True)
+                return
         got = self._kv.read(name).result()
         if got.state == "value":
             self.target.write(self._entry(name), got.value)
@@ -481,4 +516,11 @@ class ZipOutput:
             if got.state == "value":
                 self.target.write(self._entry(name), got.value)
             del self._kv[name]
+        if self._units_dir is not None:          # the engine writer's partly written units
+            for f in sorted(p for p in self._units_dir.rglob("*") if p.is_file()):
+                name = f.relative_to(self._units_dir).as_posix()
+                if name.rsplit("/", 1)[-1] in _METADATA:
+                    continue
+                self.target.writer.write_from(self._entry(name), str(f), remove=True)
+            shutil.rmtree(self._units_dir, ignore_errors=True)
         self.target._done(self)

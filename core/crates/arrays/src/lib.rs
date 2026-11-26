@@ -44,7 +44,7 @@ pub use source::{read, read_cost, region, Source, SourceRef};
 pub use views::{sliced, Cast, Concat, ExpandDims, Slice, Squeeze, Transpose};
 pub use window::{Footprint, Window};
 pub use writer::ZarrWriter;
-pub use zarr::ZarrArray;
+pub use zarr::{ReadStore, Reading, ZarrArray};
 
 /// This crate's version, for the bindings' build information.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

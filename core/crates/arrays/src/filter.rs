@@ -435,6 +435,9 @@ fn gather<T: Copy>(data: &[T], have: &Box_, want: &Stage, step: &[u64]) -> Vec<T
 }
 
 impl Source for Separable {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn reads_halo(&self) -> bool {
         true
     }

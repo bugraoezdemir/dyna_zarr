@@ -99,12 +99,15 @@ def test_max_threads_is_total_live_regions(tmp_path, capsys):
     assert readers + queue + inflight == 8
 
 
-def test_memory_budget_clamps_workers(tmp_path, capsys):
+def test_memory_budget_clamps_workers(tmp_path, capsys, monkeypatch):
     """pipeline: a tight budget lowers the live-region count below what was requested.
 
     Region 16^3 int32: read 16 KiB, out 16 KiB. A reader holds 2*16 + 16 = 48 KiB, a
     queued region 16 KiB, an in-flight write 32 KiB. 5 live regions = 2 readers, 1
     queued, 2 in flight = 176 KiB; 6 = 3/1/2 = 224 KiB. A 192 KiB budget -> 5."""
+    # the arithmetic above is TensorStore's writer; the engine writer adds its own
+    # buffers to a region (io._writer_bytes, tested in test_engine_writer.py)
+    monkeypatch.setenv("DYNA_ZARR_ENGINE_WRITER", "0")
     arr = _src(tmp_path)
     io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8), engine="pipeline",
              region_shape=(16, 16, 16), zarr_format=2,
@@ -153,9 +156,12 @@ def test_fused_memory_budget_clamps_workers(tmp_path, capsys, monkeypatch):
         assert _fused_workers(capsys.readouterr().out) == expected
 
 
-def test_fused_budget_counts_the_widest_dtype(tmp_path, capsys):
+def test_fused_budget_counts_the_widest_dtype(tmp_path, capsys, monkeypatch):
     """A narrowing chain carries its source dtype: int32 -> uint8 reads 16 KiB per region
     and writes 4 KiB, so a worker costs 2*16 + 4 = 36 KiB, not 4 KiB."""
+    # the arithmetic above is TensorStore's writer; the engine writer adds its own
+    # buffers to a region (io._writer_bytes, tested in test_engine_writer.py)
+    monkeypatch.setenv("DYNA_ZARR_ENGINE_WRITER", "0")
     arr = _src(tmp_path).astype("uint8")
     io.write(arr, str(tmp_path / "o.zarr"), chunks=(8, 8, 8),
              region_shape=(16, 16, 16), zarr_format=2,

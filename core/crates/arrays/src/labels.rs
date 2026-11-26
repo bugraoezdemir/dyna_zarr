@@ -254,6 +254,9 @@ impl TileLabels {
 }
 
 impl Source for TileLabels {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn shape(&self) -> &[u64] {
         self.src.shape()
     }

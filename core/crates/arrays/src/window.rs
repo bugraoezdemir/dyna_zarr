@@ -231,6 +231,9 @@ impl Window {
 }
 
 impl Source for Window {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
     fn reads_halo(&self) -> bool {
         true
     }
