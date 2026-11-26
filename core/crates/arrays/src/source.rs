@@ -22,6 +22,24 @@ pub trait Source: Send + Sync {
         None
     }
 
+    /// The local Zarr stores this array reads from ([`crate::ReadStore`]): a caller
+    /// holding them ([`crate::ReadStore::reading`]) for a whole read lets its pieces share
+    /// the files they open.
+    fn stores(&self, _out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {}
+
+    /// Whether reading a region reads a halo around it (filters, resampling): read in
+    /// many small pieces, every piece reads and computes its own halo again. Views above
+    /// (a stepped slice, a mean) then read it in as few pieces as their limits allow.
+    fn reads_halo(&self) -> bool {
+        false
+    }
+
+    /// `self[phase::step]` as a view that computes only the kept elements, when this
+    /// view can (a separable filter); None: a stepped slice reads it and keeps them.
+    fn stepped(&self, _phase: &[u64], _step: &[u64]) -> Option<SourceRef> {
+        None
+    }
+
     /// This array as a pointwise view, if it is one: a pointwise view over it merges it
     /// into its own expression.
     fn as_pointwise(&self) -> Option<&crate::pointwise::Pointwise> {

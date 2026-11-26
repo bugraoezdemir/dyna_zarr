@@ -13,6 +13,7 @@
 //! [`memory`] measures against.
 
 mod blocks;
+pub mod cache;
 mod cast;
 mod downsample;
 mod dtype;
@@ -26,6 +27,7 @@ mod resample;
 mod source;
 mod views;
 mod window;
+mod writer;
 mod zarr;
 
 use std::path::Path;
@@ -39,9 +41,10 @@ pub use out::Out;
 pub use pointwise::{apply as pointwise_apply, Op, Operand, Pointwise};
 pub use resample::{EdgeMode, Resample, DEFAULT_MAX_READ};
 pub use source::{read, read_cost, region, Source, SourceRef};
-pub use views::{Cast, Concat, ExpandDims, Slice, Squeeze, Transpose};
+pub use views::{sliced, Cast, Concat, ExpandDims, Slice, Squeeze, Transpose};
 pub use window::{Footprint, Window};
-pub use zarr::ZarrArray;
+pub use writer::ZarrWriter;
+pub use zarr::{ReadStore, Reading, ZarrArray};
 
 /// This crate's version, for the bindings' build information.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

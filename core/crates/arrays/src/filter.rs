@@ -9,28 +9,50 @@
 //! they go: pass `i` computes only what the later passes need. So any region gives the
 //! values of the whole filtered array, as scipy computes them, axis by axis in the
 //! element type.
+//!
+//! A stepped filter (`filter[phase::step]`, [`Separable::with_steps`]: a filter followed
+//! by a stride) computes only the elements it keeps: on a stepped axis the last pass
+//! along it computes every step-th position only, and the passes after it run on the
+//! decimated data (a stepped axis no pass filters is decimated as read). The kept values
+//! are exactly the full filter's (each output's sum is the same, in the same order); a
+//! 2 x 2 Gaussian downscale does about a third of the work.
 
 use dyna_zarr_filters as fl;
 use fl::Element;
 
-use crate::downsample::{split, split_cost, DEFAULT_MAX_READ};
+use crate::downsample::{scaled_grid, split, split_cost, DEFAULT_MAX_READ};
 use crate::dtype::DType;
 use crate::out::Out;
 use crate::pool::install;
 use crate::source::{read_vec, region, Source, SourceRef, SMALL};
 use crate::ReadError;
+use std::sync::Arc;
 
 pub use fl::{Combine, Line as FilterLine, Mode as FilterMode, Pass};
 
-/// A box: start and stop per axis.
+/// A box: start and stop per axis, in the source's positions (on an axis held decimated,
+/// the positions start, start + step, ... before stop).
 type Box_ = (Vec<u64>, Vec<u64>);
 
+/// The data between two passes of a chain: its box, and per axis whether it is held
+/// decimated (every step-th position).
+#[derive(Clone)]
+struct Stage {
+    at: Box_,
+    dec: Vec<bool>,
+}
+
 /// `chains` of passes, each applied in order to `src`; several are combined by `combine`.
+/// With steps: element `j` is the filter's element `phase + j * step` per axis.
+#[derive(Clone)]
 pub struct Separable {
     src: SourceRef,
     chains: Vec<Vec<Pass>>,
     combine: Option<Combine>,
     max_read: u64,
+    phase: Vec<u64>,
+    step: Vec<u64>,
+    shape: Vec<u64>,
 }
 
 impl Separable {
@@ -102,11 +124,15 @@ impl Separable {
                 )))
             }
         }
+        let shape = src.shape().to_vec();
         Ok(Self {
             src,
             chains,
             combine,
             max_read: DEFAULT_MAX_READ,
+            phase: vec![0; n],
+            step: vec![1; n],
+            shape,
         })
     }
 
@@ -115,40 +141,93 @@ impl Separable {
         self
     }
 
-    /// What every pass of `chain` reads: `boxes[i]` is pass i's input, the last is the
-    /// region.
-    fn boxes(&self, chain: &[Pass], start: &[u64], stop: &[u64]) -> Vec<Box_> {
+    /// This filter's elements `phase + j * step` per axis (`self[phase::step]`), computing
+    /// only those.
+    pub fn with_steps(&self, phase: &[u64], step: &[u64]) -> Result<Self, ReadError> {
+        let n = self.shape.len();
+        if phase.len() != n || step.len() != n || step.contains(&0) {
+            return Err(ReadError::new(format!(
+                "phase {phase:?} and steps {step:?}: one of each (steps >= 1) per axis"
+            )));
+        }
+        let mut out = self.clone();
+        for i in 0..n {
+            out.phase[i] = self.phase[i] + phase[i] * self.step[i];
+            out.step[i] = self.step[i] * step[i];
+            let len = self.src.shape()[i];
+            out.shape[i] = len.saturating_sub(out.phase[i]).div_ceil(out.step[i]);
+        }
+        Ok(out)
+    }
+
+    /// Elements held on axis `a` of a stage's data.
+    fn extent(&self, st: &Stage, a: usize) -> u64 {
+        let (lo, hi) = (st.at.0[a], st.at.1[a]);
+        if hi <= lo {
+            0
+        } else if st.dec[a] {
+            (hi - lo - 1) / self.step[a] + 1
+        } else {
+            hi - lo
+        }
+    }
+
+    fn stage_shape(&self, st: &Stage) -> Vec<u64> {
+        (0..st.dec.len()).map(|a| self.extent(st, a)).collect()
+    }
+
+    /// What every pass of `chain` reads: `stages[i]` is pass i's input, the last is the
+    /// region (`start .. stop` in this view's elements).
+    fn stages(&self, chain: &[Pass], start: &[u64], stop: &[u64]) -> Vec<Stage> {
         let shape = self.src.shape();
-        let mut cur: Box_ = (start.to_vec(), stop.to_vec());
+        let n = start.len();
+        let lo: Vec<u64> = (0..n)
+            .map(|a| self.phase[a] + start[a] * self.step[a])
+            .collect();
+        let hi: Vec<u64> = (0..n)
+            .map(|a| {
+                if stop[a] <= start[a] {
+                    lo[a]
+                } else {
+                    self.phase[a] + (stop[a] - 1) * self.step[a] + 1
+                }
+            })
+            .collect();
+        let mut cur = Stage {
+            at: (lo, hi),
+            dec: (0..n).map(|a| self.step[a] > 1).collect(),
+        };
         let mut out = vec![cur.clone()];
         for p in chain.iter().rev() {
             let a = p.axis;
-            let n = shape[a] as i64;
+            let len = shape[a] as i64;
             let (before, after) = p.reach();
-            let lo_p = cur.0[a] as i64 - before as i64;
-            let hi_p = cur.1[a] as i64 + after as i64;
-            let (lo, hi) = mapped_range(p.mode, n, lo_p, hi_p);
-            cur.0[a] = lo as u64;
-            cur.1[a] = hi as u64;
+            // the outputs lo, lo + step, ... (or lo .. hi) read lo - before .. hi + after
+            let lo_p = cur.at.0[a] as i64 - before as i64;
+            let hi_p = cur.at.1[a] as i64 + after as i64;
+            let (l, h) = mapped_range(p.mode, len, lo_p, hi_p);
+            cur.at.0[a] = l as u64;
+            cur.at.1[a] = h as u64;
+            cur.dec[a] = false; // a pass reads its axis whole
             out.push(cur.clone());
         }
         out.reverse();
         out
     }
 
-    /// Every chain's boxes, and the box read from the source (covering every chain's
-    /// first box).
-    fn plan(&self, start: &[u64], stop: &[u64]) -> (Vec<Vec<Box_>>, Box_) {
-        let all: Vec<Vec<Box_>> = self
+    /// Every chain's stages, and the box read from the source (covering every chain's
+    /// first stage, contiguous).
+    fn plan(&self, start: &[u64], stop: &[u64]) -> (Vec<Vec<Stage>>, Box_) {
+        let all: Vec<Vec<Stage>> = self
             .chains
             .iter()
-            .map(|c| self.boxes(c, start, stop))
+            .map(|c| self.stages(c, start, stop))
             .collect();
-        let mut union = all[0][0].clone();
+        let mut union = all[0][0].at.clone();
         for b in &all[1..] {
             for k in 0..union.0.len() {
-                union.0[k] = union.0[k].min(b[0].0[k]);
-                union.1[k] = union.1[k].max(b[0].1[k]);
+                union.0[k] = union.0[k].min(b[0].at.0[k]);
+                union.1[k] = union.1[k].max(b[0].at.1[k]);
             }
         }
         (all, union)
@@ -174,34 +253,42 @@ impl Separable {
             threads,
         )?);
         let mut acc: Option<Vec<T>> = None;
-        for (chain, boxes) in self.chains.iter().zip(&plans) {
-            // the chain's input: the read box itself (one chain), or the part it needs
-            let mut cur: Vec<T> = if single {
+        for (chain, stages) in self.chains.iter().zip(&plans) {
+            // the chain's input: the read box itself, or the part it needs (decimated on
+            // the stepped axes no pass filters)
+            let first = &stages[0];
+            let as_read = first.at == union && !first.dec.iter().any(|d| *d);
+            let mut cur: Vec<T> = if single && as_read {
                 read.take().unwrap_or_default()
             } else {
-                crop(read.as_deref().unwrap_or(&[]), &union, &boxes[0])
+                gather(read.as_deref().unwrap_or(&[]), &union, first, &self.step)
             };
             for (i, p) in chain.iter().enumerate() {
-                let (b, next_box) = (&boxes[i], &boxes[i + 1]);
+                let (b, next) = (&stages[i], &stages[i + 1]);
                 let a = p.axis;
-                let shape: Vec<usize> = (0..n).map(|k| (b.1[k] - b.0[k]) as usize).collect();
-                let out_len = (next_box.1[a] - next_box.0[a]) as usize;
+                let shape: Vec<usize> = self.stage_shape(b).iter().map(|&x| x as usize).collect();
+                let out_len = self.extent(next, a) as usize;
                 let span = fl::Span {
                     len: full[a] as usize,
-                    start: b.0[a] as usize,
-                    out_start: next_box.0[a] as usize,
+                    start: b.at.0[a] as usize,
+                    out_start: next.at.0[a] as usize,
                     out_len,
                 };
+                let step = if next.dec[a] {
+                    self.step[a] as usize
+                } else {
+                    1
+                };
                 let count = cur.len() / shape[a].max(1) * out_len;
-                let mut next = vec![T::default(); count];
-                let mut run = || p.run_on(parallel, &cur, &shape, span, &mut next);
+                let mut out_buf = vec![T::default(); count];
+                let mut run = || p.run_stepped(parallel, &cur, &shape, span, step, &mut out_buf);
                 let done = if parallel {
                     install(threads, &mut run)?
                 } else {
                     run()
                 };
                 done.map_err(ReadError::filter)?;
-                cur = next;
+                cur = out_buf;
             }
             // `cur` is this chain's region
             match (&mut acc, self.combine) {
@@ -247,8 +334,8 @@ impl Separable {
         let stop: Vec<u64> = (0..n).map(|i| start[i] + r[i]).collect();
         let (plans, union) = self.plan(start, &stop);
         let item = self.src.dtype().size() as u64;
-        let size = |b: &Box_| (0..n).map(|k| b.1[k] - b.0[k]).product::<u64>() * item;
-        let raw = size(&union);
+        let size = |st: &Stage| self.stage_shape(st).iter().product::<u64>() * item;
+        let raw = (0..n).map(|k| union.1[k] - union.0[k]).product::<u64>() * item;
         let mut most = raw + self.src.cost(&union.0, &union.1, threads)?;
         let region = r.iter().product::<u64>() * item;
         let kept = if self.chains.len() == 1 {
@@ -256,14 +343,26 @@ impl Separable {
         } else {
             raw + region
         };
-        for (chain, boxes) in self.chains.iter().zip(&plans) {
-            most = most.max(kept + size(&boxes[0]));
+        for (chain, stages) in self.chains.iter().zip(&plans) {
+            // a chain's input, gathered beside the read box
+            most = most.max(raw + kept + size(&stages[0]));
             for (i, p) in chain.iter().enumerate() {
                 let a = p.axis;
-                let out_len = (boxes[i + 1].1[a] - boxes[i + 1].0[a]) as usize;
-                let (shared, each) = p.bytes(out_len);
+                let out_len = self.extent(&stages[i + 1], a) as usize;
+                // a stepped running window computes its contiguous run first
+                let step = if stages[i + 1].dec[a] {
+                    self.step[a]
+                } else {
+                    1
+                };
+                let run = if step > 1 && !matches!(p.line, FilterLine::Correlate { .. }) {
+                    size(&stages[i + 1]) * step
+                } else {
+                    0
+                };
+                let (shared, each) = p.bytes(out_len.max(1) * step as usize);
                 let tables = shared + threads.max(1) as u64 * each;
-                most = most.max(kept + size(&boxes[i]) + size(&boxes[i + 1]) + tables);
+                most = most.max(kept + size(&stages[i]) + size(&stages[i + 1]) + run + tables);
             }
         }
         Ok(most + SMALL)
@@ -296,12 +395,27 @@ pub(crate) fn mapped_range(mode: FilterMode, n: i64, lo_p: i64, hi_p: i64) -> (i
     (lo, hi)
 }
 
-/// The part `want` of a C-ordered block `data` that holds the box `have`.
-fn crop<T: Copy>(data: &[T], have: &Box_, want: &Box_) -> Vec<T> {
+/// The part `want` of a C-ordered block `data` that holds the box `have` (contiguous),
+/// every `step[a]`-th position on the axes `want` holds decimated.
+fn gather<T: Copy>(data: &[T], have: &Box_, want: &Stage, step: &[u64]) -> Vec<T> {
     let n = have.0.len();
     let hs: Vec<usize> = (0..n).map(|k| (have.1[k] - have.0[k]) as usize).collect();
-    let ws: Vec<usize> = (0..n).map(|k| (want.1[k] - want.0[k]) as usize).collect();
-    let off: Vec<usize> = (0..n).map(|k| (want.0[k] - have.0[k]) as usize).collect();
+    let st: Vec<usize> = (0..n)
+        .map(|k| if want.dec[k] { step[k] as usize } else { 1 })
+        .collect();
+    let ws: Vec<usize> = (0..n)
+        .map(|k| {
+            let (lo, hi) = (want.at.0[k], want.at.1[k]);
+            if hi <= lo {
+                0
+            } else {
+                ((hi - lo - 1) as usize) / st[k] + 1
+            }
+        })
+        .collect();
+    let off: Vec<usize> = (0..n)
+        .map(|k| (want.at.0[k] - have.0[k]) as usize)
+        .collect();
     let count: usize = ws.iter().product();
     let mut out = Vec::with_capacity(count);
     if count == 0 || n == 0 {
@@ -312,10 +426,14 @@ fn crop<T: Copy>(data: &[T], have: &Box_, want: &Box_) -> Vec<T> {
     for _ in 0..count / inner {
         let mut at = 0usize;
         for k in 0..n - 1 {
-            at = at * hs[k] + idx[k] + off[k];
+            at = at * hs[k] + off[k] + idx[k] * st[k];
         }
         at = at * hs[n - 1] + off[n - 1];
-        out.extend_from_slice(&data[at..at + inner]);
+        if st[n - 1] == 1 {
+            out.extend_from_slice(&data[at..at + inner]);
+        } else {
+            out.extend((0..inner).map(|j| data[at + j * st[n - 1]]));
+        }
         for k in (0..n - 1).rev() {
             idx[k] += 1;
             if idx[k] < ws[k] {
@@ -328,14 +446,26 @@ fn crop<T: Copy>(data: &[T], have: &Box_, want: &Box_) -> Vec<T> {
 }
 
 impl Source for Separable {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
+    fn reads_halo(&self) -> bool {
+        true
+    }
     fn shape(&self) -> &[u64] {
-        self.src.shape()
+        &self.shape
     }
     fn dtype(&self) -> DType {
         self.src.dtype()
     }
     fn grid(&self) -> Option<Vec<u64>> {
-        self.src.grid()
+        scaled_grid(self.src.as_ref(), &self.step)
+    }
+    /// `self[phase::step]` computing only the kept elements.
+    fn stepped(&self, phase: &[u64], step: &[u64]) -> Option<SourceRef> {
+        self.with_steps(phase, step)
+            .ok()
+            .map(|v| Arc::new(v) as SourceRef)
     }
 
     fn read_into(
@@ -345,7 +475,7 @@ impl Source for Separable {
         out: &Out,
         threads: usize,
     ) -> Result<(), ReadError> {
-        let r = region(self.src.shape(), start, stop)?;
+        let r = region(&self.shape, start, stop)?;
         out.check(&r, self.dtype())?;
         let bytes = |s: &[u64], r: &[u64]| self.box_bytes(s, r);
         let run = |s: &[u64], r: &[u64], o: &Out| match self.src.dtype() {
@@ -365,7 +495,7 @@ impl Source for Separable {
     }
 
     fn cost(&self, start: &[u64], stop: &[u64], threads: usize) -> Result<u64, ReadError> {
-        let r = region(self.src.shape(), start, stop)?;
+        let r = region(&self.shape, start, stop)?;
         let bytes = |s: &[u64], r: &[u64]| self.box_bytes(s, r);
         let cost = |s: &[u64], r: &[u64]| self.part_cost(s, r, threads);
         split_cost(start, &r, self.max_read, &bytes, &cost)
@@ -584,14 +714,103 @@ mod tests {
     }
 
     #[test]
-    fn crop_takes_the_inner_box() {
+    fn gather_takes_the_inner_box() {
         let data: Vec<u32> = (0..60).collect();
         let have = (vec![10, 20, 30], vec![13, 24, 35]);
         let want = (vec![11, 21, 32], vec![13, 23, 34]);
         // (i, j, k) of the 3 x 4 x 5 block is i*20 + j*5 + k
+        let want = Stage {
+            at: want,
+            dec: vec![false; 3],
+        };
         assert_eq!(
-            crop(&data, &have, &want),
+            gather(&data, &have, &want, &[1, 1, 1]),
             vec![27, 28, 32, 33, 47, 48, 52, 53]
         );
+        // every 2nd on the last axis: positions 30, 32, 34 of 30 .. 35
+        let every = Stage {
+            at: (vec![10, 20, 30], vec![11, 21, 35]),
+            dec: vec![false, false, true],
+        };
+        assert_eq!(gather(&data, &have, &every, &[1, 1, 2]), vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn a_stepped_filter_is_the_filter_then_the_stride() {
+        // every chain kind, every mode, steps on filtered and unfiltered axes, any region:
+        // the same values as reading the filter whole and keeping every step-th
+        let (src, _) = source();
+        let w = vec![0.0625, 0.25, 0.375, 0.25, 0.0625];
+        let chains: Vec<Vec<Pass>> = vec![
+            vec![
+                Pass::correlate(1, w.clone(), FilterMode::Reflect),
+                Pass::correlate(2, w.clone(), FilterMode::Reflect),
+            ],
+            vec![Pass::correlate(
+                2,
+                vec![0.1, 0.5, 0.2, 0.15],
+                FilterMode::Mirror,
+            )],
+            vec![
+                Pass {
+                    axis: 1,
+                    line: FilterLine::Uniform { size: 3, origin: 0 },
+                    mode: FilterMode::Nearest,
+                },
+                Pass::correlate(2, w.clone(), FilterMode::Constant(1.5)),
+            ],
+            vec![Pass::correlate(0, w.clone(), FilterMode::Wrap)],
+        ];
+        for passes in chains {
+            let f = Separable::new(src.clone(), passes.clone()).unwrap();
+            let all = read(&f, &[0, 0, 0], &[7, 9, 11], 1).unwrap();
+            let all: Vec<f64> = all
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| f64::from_ne_bytes(*b))
+                .collect();
+            for (phase, step) in [
+                ([0, 0, 0], [1, 2, 2]),
+                ([1, 1, 0], [2, 3, 2]),
+                ([0, 2, 1], [3, 1, 4]),
+            ] {
+                let s = f.with_steps(&phase, &step).unwrap();
+                let sh = s.shape().to_vec();
+                for (a, b) in [([0, 0, 0], sh.clone()), ([1, 1, 1], sh.clone())] {
+                    if (0..3).any(|i| a[i] >= b[i]) {
+                        continue;
+                    }
+                    for threads in [1, 3] {
+                        let got = read(&s, &a, &b, threads).unwrap();
+                        let got: Vec<f64> = got
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|c| f64::from_ne_bytes(*c))
+                            .collect();
+                        let mut k = 0;
+                        for i in a[0]..b[0] {
+                            for j in a[1]..b[1] {
+                                for l in a[2]..b[2] {
+                                    let (x, y, z) = (
+                                        (phase[0] + i * step[0]) as usize,
+                                        (phase[1] + j * step[1]) as usize,
+                                        (phase[2] + l * step[2]) as usize,
+                                    );
+                                    let want = all[(x * 9 + y) * 11 + z];
+                                    assert_eq!(
+                                        got[k].to_bits(),
+                                        want.to_bits(),
+                                        "{passes:?} {phase:?} {step:?}"
+                                    );
+                                    k += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

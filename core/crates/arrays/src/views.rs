@@ -18,6 +18,33 @@ use crate::ReadError;
 /// Source elements per stepped axis per block when the source has no storage grid.
 const STEP_BLOCK: u64 = 256;
 
+/// Source bytes per block of a stepped read over a view that reads a halo.
+const HALO_SPAN: u64 = 64 << 20;
+
+/// `source[start:stop:step]` as a view: a source that can compute only every step-th
+/// element (a filter, [`Source::stepped`]) does, under an unstepped slice; any other is
+/// read by a stepped [`Slice`].
+pub fn sliced(
+    src: SourceRef,
+    start: &[u64],
+    stop: &[u64],
+    step: &[u64],
+) -> Result<SourceRef, ReadError> {
+    let plain = Slice::new(src.clone(), start, stop, step)?;
+    if step.iter().all(|s| *s == 1) {
+        return Ok(Arc::new(plain));
+    }
+    match src.stepped(start, step) {
+        Some(v) => {
+            let n = start.len();
+            let zero = vec![0; n];
+            let one = vec![1; n];
+            Ok(Arc::new(Slice::new(v, &zero, &plain.shape, &one)?))
+        }
+        None => Ok(Arc::new(plain)),
+    }
+}
+
 /// `source[start:stop:step]` per axis (step >= 1).
 pub struct Slice {
     src: SourceRef,
@@ -52,6 +79,12 @@ impl Slice {
 }
 
 impl Source for Slice {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
+    fn reads_halo(&self) -> bool {
+        self.src.reads_halo()
+    }
     fn shape(&self) -> &[u64] {
         &self.shape
     }
@@ -136,6 +169,26 @@ impl Slice {
     /// A stepped read's blocks: about one storage unit of the source per axis (or
     /// STEP_BLOCK source elements per stepped axis without a grid).
     fn blocks(&self, r: &[u64]) -> Blocks {
+        if self.src.reads_halo() {
+            // over a filter: as few blocks as fit HALO_SPAN, halving the block's widest
+            // axis (each block reads its halo; a block per chunk read each up to 9x in 2-D)
+            let item = self.dtype().size() as u64;
+            let span = |p: &[u64]| -> u64 {
+                p.iter()
+                    .zip(&self.step)
+                    .map(|(a, s)| a * s)
+                    .product::<u64>()
+                    * item
+            };
+            let mut per = r.to_vec();
+            while span(&per) > HALO_SPAN && per.iter().any(|x| *x > 1) {
+                let ax = (0..r.len())
+                    .max_by_key(|&i| per[i] * self.step[i])
+                    .unwrap_or(0);
+                per[ax] = per[ax].div_ceil(2);
+            }
+            return Blocks::regular(r, &per);
+        }
         let grid = self.src.grid();
         let per: Vec<u64> = (0..r.len())
             .map(|i| match &grid {
@@ -198,6 +251,12 @@ impl Transpose {
 }
 
 impl Source for Transpose {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
+    fn reads_halo(&self) -> bool {
+        self.src.reads_halo()
+    }
     fn shape(&self) -> &[u64] {
         &self.shape
     }
@@ -272,6 +331,12 @@ impl ExpandDims {
 }
 
 impl Source for ExpandDims {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
+    fn reads_halo(&self) -> bool {
+        self.src.reads_halo()
+    }
     fn shape(&self) -> &[u64] {
         &self.shape
     }
@@ -355,6 +420,12 @@ impl Squeeze {
 }
 
 impl Source for Squeeze {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
+    fn reads_halo(&self) -> bool {
+        self.src.reads_halo()
+    }
     fn shape(&self) -> &[u64] {
         &self.shape
     }
@@ -452,6 +523,14 @@ impl Concat {
 }
 
 impl Source for Concat {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        for p in &self.parts {
+            p.stores(out)
+        }
+    }
+    fn reads_halo(&self) -> bool {
+        self.parts.iter().any(|p| p.reads_halo())
+    }
     fn shape(&self) -> &[u64] {
         &self.shape
     }
@@ -528,6 +607,12 @@ impl Cast {
 }
 
 impl Source for Cast {
+    fn stores(&self, out: &mut Vec<std::sync::Arc<crate::ReadStore>>) {
+        self.src.stores(out)
+    }
+    fn reads_halo(&self) -> bool {
+        self.src.reads_halo()
+    }
     fn shape(&self) -> &[u64] {
         self.src.shape()
     }

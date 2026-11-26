@@ -45,6 +45,9 @@ class WriteScope:
         self._ts_context = None
         self._pool = None
         self._handles = {}            # id(handle) -> (handle, its reopened handle)
+        #: bytes of the engine pool's chunk cache (0: none); a write over a filter sets
+        #: it before its first read (see io._halo_cache_bytes)
+        self.cache_bytes = 0
 
     def ts_context(self):
         """A TensorStore context whose data-copy and file-I/O pools have ``max_threads``
@@ -83,12 +86,24 @@ class WriteScope:
         return reopened
 
     def pool(self):
-        """The engine's thread pool for this write (``max_threads`` threads)."""
+        """The engine's thread pool for this write (``max_threads`` threads), with a
+        cache of decoded chunks of ``cache_bytes`` when that is set."""
         with self._lock:
             if self._pool is None:
                 from . import _engine
-                self._pool = _engine.engine().Pool(self.max_threads)
+                self._pool = _engine.engine().Pool(
+                    self.max_threads, cache_mb=self.cache_bytes / 2**20)
             return self._pool
+
+    def want_cache(self, nbytes: int) -> bool:
+        """Give the engine pool a chunk cache of ``nbytes`` (the larger of what earlier
+        writes in this scope asked for); False once the pool exists without one big
+        enough (a write inside a write that started reading)."""
+        with self._lock:
+            if self._pool is not None:
+                return self._pool.cache_bytes >= nbytes
+            self.cache_bytes = max(self.cache_bytes, int(nbytes))
+            return True
 
 
 def _reopen(handle, scope: WriteScope):

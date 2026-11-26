@@ -232,6 +232,7 @@ pub fn uniform1d_on<T: Element, U: Element>(
         mode,
         span,
         output.len(),
+        1,
     )?;
     if let Some(lay) = lay {
         run(parallel, &Uniform { size }, input, lay, mode.cval(), output);
@@ -391,6 +392,7 @@ pub fn min_max1d_on<T: Element, U: Element>(
         mode,
         span,
         output.len(),
+        1,
     )?;
     if let Some(lay) = lay {
         run(

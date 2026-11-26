@@ -617,12 +617,13 @@ def read(array, key):
     # values that depend on where the read starts (UsePythonPath, see the module notes):
     # the Python path reads them, so both give the same values for every read
     use_python = getattr(_engine.engine(), "UsePythonPath", ())
+    from ._scope import current
+    scope = current()
     try:
-        if threads == 1:
+        if threads == 1 and (scope is None or not scope.cache_bytes):
             return view.read([0] * len(shape), shape, threads=1)     # on this thread
-        # several threads: inside a write, on its one pool (decision DR-5, see _scope)
-        from ._scope import current
-        scope = current()
+        # several threads, or a write with a chunk cache: on the write's one pool
+        # (decision DR-5, see _scope; the cache lives in the pool's threads)
         pool = None if scope is None else scope.pool()
         return view.read([0] * len(shape), shape, threads=threads, pool=pool)
     except use_python:

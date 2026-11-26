@@ -32,22 +32,34 @@ fn err(e: ar::ReadError) -> PyErr {
 /// with its max_threads and runs every region's read on it: the threads busy at once
 /// never exceed `threads`, however many reads share it. A read's own `threads` caps its
 /// memory (how many of its pieces are open at once), not the pool.
+///
+/// `cache_mb` > 0 gives the pool a cache of decoded chunks of at most that many MiB,
+/// shared by every read on it (a write over a filter: neighbouring regions' halos are
+/// then decoded once). The write counts it once in its memory budget.
 #[pyclass(frozen, module = "dyna_zarr_core")]
 pub struct Pool {
     pool: Arc<ar::pool::ThreadPool>,
     threads: usize,
+    cache: Option<Arc<ar::cache::ChunkCache>>,
 }
 
 #[pymethods]
 impl Pool {
     #[new]
-    fn new(threads: usize) -> PyResult<Self> {
+    #[pyo3(signature = (threads, cache_mb = 0.0))]
+    fn new(threads: usize, cache_mb: f64) -> PyResult<Self> {
         if threads < 1 {
             return Err(PyValueError::new_err("a pool needs at least 1 thread"));
         }
+        if cache_mb.is_nan() || cache_mb < 0.0 {
+            return Err(PyValueError::new_err("cache_mb must be 0 or more"));
+        }
+        let bytes = (cache_mb * 1048576.0) as u64;
+        let cache = (bytes > 0).then(|| ar::cache::ChunkCache::new(bytes));
         Ok(Self {
-            pool: ar::pool::new_pool(threads).map_err(err)?,
+            pool: ar::pool::new_pool_cached(threads, cache.clone()).map_err(err)?,
             threads,
+            cache,
         })
     }
 
@@ -56,8 +68,172 @@ impl Pool {
         self.threads
     }
 
+    /// The chunk cache's limit in bytes (0: no cache).
+    #[getter]
+    fn cache_bytes(&self) -> u64 {
+        self.cache.as_ref().map_or(0, |c| c.limit())
+    }
+
+    /// (chunks served from the cache, chunks decoded) by reads on this pool so far.
+    fn cache_counts(&self) -> (u64, u64) {
+        self.cache.as_ref().map_or((0, 0), |c| c.counts())
+    }
+
     fn __repr__(&self) -> String {
-        format!("<dyna_zarr_core.Pool {} threads>", self.threads)
+        match &self.cache {
+            Some(c) => format!(
+                "<dyna_zarr_core.Pool {} threads, cache {} MiB>",
+                self.threads,
+                c.limit() >> 20
+            ),
+            None => format!("<dyna_zarr_core.Pool {} threads>", self.threads),
+        }
+    }
+}
+
+/// A Zarr array in a local folder, opened for writing with zarrs (Workplan DR8): dyna
+/// creates the array (its metadata), the writer encodes and stores regions of it.
+#[pyclass(frozen, module = "dyna_zarr_core")]
+pub struct Writer {
+    writer: Arc<ar::ZarrWriter>,
+}
+
+#[pymethods]
+impl Writer {
+    #[new]
+    fn new(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
+        let w = py.detach(|| ar::ZarrWriter::open(&path)).map_err(err)?;
+        Ok(Self {
+            writer: Arc::new(w),
+        })
+    }
+
+    #[getter]
+    fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, self.writer.shape())
+    }
+
+    #[getter]
+    fn dtype(&self) -> &'static str {
+        self.writer.dtype().name()
+    }
+
+    /// The write unit: the shard when sharded, else the chunk.
+    #[getter]
+    fn unit<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
+        PyTuple::new(py, self.writer.unit())
+    }
+
+    /// Store `data` (a C-contiguous NumPy array of the array's dtype) at `start`, with
+    /// `threads` (on `pool` when given), without the GIL. Regions should cover whole
+    /// write units: one covering a unit in part rewrites it, which is safe only while no
+    /// other region writes that unit at the same time.
+    #[pyo3(signature = (start, data, threads = 1, pool = None))]
+    fn store(
+        &self,
+        py: Python<'_>,
+        start: Vec<u64>,
+        data: Bound<'_, PyAny>,
+        threads: usize,
+        pool: Option<PyRef<'_, Pool>>,
+    ) -> PyResult<()> {
+        if threads < 1 {
+            return Err(PyValueError::new_err("threads must be >= 1"));
+        }
+        let dtype = self.writer.dtype();
+        let name: String = data.getattr("dtype")?.getattr("name")?.extract()?;
+        if name != dtype.name() {
+            return Err(PyTypeError::new_err(format!(
+                "data is {name}; the array is {}",
+                dtype.name()
+            )));
+        }
+        let native: bool = data.getattr("dtype")?.getattr("isnative")?.extract()?;
+        let contiguous: bool = data.getattr("flags")?.getattr("c_contiguous")?.extract()?;
+        if !native || !contiguous {
+            return Err(PyValueError::new_err(
+                "data must be a C-contiguous NumPy array in native byte order",
+            ));
+        }
+        let shape: Vec<u64> = data.getattr("shape")?.extract()?;
+        if shape.len() != start.len() {
+            return Err(PyValueError::new_err(format!(
+                "data has {} axes, start {}",
+                shape.len(),
+                start.len()
+            )));
+        }
+        // the array's bytes, kept alive (and unresizable) while they are stored
+        let bytes = data
+            .call_method1("reshape", (-1,))?
+            .call_method1("view", ("u1",))?;
+        let buf: PyBuffer<u8> = PyBuffer::get(&bytes)?;
+        let (ptr, len) = (buf.buf_ptr() as usize, buf.len_bytes());
+        let w = self.writer.clone();
+        let pool = pool.map(|p| p.pool.clone());
+        py.detach(move || {
+            // SAFETY: the buffer export above keeps the memory alive and unchanged in
+            // size for the call; it is only read
+            let b = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+            // on this (Python) thread: the writer takes its unit locks before the pool
+            w.store(&start, &shape, b, threads, pool.as_deref())
+        })
+        .map_err(err)?;
+        drop(buf);
+        Ok(())
+    }
+
+    /// Whether `append` can append inner chunks to this array's shards (a sharded array
+    /// with its index at the end).
+    #[getter]
+    fn appends(&self) -> bool {
+        self.writer.appends()
+    }
+
+    /// Append the inner chunk `data` (cut at the array's end) at `start` to its shard;
+    /// the shard's index is written when its last inner chunk is in (or by
+    /// `finish_shards`). Without the GIL.
+    fn append(&self, py: Python<'_>, start: Vec<u64>, data: Bound<'_, PyAny>) -> PyResult<()> {
+        let dtype = self.writer.dtype();
+        let name: String = data.getattr("dtype")?.getattr("name")?.extract()?;
+        let native: bool = data.getattr("dtype")?.getattr("isnative")?.extract()?;
+        let contiguous: bool = data.getattr("flags")?.getattr("c_contiguous")?.extract()?;
+        if name != dtype.name() || !native || !contiguous {
+            return Err(PyValueError::new_err(format!(
+                "data must be a C-contiguous {} NumPy array in native byte order",
+                dtype.name()
+            )));
+        }
+        let shape: Vec<u64> = data.getattr("shape")?.extract()?;
+        let bytes = data
+            .call_method1("reshape", (-1,))?
+            .call_method1("view", ("u1",))?;
+        let buf: PyBuffer<u8> = PyBuffer::get(&bytes)?;
+        let (ptr, len) = (buf.buf_ptr() as usize, buf.len_bytes());
+        let w = self.writer.clone();
+        py.detach(move || {
+            // SAFETY: the buffer export above keeps the memory alive and unchanged in
+            // size for the call; it is only read
+            let b = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+            w.append(&start, &shape, b)
+        })
+        .map_err(err)?;
+        drop(buf);
+        Ok(())
+    }
+
+    /// Close every shard still open (its index written).
+    fn finish_shards(&self, py: Python<'_>) -> PyResult<()> {
+        let w = self.writer.clone();
+        py.detach(move || w.finish_shards()).map_err(err)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<dyna_zarr_core.Writer {:?} {}>",
+            self.writer.shape(),
+            self.writer.dtype().name()
+        )
     }
 }
 
@@ -155,6 +331,10 @@ impl Array {
         let (ptr, len) = (buf.buf_ptr() as usize, buf.len_bytes());
         let src = self.src.clone();
         py.detach(move || {
+            // the read's pieces share the files they open (local arrays: ar::ReadStore)
+            let mut stores = Vec::new();
+            src.stores(&mut stores);
+            let _held: Vec<_> = stores.iter().map(|s| s.reading()).collect();
             let run = move || {
                 // SAFETY: the buffer export above keeps the memory alive and in place for
                 // the call; the region written lies inside it (Out::new and read_into
@@ -196,6 +376,13 @@ impl Array {
     #[getter]
     fn shape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyTuple>> {
         PyTuple::new(py, self.src.shape())
+    }
+
+    /// Whether reading it reads a halo around every region (a filter or a resampling
+    /// in the chain): a write over it gives its pool a chunk cache.
+    #[getter]
+    fn reads_halo(&self) -> bool {
+        self.src.reads_halo()
     }
 
     #[getter]
@@ -360,8 +547,9 @@ impl Array {
                 )));
             }
         }
+        // a filter under a stepped slice computes only the kept elements (ar::sliced)
         let mut src: ar::SourceRef =
-            Arc::new(ar::Slice::new(self.src.clone(), &start, &stop, &step).map_err(err)?);
+            ar::sliced(self.src.clone(), &start, &stop, &step).map_err(err)?;
         for &a in squeeze.iter().rev() {
             src = Arc::new(ar::Squeeze::new(src, a).map_err(err)?);
         }
@@ -422,9 +610,13 @@ impl Array {
     ) -> PyResult<Array> {
         let bytes = max_read_mb.map(|mb| (mb * 1048576.0) as u64);
         match method {
-            "stride" | "simple" => Ok(Self::view(
-                ar::stride(self.src.clone(), &factors).map_err(err)?,
-            )),
+            "stride" | "simple" => {
+                ar::stride(self.src.clone(), &factors).map_err(err)?; // checks the factors
+                let n = factors.len();
+                let src = ar::sliced(self.src.clone(), &vec![0; n], self.src.shape(), &factors)
+                    .map_err(err)?;
+                Ok(Self { src, zarr: None })
+            }
             "mean" => {
                 let mut m = ar::Mean::new(self.src.clone(), &factors).map_err(err)?;
                 if let Some(b) = bytes {

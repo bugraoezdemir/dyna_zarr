@@ -102,6 +102,8 @@ def test_write_levels_plans_threads_with_the_engine_cost(sharded, tmp_path, caps
     if not _engine.available():
         pytest.skip("dyna-zarr-core is not installed")
     monkeypatch.setattr(_engine, "_choice", True)
+    # TensorStore writes: the engine writer's buffers (io._writer_bytes) would add to it
+    monkeypatch.setenv("DYNA_ZARR_ENGINE_WRITER", "0")
     v = gaussian_filter(io.read(str(sharded)), (0.0, 1.0, 1.0))
     budget_mb = 110
     io.write_levels(v, [{"path": str(tmp_path / "0"), "factors": (1, 1, 1)},
@@ -113,7 +115,13 @@ def test_write_levels_plans_threads_with_the_engine_cost(sharded, tmp_path, caps
     threads = int(m.group(2))
     block = int(np.prod(region)) * 2
     per_thread = block + int(_lowering.lowered(v).cost([0, 0, 0], region, 1)) + block * (1 + 1 / 4)
-    assert threads == max(1, min(16, int(budget_mb * 2**20 // per_thread))), (line, per_thread)
+    # a filter's chunk cache comes off the budget first (test_engine_halo_cache)
+    along_last = -(-1024 // region[-1])
+    cache = sys.modules["dyna_zarr.io"]._halo_cache_bytes(v, region, along_last, 16,
+                                                         budget_mb * 2**20)
+    assert ("chunk cache" in line) == (cache > 0), line
+    assert threads == max(1, min(16, int((budget_mb * 2**20 - cache) // per_thread))), (
+        line, per_thread, cache)
 
 
 def test_write_levels_values_unchanged(sharded, tmp_path, engine):
