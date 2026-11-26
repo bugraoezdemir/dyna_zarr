@@ -181,8 +181,13 @@ impl Source for ZarrArray {
         self.dtype
     }
 
+    /// What one decode yields: the inner chunk when sharded, else the chunk. Views above
+    /// read in blocks of about one such unit, at most `threads` at once, so their scratch
+    /// stays near a unit per thread. With the shard here, a stride or mean over a
+    /// sharded array held a whole shard's input per thread (16 threads of 8 MiB shard
+    /// spans: 142 MiB where the Python path held ~100 MiB in all, 2026-11-25).
     fn grid(&self) -> Option<Vec<u64>> {
-        Some(self.chunks.clone())
+        Some(self.unit.clone())
     }
 
     fn read_into(

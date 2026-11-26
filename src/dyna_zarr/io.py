@@ -3534,14 +3534,34 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
     # while it is appended to the zip: up to twice the output again
     zip_extra = 2 if any(spec.zip_target is not None for spec in specs) else 0
 
+    # the engine's counterpart of the chain, when the engine reads it: a block's read
+    # then holds what the engine says it does (decision DR-5), as in io.write's planner
+    from . import _lowering
+    eng = _lowering.lowered(array)
+    eng_costs = {}
+
+    def read_cost(region):
+        """Bytes a worker holds while reading one block: with the engine, the block
+        itself plus the engine's own cost for it (``Array.cost`` on one thread, as each
+        write_levels worker reads); else the read with what the reader holds on top
+        (1.25x for zarrista / micro-reader, 2x for TensorStore, ``_read_cost.read_overhead``)."""
+        if eng is not None:
+            stop = [min(int(r), int(s)) for r, s in zip(region, shape)]
+            key = tuple(stop)
+            if key not in eng_costs:
+                dest = int(np.prod(stop, dtype=np.int64)) * np.dtype(array.dtype).itemsize
+                eng_costs[key] = dest + int(eng.cost([0] * ndim, stop, 1))
+            return eng_costs[key]
+        read_bytes, _ = _region_cost(array, region, shape, final_dtype)
+        return int(read_factor * read_bytes)
+
     def worker_cost(region):
-        """A write_levels worker's memory for one block: the block read (with what the
-        reader holds on top: 1.25x for zarrista / micro-reader, 2x for TensorStore,
-        ``_read_cost.read_overhead``), and every level's output computed from it (with,
-        for an output into a zip, the encoded unit and its copy on the way in)."""
-        read_bytes, out_bytes = _region_cost(array, region, shape, final_dtype)
+        """A write_levels worker's memory for one block: the block read (``read_cost``),
+        and every level's output computed from it (with, for an output into a zip, the
+        encoded unit and its copy on the way in)."""
+        _, out_bytes = _region_cost(array, region, shape, final_dtype)
         levels_out = sum(out_bytes / float(np.prod(f, dtype=np.int64)) for f in factors)
-        return int(read_factor * read_bytes + levels_out * (1 + zip_extra))
+        return int(read_cost(region) + levels_out * (1 + zip_extra))
 
     def grown(start, limit):
         """``start`` grown to the budget, innermost axis first (contiguous reads), in
