@@ -35,16 +35,15 @@ use std::num::NonZeroU64;
 
 use zarrs::array::codec::api::ArrayToBytesCodecTraits;
 use zarrs::array::{
-    data_type, Array, ArrayBytes, ArrayShardedExt, ArraySubset, CodecChain, CodecOptions,
-    FillValue,
+    data_type, Array, ArrayBytes, ArrayShardedExt, ArraySubset, CodecChain, CodecOptions, FillValue,
 };
-use zarrs::metadata::v3::MetadataV3;
 use zarrs::filesystem::FilesystemStore;
+use zarrs::metadata::v3::MetadataV3;
 use zarrs::plugin::ZarrVersion;
 use zarrs::storage::byte_range::ByteRangeIterator;
 use zarrs::storage::{
-    Bytes, MaybeBytesIterator, OffsetBytesIterator, ReadableStorageTraits, StorageError,
-    StoreKey, StorePrefix, WritableStorageTraits,
+    Bytes, MaybeBytesIterator, OffsetBytesIterator, ReadableStorageTraits, StorageError, StoreKey,
+    StorePrefix, WritableStorageTraits,
 };
 
 use crate::blocks::Blocks;
@@ -182,10 +181,16 @@ impl Appender {
             return None;
         }
         let conf = codecs[0].get("configuration")?;
-        if conf.get("index_location").and_then(|v| v.as_str()).unwrap_or("end") != "end" {
+        if conf
+            .get("index_location")
+            .and_then(|v| v.as_str())
+            .unwrap_or("end")
+            != "end"
+        {
             return None;
         }
-        let inner_shape: Vec<u64> = serde_json::from_value(conf.get("chunk_shape")?.clone()).ok()?;
+        let inner_shape: Vec<u64> =
+            serde_json::from_value(conf.get("chunk_shape")?.clone()).ok()?;
         let chain = |key: &str| -> Option<CodecChain> {
             let m: Vec<MetadataV3> = serde_json::from_value(conf.get(key)?.clone()).ok()?;
             CodecChain::from_metadata(&m).ok()
@@ -348,14 +353,18 @@ impl ZarrWriter {
         let whole: Vec<u64> = (0..n)
             .map(|i| inner[i].min(self.shape[i] - start[i]))
             .collect();
-        if (0..n).any(|i| start[i] % inner[i] != 0) || r != whole {
+        if (0..n).any(|i| !start[i].is_multiple_of(inner[i])) || r != whole {
             return Err(ReadError::new(format!(
                 "{}: {start:?} + {shape:?} is not one inner chunk of {inner:?}",
                 self.label
             )));
         }
         if bytes.len() != r.iter().product::<u64>() as usize * item {
-            return Err(ReadError::new(format!("{}: {} bytes for {r:?}", self.label, bytes.len())));
+            return Err(ReadError::new(format!(
+                "{}: {} bytes for {r:?}",
+                self.label,
+                bytes.len()
+            )));
         }
         let fill = self.array.fill_value();
         // the inner chunk at its full shape (cut at the array's end: padded with the fill)
@@ -380,11 +389,19 @@ impl ZarrWriter {
         let encoded = if ab.is_fill_value(fill) {
             None
         } else {
-            let shape_nz: Vec<NonZeroU64> =
-                inner.iter().map(|&c| NonZeroU64::new(c).expect("inner chunks are > 0")).collect();
+            let shape_nz: Vec<NonZeroU64> = inner
+                .iter()
+                .map(|&c| NonZeroU64::new(c).expect("inner chunks are > 0"))
+                .collect();
             let e = ap
                 .inner
-                .encode(ab, &shape_nz, self.array.data_type(), fill, &Self::options(1))
+                .encode(
+                    ab,
+                    &shape_nz,
+                    self.array.data_type(),
+                    fill,
+                    &Self::options(1),
+                )
                 .map_err(|e| ReadError::new(format!("{}: {e}", self.label)))?;
             Some(e.into_owned())
         };
@@ -504,9 +521,9 @@ impl ZarrWriter {
     }
 
     fn stripe(index: &[u64]) -> usize {
-        let h = index
-            .iter()
-            .fold(0xcbf29ce484222325u64, |h, &v| (h ^ v).wrapping_mul(0x100000001b3));
+        let h = index.iter().fold(0xcbf29ce484222325u64, |h, &v| {
+            (h ^ v).wrapping_mul(0x100000001b3)
+        });
         (h % STRIPES as u64) as usize
     }
 
@@ -580,8 +597,8 @@ impl ZarrWriter {
                 let at: Vec<u64> = (0..n).map(|i| first[i] - origin[i]).collect();
                 let in_unit = ArraySubset::new_with_start_shape(at, sub).map_err(|e| err(&e))?;
                 // part of a shard: its inner chunks appended in place (partial encoding)
-                let options = Self::options(each)
-                    .with_experimental_partial_encoding(self.sharded && !whole);
+                let options =
+                    Self::options(each).with_experimental_partial_encoding(self.sharded && !whole);
                 self.array
                     .store_chunk_subset_opt(&index, &in_unit, ArrayBytes::from(data), &options)
                     .map_err(|e| err(&e))
@@ -602,7 +619,11 @@ mod tests {
         let store = Arc::new(FilesystemStore::new(path).unwrap());
         let mut b = ArrayBuilder::new(
             vec![5, 70, 90],
-            if shards { vec![5, 32, 32] } else { vec![2, 16, 16] },
+            if shards {
+                vec![5, 32, 32]
+            } else {
+                vec![2, 16, 16]
+            },
             data_type::uint16(),
             0u16,
         );
@@ -615,10 +636,8 @@ mod tests {
     #[test]
     fn stores_whole_units_and_edges() {
         for shards in [false, true] {
-            let dir = std::env::temp_dir().join(format!(
-                "dyna_writer_{}_{shards}",
-                std::process::id()
-            ));
+            let dir =
+                std::env::temp_dir().join(format!("dyna_writer_{}_{shards}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             create(&dir, shards);
@@ -637,10 +656,13 @@ mod tests {
                 bottom.extend_from_slice(&p[cut as usize * row..]);
             }
             w.store(&[0, 0, 0], &[5, cut, 90], &top, 4, None).unwrap();
-            w.store(&[0, cut, 0], &[5, 70 - cut, 90], &bottom, 1, None).unwrap();
+            w.store(&[0, cut, 0], &[5, 70 - cut, 90], &bottom, 1, None)
+                .unwrap();
             let back = read(&ZarrArray::open(&dir).unwrap(), &[0, 0, 0], &[5, 70, 90], 2).unwrap();
             assert_eq!(back, bytes, "sharded: {shards}");
-            assert!(w.store(&[0, 0, 0], &[5, 70, 90], &bytes[1..], 1, None).is_err());
+            assert!(w
+                .store(&[0, 0, 0], &[5, 70, 90], &bytes[1..], 1, None)
+                .is_err());
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -648,10 +670,8 @@ mod tests {
     #[test]
     fn bands_cut_mid_chunk_stored_at_once_lose_nothing() {
         for shards in [false, true] {
-            let dir = std::env::temp_dir().join(format!(
-                "dyna_writer_bands_{}_{shards}",
-                std::process::id()
-            ));
+            let dir = std::env::temp_dir()
+                .join(format!("dyna_writer_bands_{}_{shards}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             create(&dir, shards);
@@ -685,7 +705,8 @@ mod tests {
     #[test]
     fn a_shard_written_inner_chunk_by_chunk_has_no_dead_space() {
         let dir = std::env::temp_dir().join(format!("dyna_writer_inner_{}", std::process::id()));
-        let whole = std::env::temp_dir().join(format!("dyna_writer_inner_w_{}", std::process::id()));
+        let whole =
+            std::env::temp_dir().join(format!("dyna_writer_inner_w_{}", std::process::id()));
         for d in [&dir, &whole] {
             let _ = std::fs::remove_dir_all(d);
             std::fs::create_dir_all(d).unwrap();
@@ -694,7 +715,10 @@ mod tests {
         let all: Vec<u8> = (0..5 * 70 * 90u64)
             .flat_map(|i| ((i % 3000) as u16 + 1).to_ne_bytes())
             .collect();
-        ZarrWriter::open(&whole).unwrap().store(&[0, 0, 0], &[5, 70, 90], &all, 2, None).unwrap();
+        ZarrWriter::open(&whole)
+            .unwrap()
+            .store(&[0, 0, 0], &[5, 70, 90], &all, 2, None)
+            .unwrap();
         let w = ZarrWriter::open(&dir).unwrap();
         // inner chunks of (5, 16, 16), one at a time, in any order
         let mut boxes = Vec::new();
@@ -719,10 +743,17 @@ mod tests {
         assert_eq!(back, all);
         let size = |d: &std::path::Path| -> u64 {
             fn walk(p: &std::path::Path) -> u64 {
-                std::fs::read_dir(p).unwrap().map(|e| {
-                    let e = e.unwrap();
-                    if e.file_type().unwrap().is_dir() { walk(&e.path()) } else { e.metadata().unwrap().len() }
-                }).sum()
+                std::fs::read_dir(p)
+                    .unwrap()
+                    .map(|e| {
+                        let e = e.unwrap();
+                        if e.file_type().unwrap().is_dir() {
+                            walk(&e.path())
+                        } else {
+                            e.metadata().unwrap().len()
+                        }
+                    })
+                    .sum()
             }
             walk(d)
         };
@@ -749,7 +780,10 @@ mod tests {
                 (if y < 16 { 0u16 } else { (i % 3000) as u16 + 1 }).to_ne_bytes()
             })
             .collect();
-        ZarrWriter::open(&whole).unwrap().store(&[0, 0, 0], &[5, 70, 90], &all, 2, None).unwrap();
+        ZarrWriter::open(&whole)
+            .unwrap()
+            .store(&[0, 0, 0], &[5, 70, 90], &all, 2, None)
+            .unwrap();
         let w = ZarrWriter::open(&dir).unwrap();
         assert!(w.appends());
         let mut boxes = Vec::new();
@@ -775,17 +809,31 @@ mod tests {
         assert_eq!(back, all);
         let size = |d: &std::path::Path| -> u64 {
             fn walk(p: &std::path::Path) -> u64 {
-                std::fs::read_dir(p).unwrap().map(|e| {
-                    let e = e.unwrap();
-                    if e.file_type().unwrap().is_dir() { walk(&e.path()) } else { e.metadata().unwrap().len() }
-                }).sum()
+                std::fs::read_dir(p)
+                    .unwrap()
+                    .map(|e| {
+                        let e = e.unwrap();
+                        if e.file_type().unwrap().is_dir() {
+                            walk(&e.path())
+                        } else {
+                            e.metadata().unwrap().len()
+                        }
+                    })
+                    .sum()
             }
             walk(d)
         };
-        assert!(size(&dir) <= size(&whole) + size(&whole) / 50, "{} vs {}", size(&dir), size(&whole));
+        assert!(
+            size(&dir) <= size(&whole) + size(&whole) / 50,
+            "{} vs {}",
+            size(&dir),
+            size(&whole)
+        );
         // not one inner chunk, or twice: refused
         let w2 = ZarrWriter::open(&dir).unwrap();
-        assert!(w2.append(&[0, 8, 0], &[5, 16, 16], &vec![0u8; 5 * 16 * 16 * 2]).is_err());
+        assert!(w2
+            .append(&[0, 8, 0], &[5, 16, 16], &vec![0u8; 5 * 16 * 16 * 2])
+            .is_err());
         for d in [&dir, &whole] {
             let _ = std::fs::remove_dir_all(d);
         }

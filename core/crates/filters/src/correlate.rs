@@ -318,7 +318,12 @@ pub fn correlate1d_stepped<T: Element, U: Element>(
                     }
                 }
                 for qi in 0..qn {
-                    k.lanes(scratch, qi * step + size1, m, &mut dst[qi * inner + l0..][..m]);
+                    k.lanes(
+                        scratch,
+                        qi * step + size1,
+                        m,
+                        &mut dst[qi * inner + l0..][..m],
+                    );
                 }
             }
         };
@@ -599,7 +604,13 @@ mod tests {
         for w in weights {
             for axis in 0..3 {
                 for step in [2usize, 3, 4] {
-                    for mode in [Mode::Reflect, Mode::Mirror, Mode::Nearest, Mode::Constant(2.5), Mode::Wrap] {
+                    for mode in [
+                        Mode::Reflect,
+                        Mode::Mirror,
+                        Mode::Nearest,
+                        Mode::Constant(2.5),
+                        Mode::Wrap,
+                    ] {
                         let len = shape[axis];
                         let full_f: Vec<f64> = whole(&xf, &shape, axis, w, mode);
                         let full_i: Vec<u16> = whole(&xi, &shape, axis, w, mode);
@@ -608,11 +619,22 @@ mod tests {
                             let mut oshape = shape;
                             oshape[axis] = out_len;
                             let m: usize = oshape.iter().product();
-                            let span = Span { len, start: 0, out_start: phase, out_len };
+                            let span = Span {
+                                len,
+                                start: 0,
+                                out_start: phase,
+                                out_len,
+                            };
                             let mut got_f = vec![0f64; m];
                             let mut got_i = vec![0u16; m];
-                            correlate1d_stepped(false, &xf, &shape, axis, w, 0, mode, span, step, &mut got_f).unwrap();
-                            correlate1d_stepped(true, &xi, &shape, axis, w, 0, mode, span, step, &mut got_i).unwrap();
+                            correlate1d_stepped(
+                                false, &xf, &shape, axis, w, 0, mode, span, step, &mut got_f,
+                            )
+                            .unwrap();
+                            correlate1d_stepped(
+                                true, &xi, &shape, axis, w, 0, mode, span, step, &mut got_i,
+                            )
+                            .unwrap();
                             let outer: usize = shape[..axis].iter().product();
                             let inner: usize = shape[axis + 1..].iter().product();
                             for o in 0..outer {
@@ -620,7 +642,11 @@ mod tests {
                                     for l in 0..inner {
                                         let a = (o * len + phase + k * step) * inner + l;
                                         let b = (o * out_len + k) * inner + l;
-                                        assert_eq!(got_f[b].to_bits(), full_f[a].to_bits(), "{w:?} axis {axis} step {step} {mode:?}");
+                                        assert_eq!(
+                                            got_f[b].to_bits(),
+                                            full_f[a].to_bits(),
+                                            "{w:?} axis {axis} step {step} {mode:?}"
+                                        );
                                         assert_eq!(got_i[b], full_i[a]);
                                     }
                                 }

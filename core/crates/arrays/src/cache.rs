@@ -203,7 +203,8 @@ mod tests {
     #[test]
     fn too_large_is_not_kept_and_errors_are_retried() {
         let c = ChunkCache::new(8);
-        c.get_or_decode((1, vec![0]), 16, || Ok(vec![0; 16])).unwrap();
+        c.get_or_decode((1, vec![0]), 16, || Ok(vec![0; 16]))
+            .unwrap();
         assert_eq!(c.lock().unwrap().used, 0);
         let e = c.get_or_decode((1, vec![1]), 4, || Err(ReadError::new("x".into())));
         assert!(e.is_err());

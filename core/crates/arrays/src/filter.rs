@@ -25,8 +25,8 @@ use crate::dtype::DType;
 use crate::out::Out;
 use crate::pool::install;
 use crate::source::{read_vec, region, Source, SourceRef, SMALL};
-use std::sync::Arc;
 use crate::ReadError;
+use std::sync::Arc;
 
 pub use fl::{Combine, Line as FilterLine, Mode as FilterMode, Pass};
 
@@ -181,7 +181,9 @@ impl Separable {
     fn stages(&self, chain: &[Pass], start: &[u64], stop: &[u64]) -> Vec<Stage> {
         let shape = self.src.shape();
         let n = start.len();
-        let lo: Vec<u64> = (0..n).map(|a| self.phase[a] + start[a] * self.step[a]).collect();
+        let lo: Vec<u64> = (0..n)
+            .map(|a| self.phase[a] + start[a] * self.step[a])
+            .collect();
         let hi: Vec<u64> = (0..n)
             .map(|a| {
                 if stop[a] <= start[a] {
@@ -264,8 +266,7 @@ impl Separable {
             for (i, p) in chain.iter().enumerate() {
                 let (b, next) = (&stages[i], &stages[i + 1]);
                 let a = p.axis;
-                let shape: Vec<usize> =
-                    self.stage_shape(b).iter().map(|&x| x as usize).collect();
+                let shape: Vec<usize> = self.stage_shape(b).iter().map(|&x| x as usize).collect();
                 let out_len = self.extent(next, a) as usize;
                 let span = fl::Span {
                     len: full[a] as usize,
@@ -273,7 +274,11 @@ impl Separable {
                     out_start: next.at.0[a] as usize,
                     out_len,
                 };
-                let step = if next.dec[a] { self.step[a] as usize } else { 1 };
+                let step = if next.dec[a] {
+                    self.step[a] as usize
+                } else {
+                    1
+                };
                 let count = cur.len() / shape[a].max(1) * out_len;
                 let mut out_buf = vec![T::default(); count];
                 let mut run = || p.run_stepped(parallel, &cur, &shape, span, step, &mut out_buf);
@@ -345,7 +350,11 @@ impl Separable {
                 let a = p.axis;
                 let out_len = self.extent(&stages[i + 1], a) as usize;
                 // a stepped running window computes its contiguous run first
-                let step = if stages[i + 1].dec[a] { self.step[a] } else { 1 };
+                let step = if stages[i + 1].dec[a] {
+                    self.step[a]
+                } else {
+                    1
+                };
                 let run = if step > 1 && !matches!(p.line, FilterLine::Correlate { .. }) {
                     size(&stages[i + 1]) * step
                 } else {
@@ -404,7 +413,9 @@ fn gather<T: Copy>(data: &[T], have: &Box_, want: &Stage, step: &[u64]) -> Vec<T
             }
         })
         .collect();
-    let off: Vec<usize> = (0..n).map(|k| (want.at.0[k] - have.0[k]) as usize).collect();
+    let off: Vec<usize> = (0..n)
+        .map(|k| (want.at.0[k] - have.0[k]) as usize)
+        .collect();
     let count: usize = ws.iter().product();
     let mut out = Vec::with_capacity(count);
     if count == 0 || n == 0 {
@@ -735,9 +746,17 @@ mod tests {
                 Pass::correlate(1, w.clone(), FilterMode::Reflect),
                 Pass::correlate(2, w.clone(), FilterMode::Reflect),
             ],
-            vec![Pass::correlate(2, vec![0.1, 0.5, 0.2, 0.15], FilterMode::Mirror)],
+            vec![Pass::correlate(
+                2,
+                vec![0.1, 0.5, 0.2, 0.15],
+                FilterMode::Mirror,
+            )],
             vec![
-                Pass { axis: 1, line: FilterLine::Uniform { size: 3, origin: 0 }, mode: FilterMode::Nearest },
+                Pass {
+                    axis: 1,
+                    line: FilterLine::Uniform { size: 3, origin: 0 },
+                    mode: FilterMode::Nearest,
+                },
                 Pass::correlate(2, w.clone(), FilterMode::Constant(1.5)),
             ],
             vec![Pass::correlate(0, w.clone(), FilterMode::Wrap)],
@@ -746,10 +765,16 @@ mod tests {
             let f = Separable::new(src.clone(), passes.clone()).unwrap();
             let all = read(&f, &[0, 0, 0], &[7, 9, 11], 1).unwrap();
             let all: Vec<f64> = all
-                .chunks_exact(8)
-                .map(|b| f64::from_ne_bytes(b.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| f64::from_ne_bytes(*b))
                 .collect();
-            for (phase, step) in [([0, 0, 0], [1, 2, 2]), ([1, 1, 0], [2, 3, 2]), ([0, 2, 1], [3, 1, 4])] {
+            for (phase, step) in [
+                ([0, 0, 0], [1, 2, 2]),
+                ([1, 1, 0], [2, 3, 2]),
+                ([0, 2, 1], [3, 1, 4]),
+            ] {
                 let s = f.with_steps(&phase, &step).unwrap();
                 let sh = s.shape().to_vec();
                 for (a, b) in [([0, 0, 0], sh.clone()), ([1, 1, 1], sh.clone())] {
@@ -759,8 +784,10 @@ mod tests {
                     for threads in [1, 3] {
                         let got = read(&s, &a, &b, threads).unwrap();
                         let got: Vec<f64> = got
-                            .chunks_exact(8)
-                            .map(|c| f64::from_ne_bytes(c.try_into().unwrap()))
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|c| f64::from_ne_bytes(*c))
                             .collect();
                         let mut k = 0;
                         for i in a[0]..b[0] {
@@ -772,7 +799,11 @@ mod tests {
                                         (phase[2] + l * step[2]) as usize,
                                     );
                                     let want = all[(x * 9 + y) * 11 + z];
-                                    assert_eq!(got[k].to_bits(), want.to_bits(), "{passes:?} {phase:?} {step:?}");
+                                    assert_eq!(
+                                        got[k].to_bits(),
+                                        want.to_bits(),
+                                        "{passes:?} {phase:?} {step:?}"
+                                    );
                                     k += 1;
                                 }
                             }

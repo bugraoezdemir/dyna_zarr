@@ -15,11 +15,11 @@ use zarrs::plugin::{ExtensionName, ZarrVersion};
 use zarrs::storage::{ReadableStorage, StorageError, StoreKey};
 use zarrs_zip::ZipStorageAdapter;
 
+use crate::blocks::Blocks;
+use crate::cache::ChunkCache;
 use crate::dtype::DType;
 use crate::out::Out;
 use crate::pool::{install, new_pool};
-use crate::blocks::Blocks;
-use crate::cache::ChunkCache;
 use crate::source::{bytes_of, c_strides, region, Source, SMALL};
 use crate::ReadError;
 
@@ -39,8 +39,11 @@ const PER_CHUNK_EXTRA: u64 = 16 << 10;
 pub struct ReadStore {
     base: std::path::PathBuf,
     active: std::sync::atomic::AtomicUsize,
-    open: std::sync::Mutex<std::collections::HashMap<String, Option<Arc<(std::fs::File, u64)>>>>,
+    open: std::sync::Mutex<std::collections::HashMap<String, Option<FileRef>>>,
 }
+
+/// An open file and its size.
+type FileRef = Arc<(std::fs::File, u64)>;
 
 /// Ends a read of a [`ReadStore`] (the files close when the last read ends).
 pub struct Reading<'a>(&'a ReadStore);
@@ -70,7 +73,8 @@ impl ReadStore {
 
     /// Files opened until the returned guard drops are shared by the reads running.
     pub fn reading(&self) -> Reading<'_> {
-        self.active.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Reading(self)
     }
 
@@ -83,8 +87,8 @@ impl ReadStore {
         p
     }
 
-    fn file(&self, key: &StoreKey) -> Result<Option<Arc<(std::fs::File, u64)>>, StorageError> {
-        let opened = || -> Result<Option<Arc<(std::fs::File, u64)>>, StorageError> {
+    fn file(&self, key: &StoreKey) -> Result<Option<FileRef>, StorageError> {
+        let opened = || -> Result<Option<FileRef>, StorageError> {
             match std::fs::File::open(self.path(key)) {
                 Ok(f) => {
                     let size = f.metadata()?.len();
@@ -97,7 +101,12 @@ impl ReadStore {
         if self.active.load(std::sync::atomic::Ordering::Acquire) == 0 {
             return opened();
         }
-        if let Some(f) = self.open.lock().ok().and_then(|m| m.get(key.as_str()).cloned()) {
+        if let Some(f) = self
+            .open
+            .lock()
+            .ok()
+            .and_then(|m| m.get(key.as_str()).cloned())
+        {
             return Ok(f);
         }
         let f = opened()?;
@@ -145,9 +154,9 @@ impl zarrs::storage::ReadableStorageTraits for ReadStore {
                     ByteRange::Suffix(len) => size.saturating_sub(len),
                 };
                 let len = match r {
-                    ByteRange::FromStart(o, None) => size.checked_sub(o).ok_or_else(|| {
-                        StorageError::from(InvalidByteRangeError::new(r, size))
-                    })?,
+                    ByteRange::FromStart(o, None) => size
+                        .checked_sub(o)
+                        .ok_or_else(|| StorageError::from(InvalidByteRangeError::new(r, size)))?,
                     ByteRange::FromStart(_, Some(len)) | ByteRange::Suffix(len) => len,
                 };
                 let mut buf = vec![0u8; len as usize];
@@ -339,7 +348,6 @@ impl ZarrArray {
         result.map_err(|e| ReadError::new(format!("{}: {e}", self.label)))
     }
 
-
     /// The region through `cache`: per unit it touches (the inner chunk when sharded),
     /// the whole unit from the cache or decoded into it, and the region's part copied
     /// out. At most `threads` units decoded at once, each with one thread.
@@ -519,7 +527,11 @@ mod tests {
         let a = b.build(store, "/").unwrap();
         a.store_metadata().unwrap();
         let data = vec![v; 4 * 64 * 64];
-        a.store_array_subset(&ArraySubset::new_with_shape(vec![4, 64, 64]), data.as_slice()).unwrap();
+        a.store_array_subset(
+            &ArraySubset::new_with_shape(vec![4, 64, 64]),
+            data.as_slice(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -530,12 +542,20 @@ mod tests {
         write(&dir, 7);
         let a = ZarrArray::open(&dir).unwrap();
         let first = read(&a, &[0, 0, 0], &[4, 64, 64], 4).unwrap();
-        assert!(first.chunks_exact(2).all(|b| u16::from_ne_bytes([b[0], b[1]]) == 7));
+        assert!(first
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|b| u16::from_ne_bytes(*b) == 7));
         // nothing is kept open between reads
         assert!(a.files.as_ref().unwrap().open.lock().unwrap().is_empty());
         write(&dir, 9); // rewritten on disk, the same ZarrArray read again
         let second = read(&a, &[0, 0, 0], &[4, 64, 64], 4).unwrap();
-        assert!(second.chunks_exact(2).all(|b| u16::from_ne_bytes([b[0], b[1]]) == 9));
+        assert!(second
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .all(|b| u16::from_ne_bytes(*b) == 9));
         // during a read, the shards' files are opened once and shared
         let files = a.files.as_ref().unwrap();
         {

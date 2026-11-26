@@ -51,7 +51,7 @@ impl Pool {
         if threads < 1 {
             return Err(PyValueError::new_err("a pool needs at least 1 thread"));
         }
-        if !(cache_mb >= 0.0) {
+        if cache_mb.is_nan() || cache_mb < 0.0 {
             return Err(PyValueError::new_err("cache_mb must be 0 or more"));
         }
         let bytes = (cache_mb * 1048576.0) as u64;
@@ -103,7 +103,9 @@ impl Writer {
     #[new]
     fn new(py: Python<'_>, path: PathBuf) -> PyResult<Self> {
         let w = py.detach(|| ar::ZarrWriter::open(&path)).map_err(err)?;
-        Ok(Self { writer: Arc::new(w) })
+        Ok(Self {
+            writer: Arc::new(w),
+        })
     }
 
     #[getter]
@@ -146,14 +148,8 @@ impl Writer {
                 dtype.name()
             )));
         }
-        let native: bool = data
-            .getattr("dtype")?
-            .getattr("isnative")?
-            .extract()?;
-        let contiguous: bool = data
-            .getattr("flags")?
-            .getattr("c_contiguous")?
-            .extract()?;
+        let native: bool = data.getattr("dtype")?.getattr("isnative")?.extract()?;
+        let contiguous: bool = data.getattr("flags")?.getattr("c_contiguous")?.extract()?;
         if !native || !contiguous {
             return Err(PyValueError::new_err(
                 "data must be a C-contiguous NumPy array in native byte order",

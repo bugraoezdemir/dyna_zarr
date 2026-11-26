@@ -132,8 +132,7 @@ impl Pass {
         }
         if let Line::Correlate { weights, origin } = &self.line {
             return correlate1d_stepped(
-                parallel, input, shape, self.axis, weights, *origin, self.mode, span, step,
-                output,
+                parallel, input, shape, self.axis, weights, *origin, self.mode, span, step, output,
             );
         }
         let a = self.axis;

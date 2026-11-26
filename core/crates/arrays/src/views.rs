@@ -174,7 +174,11 @@ impl Slice {
             // axis (each block reads its halo; a block per chunk read each up to 9x in 2-D)
             let item = self.dtype().size() as u64;
             let span = |p: &[u64]| -> u64 {
-                p.iter().zip(&self.step).map(|(a, s)| a * s).product::<u64>() * item
+                p.iter()
+                    .zip(&self.step)
+                    .map(|(a, s)| a * s)
+                    .product::<u64>()
+                    * item
             };
             let mut per = r.to_vec();
             while span(&per) > HALO_SPAN && per.iter().any(|x| *x > 1) {
