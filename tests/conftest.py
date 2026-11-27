@@ -22,8 +22,23 @@ def pytest_configure(config):
     # markers were unknown ("PytestUnknownMarkWarning: Unknown pytest.mark.gpu").
     for marker in ("slow: slow integration tests",
                    "zarrista: needs the optional zarrista backend",
-                   "gpu: needs CuPy and a CUDA device"):
+                   "gpu: needs CuPy and a CUDA device",
+                   "scipy_sums: needs the engine's weighted sums to be this scipy's"):
         config.addinivalue_line("markers", marker)
+
+
+def pytest_runtest_setup(item):
+    """``scipy_sums``: the test compares the engine's weighted sums (correlate1d, the
+    Gaussians, the n-D correlate) with scipy's, or needs such a filter lowered. Where
+    this scipy's build rounds them otherwise (scipy 1.10 on macOS arm64), dyna keeps
+    the Python path for those filters (_lowering._scipy_sums_agree), and the test has
+    nothing to compare. test_engine_filters checks that the reference builds agree."""
+    if item.get_closest_marker("scipy_sums") is None:
+        return
+    from dyna_zarr import _lowering
+    if not _lowering._scipy_sums_agree():
+        pytest.skip("this scipy build rounds its weighted sums otherwise than the build "
+                    "the engine's kernels follow; dyna keeps the Python path for them")
 
 
 # ============================================================================

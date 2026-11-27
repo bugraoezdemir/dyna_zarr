@@ -69,6 +69,7 @@ def _pools(monkeypatch):
     return seen
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.parametrize("threads", [1, 4])
 def test_a_gaussian_downscale_write_decodes_each_chunk_once(source, tmp_path, monkeypatch,
                                                             capsys, threads):
@@ -86,6 +87,7 @@ def test_a_gaussian_downscale_write_decodes_each_chunk_once(source, tmp_path, mo
     np.testing.assert_array_equal(np.asarray(zarr.open_array(str(tmp_path / "o"))[:]), want)
 
 
+@pytest.mark.scipy_sums
 def test_a_copy_has_no_cache(source, tmp_path, monkeypatch, capsys):
     """Only chains that read a halo get one: a copy or a stride decodes each chunk once
     anyway, and keeps decoding straight into its destination."""
@@ -98,6 +100,7 @@ def test_a_copy_has_no_cache(source, tmp_path, monkeypatch, capsys):
     assert "chunk cache" not in capsys.readouterr().out
 
 
+@pytest.mark.scipy_sums
 def test_a_stepped_slice_reads_a_filter_whole(source):
     """One read of a strided filter decodes every chunk of its box once (before: each
     block of one chunk read its own halo, up to 9 decodes per chunk in 2-D)."""

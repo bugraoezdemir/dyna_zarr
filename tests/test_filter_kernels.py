@@ -70,6 +70,7 @@ def _ours_1d(x, w, axis, mode, cval=0.0, origin=0, out_dtype=None, threads=1):
 @pytest.mark.parametrize("kind, size", [("symmetric", 1), ("symmetric", 5),
                                         ("antisymmetric", 3), ("general", 4),
                                         ("general", 7), ("symmetric", 31)])
+@pytest.mark.scipy_sums
 def test_correlate1d_equals_scipy(dtype, mode, kind, size):
     w = _weights(kind, size, seed=size)
     for k, shape in enumerate(SHAPES):
@@ -85,6 +86,7 @@ def test_correlate1d_equals_scipy(dtype, mode, kind, size):
                                               f"origin {origin}")
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.parametrize("dtype", ["uint8", "int16", "float32"])
 def test_float_output_of_an_integer_or_float32_input(dtype):
     x = _data((6, 9), dtype, seed=3)
@@ -94,6 +96,7 @@ def test_float_output_of_an_integer_or_float32_input(dtype):
         np.testing.assert_array_equal(_ours_1d(x, w, 1, "mirror", out_dtype=out), want)
 
 
+@pytest.mark.scipy_sums
 def test_threads_change_nothing():
     x = _data((40, 30, 50), "float32", seed=5)
     w = _weights("symmetric", 9, seed=6)
@@ -132,6 +135,7 @@ def _gaussian_with_scipy_weights(x, sigma, order, mode, truncate=4.0, out_dtype=
                                           ((1.0, 1.0, 1.0), (0, 1, 0)),
                                           ((0.7, 3.0, 0.4), (2, 0, 1)),
                                           ((0.0, 0.0, 0.0), (0, 0, 0))])
+@pytest.mark.scipy_sums
 def test_gaussian_with_scipy_weights_equals_scipy(dtype, mode, sigma, order):
     x = _data((5, 17, 11), dtype, seed=7)
     if not X86 and np.dtype(dtype).kind != "f" and any(order):
@@ -149,10 +153,11 @@ def test_own_kernel_is_scipys_to_the_last_bits(sigma, order, radius):
     BLAS product, both of which can differ in the last bits between machines (on a
     Windows x86-64 machine with OpenBLAS, order 2 was fused into a multiply-add while
     orders 0, 1 and 3 matched exactly), so the engine passes scipy's own weights. The
-    crate's stay within 2 ulp."""
+    crate's stay within 2 ulp on x86-64 (NumPy 1.26's macOS arm64 build gave order 3
+    within 5 ulp)."""
     want = _gaussian_kernel1d(sigma, order, radius)[::-1]
     got = np.array(filters.gaussian_weights(sigma, order, radius))
-    np.testing.assert_array_max_ulp(got, want, maxulp=2)
+    np.testing.assert_array_max_ulp(got, want, maxulp=2 if X86 else 8)
 
 
 @pytest.mark.parametrize("n", [1, 2, 7, 8, 9, 16, 17, 127, 128, 129, 200, 513, 1000])
@@ -299,6 +304,7 @@ def _gaussian_chain(ndim, sigma, order, mode, truncate=4.0):
     return chain
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.parametrize("dtype", ["uint8", "int16", "uint16", "int32", "float32", "float64"])
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("sigma", [(1.0, 1.5, 2.0), (0.0, 1.0, 0.7)])
@@ -315,6 +321,7 @@ def test_gaussian_laplace_equals_scipy(dtype, mode, sigma):
     _same_bits(out, ndi.gaussian_laplace(x, sigma, mode=mode))
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.parametrize("dtype", ["float32", "float64"])
 @pytest.mark.parametrize("mode", MODES)
 @pytest.mark.parametrize("sigma", [(1.0, 1.5, 2.0), (0.0, 1.0, 0.7)])
@@ -483,6 +490,7 @@ def _correlate_out(x, w, origin=None, mode="reflect", cval=0.0, convolve=False, 
     return out
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.skipif(not X86, reason="integer results out of range wrap on x86-64 only")
 @pytest.mark.parametrize("dtype", TYPES)
 @pytest.mark.parametrize("mode", MODES)
@@ -506,6 +514,7 @@ def test_correlate_and_convolve_equal_scipy(dtype, mode, convolve):
             _same_bits(got, want, f"{shape} {w.shape} {origin}", nan_sign=False)
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.parametrize("dtype", ["uint8", "int16", "float32"])
 @pytest.mark.parametrize("out_dtype", ["float32", "float64"])
 def test_correlate_into_a_float_output_equals_scipy(dtype, out_dtype):
@@ -515,12 +524,14 @@ def test_correlate_into_a_float_output_equals_scipy(dtype, out_dtype):
     _same_bits(_correlate_out(x, w, mode="nearest", out_dtype=out_dtype), want)
 
 
+@pytest.mark.scipy_sums
 def test_correlate_with_no_weight_left_gives_zeros():
     x = _data((5, 6), "uint16", 1)
     w = np.array([[0.0, 1e-17], [np.nan, -2e-16]])
     _same_bits(_correlate_out(x, w), ndi.correlate(x, w))
 
 
+@pytest.mark.scipy_sums
 def test_correlate_on_threads_changes_nothing():
     x = _floats_with_specials((30, 40, 300), "float32", seed=14)
     w = np.random.default_rng(2).uniform(-1, 1, (3, 5, 3))

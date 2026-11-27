@@ -294,6 +294,7 @@ def test_an_operation_numpy_disagrees_on_keeps_the_python_path(tmp_path):
     _lowered_unless_numpy_differs(a - a)
 
 
+@pytest.mark.scipy_sums
 def test_a_filter_chain_written_as_python(tmp_path):
     """gaussian -> threshold -> where -> astype, written in regions by io.write: the
     whole chain in the engine, as the Python path and scipy / NumPy give it."""

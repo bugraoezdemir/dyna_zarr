@@ -60,6 +60,12 @@ def _same(e, p):
     np.testing.assert_array_equal(e, p)
 
 
+def _sums():
+    """Whether the engine takes the filters with weighted sums under this scipy (the
+    Gaussians, correlate, convolve; see _lowering._scipy_sums_agree)."""
+    return _lowering._scipy_sums_agree()
+
+
 def _keys(shape):
     a, b, c = shape
     return [
@@ -94,7 +100,7 @@ def test_gaussian_reads_as_python_and_scipy(tmp_path, dtype, mode, case):
         kw = {**kw, "cval": 3.0}
     data = _data(SHAPE, dtype)
     v = o.gaussian_filter(_zarr(tmp_path / "a.zarr", data), sigma, boundary=mode, **kw)
-    assert _lowering.lowered(v) is not None
+    assert (_lowering.lowered(v) is not None) == _sums()
     want = ndi.gaussian_filter(data, sigma, mode=mode, **kw)
     for key in _keys(v.shape):
         e, p = _both(lambda: np.asarray(v._read_direct(key)))
@@ -107,7 +113,7 @@ def test_written_as_python(tmp_path):
     data = _data((12, 96, 80), "uint16")
     v = o.gaussian_filter(_zarr(tmp_path / "a.zarr", data, chunks=(4, 32, 32)),
                           (1.0, 2.5, 2.0), boundary="mirror")
-    assert _lowering.lowered(v) is not None
+    assert (_lowering.lowered(v) is not None) == _sums()
     out = {}
     for on in (True, False):
         _engine.set_engine(on)
@@ -133,7 +139,7 @@ CHAINS = {
 @pytest.mark.parametrize("chain", list(CHAINS))
 def test_chains_read_as_python(tmp_path, chain):
     v = CHAINS[chain](_zarr(tmp_path / "a.zarr", _data(SHAPE, "uint16")))
-    assert _lowering.lowered(v) is not None
+    assert (_lowering.lowered(v) is not None) == _sums()
     _same(*_both(v.compute))
 
 
@@ -171,6 +177,7 @@ def test_a_gpu_device_is_not_lowered(tmp_path):
     assert _lowering.lowered(o.gaussian_filter(a, 1.0, device="cuda")) is None
 
 
+@pytest.mark.scipy_sums
 def test_a_filter_following_the_device_context_stays_out_of_a_gpu_context(tmp_path):
     """device=None follows the context of the read (cupy inside a GPU context); the
     engine reads on the CPU, so it stands aside there, for every array built on it."""
@@ -209,10 +216,10 @@ STEP3 = {
     "laplace": (lambda a, m, kw: o.laplace(a, boundary=m, **kw), lambda dt: True),
     "gaussian_laplace": (lambda a, m, kw: o.gaussian_laplace(a, (1.0, 1.5, 0.0),
                                                             boundary=m, **kw),
-                         lambda dt: True),
+                         lambda dt: _sums()),
     "gaussian_gradient_magnitude": (
         lambda a, m, kw: o.gaussian_gradient_magnitude(a, (0.8, 1.2, 2.0), boundary=m, **kw),
-        lambda dt: dt in ("float32", "float64")),
+        lambda dt: dt in ("float32", "float64") and _sums()),
 }
 
 
@@ -450,7 +457,7 @@ def test_step5_filters_read_as_python_and_scipy(tmp_path, dtype, mode, name):
     kw = {"cval": -3.5} if mode == "constant" else {}
     data = _with_specials(_data(SHAPE, dtype))
     v = build(_zarr(tmp_path / "a.zarr", data), mode, kw)
-    assert _lowering.lowered(v) is not None
+    assert (_lowering.lowered(v) is not None) == _sums()
     want = ref(data, mode, kw)
     for key in _keys(v.shape):
         e, p = _both(lambda: np.asarray(v._read_direct(key)))
@@ -473,7 +480,7 @@ def test_step5_written_as_python(tmp_path):
     a = _zarr(tmp_path / "a.zarr", data, chunks=(4, 32, 32))
     w = _kernel((3, 5, 5), 7)
     v = o.convolve(o.median_filter(a, 3), w, boundary="nearest")
-    assert _lowering.lowered(v) is not None
+    assert (_lowering.lowered(v) is not None) == _sums()
     out = {}
     for on in (True, False):
         _engine.set_engine(on)
@@ -483,3 +490,45 @@ def test_step5_written_as_python(tmp_path):
     _same(out[True], out[False])
     np.testing.assert_array_equal(out[True], ndi.convolve(ndi.median_filter(data, 3), w,
                                                           mode="nearest"))
+
+
+# ------------------------------------------------------------------- the scipy check
+
+def test_the_reference_builds_agree_with_the_engine():
+    """The builds the engine's kernels follow pass the check: scipy on x86-64 (every
+    release from the floor up), and scipy 1.17 or later on macOS arm64. Elsewhere the
+    check may fail, and dyna then keeps the Python path (the next test)."""
+    import platform
+    import sys
+
+    import scipy
+    x86 = platform.machine().lower() in ("x86_64", "amd64")
+    release = tuple(int(p) for p in scipy.__version__.split(".")[:2])
+    mac_arm = sys.platform == "darwin" and platform.machine().lower() == "arm64"
+    if not (x86 or (mac_arm and release >= (1, 17))):
+        pytest.skip("not a build the engine's kernels follow")
+    assert _lowering._scipy_sums_agree()
+
+
+def test_a_scipy_that_sums_otherwise_keeps_the_python_path(tmp_path, monkeypatch):
+    """Where the check fails, the filters with weighted sums keep the Python path (of
+    any type), the others still go to the engine, and every value stays scipy's."""
+    monkeypatch.setattr(_lowering, "_sums_agree", False)
+    data, ints = _data(SHAPE, "float64"), _data(SHAPE, "uint16")
+    a = _zarr(tmp_path / "a.zarr", data)
+    w = _kernel((3, 3, 3))
+    stays = {
+        "gaussian_filter": (o.gaussian_filter(a, 1.5), ndi.gaussian_filter(data, 1.5)),
+        "gaussian_laplace": (o.gaussian_laplace(a, 1.0), ndi.gaussian_laplace(data, 1.0)),
+        "gaussian_gradient_magnitude": (o.gaussian_gradient_magnitude(a, 1.0),
+                                        ndi.gaussian_gradient_magnitude(data, 1.0)),
+        "correlate": (o.correlate(a, w), ndi.correlate(data, w)),
+        "convolve": (o.convolve(a, w), ndi.convolve(data, w)),
+        "gaussian_filter-uint16": (o.gaussian_filter(_zarr(tmp_path / "b.zarr", ints), 1.0),
+                                   ndi.gaussian_filter(ints, 1.0)),
+    }
+    for name, (v, want) in stays.items():
+        assert _lowering.lowered(v) is None, name
+        np.testing.assert_array_equal(np.asarray(v.compute()), want, err_msg=name)
+    for v in (o.laplace(a), o.minimum_filter(a, 3)):
+        assert _lowering.lowered(v) is not None

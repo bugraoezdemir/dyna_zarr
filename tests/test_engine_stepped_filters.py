@@ -75,6 +75,7 @@ def test_regions_of_a_stepped_filter_are_its_parts(source):
         np.testing.assert_array_equal(np.asarray(v[sl].compute()), whole[sl])
 
 
+@pytest.mark.scipy_sums
 def test_the_lowered_view_computes_only_the_kept_elements(source):
     """The engine's view under the stride costs less than the full filter's read."""
     a = io.read(source)
