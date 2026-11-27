@@ -153,6 +153,7 @@ def test_the_write_with_its_cache_stays_within_the_budget(tmp_path):
     assert grew <= budget_mb + RUNTIME_MB, grew
 
 
+@pytest.mark.scipy_sums
 def test_without_a_budget_the_cache_is_capped(source):
     """Without memory_budget_mb a write's cache takes at most io._HALO_CACHE_MAX (64 MiB,
     measured 2026-11-27: as fast as the whole cache a Gaussian downscale asks for, with
@@ -170,6 +171,7 @@ def test_without_a_budget_the_cache_is_capped(source):
     assert mod._halo_cache_bytes(v, (4, 64, 64), 2, 1, None) == small
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.parametrize("budget_mb, whole", [(2000, True), (12, False)])
 def test_the_budget_plans_the_regions_first_then_the_cache(source, tmp_path, monkeypatch,
                                                           budget_mb, whole):
