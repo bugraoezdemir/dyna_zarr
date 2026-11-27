@@ -131,7 +131,7 @@ def test_cached_regions_are_the_values_of_direct_reads(source):
 
 
 def test_the_write_with_its_cache_stays_within_the_budget(tmp_path):
-    """The cache comes off memory_budget_mb before the regions are planned."""
+    """The cache gets what memory_budget_mb leaves once the regions are planned."""
     src = _source(tmp_path / "s.zarr", False)
     budget_mb = 40
     grew = _run("""
@@ -148,3 +148,97 @@ def test_the_write_with_its_cache_stays_within_the_budget(tmp_path):
         print(json.dumps((peak - before) / 2**20))
     """, src, tmp_path, budget_mb)
     assert grew <= budget_mb + RUNTIME_MB, grew
+
+
+def test_without_a_budget_the_cache_is_capped(source):
+    """Without memory_budget_mb a write's cache takes at most io._HALO_CACHE_MAX (64 MiB,
+    measured 2026-11-27: as fast as the whole cache a Gaussian downscale asks for, with
+    90-220 MB less at 16 threads); with a budget, what the plan leaves (``room``)."""
+    path, _ = source
+    mod = sys.modules["dyna_zarr.io"]
+    v = gaussian_filter(io.read(str(path)), SIGMA)[:, ::2, ::2]
+    big = mod._halo_cache_bytes(v, (8, 300, 350), 100, 16, 1 << 62)   # uncapped
+    assert big > mod._HALO_CACHE_MAX == 64 << 20
+    assert mod._halo_cache_bytes(v, (8, 300, 350), 100, 16, None) == mod._HALO_CACHE_MAX
+    assert mod._halo_cache_bytes(v, (8, 300, 350), 100, 16, 10 << 20) == 10 << 20
+    assert mod._halo_cache_bytes(v, (8, 300, 350), 100, 16, 0) == 0
+    small = mod._halo_cache_bytes(v, (4, 64, 64), 2, 1, 1 << 62)
+    assert 0 < small < mod._HALO_CACHE_MAX
+    assert mod._halo_cache_bytes(v, (4, 64, 64), 2, 1, None) == small
+
+
+@pytest.mark.parametrize("budget_mb, whole", [(2000, True), (12, False)])
+def test_the_budget_plans_the_regions_first_then_the_cache(source, tmp_path, monkeypatch,
+                                                          budget_mb, whole):
+    """Bugra 2026-11-26: the fast path when it fits the budget, a smaller cache when it
+    does not. The regions and threads are planned with the whole budget, as without a
+    cache; the cache gets what that plan leaves, whole when it fits (2000 MB), smaller
+    when the budget is tight (12 MB), never at the threads' expense."""
+    path, sharded = source
+    if sharded:
+        pytest.skip("written chunk by chunk through write_levels' tiles: the next test")
+    mod = sys.modules["dyna_zarr.io"]
+    plans, sizes = [], []
+    plan0, size0 = mod._plan_regions, mod._halo_cache_bytes
+
+    def plan(*a):
+        r = plan0(*a)
+        plans.append((a[4], r))
+        return r
+
+    def size(array, extent, along_last, threads, room):
+        got = size0(array, extent, along_last, threads, room)
+        sizes.append((room, got, size0(array, extent, along_last, threads, 1 << 62)))
+        return got
+    monkeypatch.setattr(mod, "_plan_regions", plan)
+    monkeypatch.setattr(mod, "_halo_cache_bytes", size)
+    v = gaussian_filter(io.read(str(path)), SIGMA, boundary="reflect")[:, ::2, ::2]
+    io.write(v, str(tmp_path / "o"), max_threads=8, region_size_mb=0.25,
+             memory_budget_mb=budget_mb)
+    (budget, (workers, _, region_bytes, fits)), = plans
+    assert budget == budget_mb * 2**20 and fits     # the whole budget, not minus a cache
+    (room, got, want), = sizes
+    assert room == budget - workers * region_bytes
+    assert (got == want) if whole else (0 < got == int(room) < want), (room, got, want)
+    _engine.set_engine(False)
+    np.testing.assert_array_equal(np.asarray(zarr.open_array(str(tmp_path / "o"))[:]),
+                                  np.asarray(v.compute()))
+
+
+@pytest.mark.parametrize("budget_mb", [2000, 12])
+def test_the_tiled_pass_plans_the_tiles_first_then_the_cache(tmp_path, monkeypatch, budget_mb):
+    """The same rule in write_levels' tiled pass (a sharded output written chunk by
+    chunk): the tiles are planned with the whole budget and smaller shares of it; the
+    plan with the most levels per pass and then the most threads wins (a whole cache
+    beside it only breaks ties), and the cache gets at most what that plan leaves."""
+    src = _source(tmp_path / "s.zarr", True)
+    mod = sys.modules["dyna_zarr.io"]
+    plans, rooms = [], []
+    plan0, size0 = mod._plan_xy_tiles, mod._halo_cache_bytes
+
+    def plan(*a, **k):
+        r = plan0(*a, **k)
+        plans.append((a[5], r))
+        return r
+
+    def size(array, extent, along_last, threads, room):
+        if room != 1 << 62:                         # not the planner sizing a candidate
+            rooms.append((threads, room))
+        return size0(array, extent, along_last, threads, room)
+    monkeypatch.setattr(mod, "_plan_xy_tiles", plan)
+    monkeypatch.setattr(mod, "_halo_cache_bytes", size)
+    v = gaussian_filter(io.read(str(src)), SIGMA, boundary="reflect")[:, ::2, ::2]
+    io.write(v, str(tmp_path / "o"), max_threads=8, region_size_mb=0.25,
+             memory_budget_mb=budget_mb)
+    budget = budget_mb * 2**20
+    assert plans[0][0] == budget                    # the whole budget first
+    fit = [p for _, p in plans if p["fits"]]
+    most_n = max(p["n"] for p in fit)
+    (threads, room), = rooms
+    # the threads are not cut for the cache
+    assert threads == max(p["workers"] for p in fit if p["n"] == most_n)
+    kept = [p for p in fit if (p["n"], p["workers"]) == (most_n, threads)]
+    assert room is not None and room + min(p["chunks"] + p["blocks"] for p in kept) <= budget + 1
+    _engine.set_engine(False)
+    np.testing.assert_array_equal(np.asarray(zarr.open_array(str(tmp_path / "o"))[:]),
+                                  np.asarray(v.compute()))
