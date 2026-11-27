@@ -115,7 +115,12 @@ def test_gaussian_with_a_given_sigma_and_a_wide_kernel(tmp_path):
     data = _data((8, 40, 50), "float64", seed=4)
     a = _store(tmp_path, data, (4, 16, 16))
     got = _all(a.downsample([1, 2, 2], "gaussian", sigma=[0.0, 3.0, 1.5], truncate=3.0))
-    np.testing.assert_allclose(got, _gaussian_ref(data, (1, 2, 2), [0.0, 3.0, 1.5], "reflect", 3.0), rtol=1e-12)
+    want = _gaussian_ref(data, (1, 2, 2), [0.0, 3.0, 1.5], "reflect", 3.0)
+    # Close to scipy, not bit for bit (dyna's own Gaussian goes through the filters, which
+    # are): the engine computes its weights in Rust and sums in its own order, so a
+    # value much smaller than its neighbours can differ by a few units in the last place
+    # (scipy 1.10: 8 of them on one value of 4000). Hence a tolerance on the data's scale.
+    np.testing.assert_allclose(got, want, rtol=1e-12, atol=1e-14 * np.abs(want).max())
     # a kernel wider than the array: reflect folds several times
     small = _store(tmp_path, data[:2, :3, :4].copy(), (2, 3, 4), "small")
     got = _all(small.downsample([1, 1, 2], "gaussian", sigma=[0.0, 4.0, 4.0]))

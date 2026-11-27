@@ -256,7 +256,13 @@ def test_other_expressions_keep_the_python_path(tmp_path, expr):
     b = _zarr(tmp_path / "b.zarr", _data(SHAPE, "float32", 2))
     c = _zarr(tmp_path / "c.zarr", _data(SHAPE, "uint8", 3))
     v = STAYS[expr](a, b, c)
-    assert _lowering.lowered(v) is None
+    if expr == "out-of-range" and np.lib.NumpyVersion(np.__version__) < "2.0.0":
+        # NumPy 1 casts by value: c < 300 runs as a uint16 comparison, which holds 300
+        # exactly, so the engine takes it (NumPy 2 refuses 300 for uint8). The values
+        # are compared below either way.
+        assert _lowering.lowered(v) is not None
+    else:
+        assert _lowering.lowered(v) is None
     assert _lowering.lowered(a) is not None              # the sources still are
     for key in _keys(v.shape)[:2]:
         e, p = _both(lambda: np.asarray(v._read_direct(key)))
@@ -288,6 +294,7 @@ def test_an_operation_numpy_disagrees_on_keeps_the_python_path(tmp_path):
     _lowered_unless_numpy_differs(a - a)
 
 
+@pytest.mark.scipy_sums
 def test_a_filter_chain_written_as_python(tmp_path):
     """gaussian -> threshold -> where -> astype, written in regions by io.write: the
     whole chain in the engine, as the Python path and scipy / NumPy give it."""

@@ -69,6 +69,7 @@ def _pools(monkeypatch):
     return seen
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.parametrize("threads", [1, 4])
 def test_a_gaussian_downscale_write_decodes_each_chunk_once(source, tmp_path, monkeypatch,
                                                             capsys, threads):
@@ -86,6 +87,7 @@ def test_a_gaussian_downscale_write_decodes_each_chunk_once(source, tmp_path, mo
     np.testing.assert_array_equal(np.asarray(zarr.open_array(str(tmp_path / "o"))[:]), want)
 
 
+@pytest.mark.scipy_sums
 def test_a_copy_has_no_cache(source, tmp_path, monkeypatch, capsys):
     """Only chains that read a halo get one: a copy or a stride decodes each chunk once
     anyway, and keeps decoding straight into its destination."""
@@ -98,6 +100,7 @@ def test_a_copy_has_no_cache(source, tmp_path, monkeypatch, capsys):
     assert "chunk cache" not in capsys.readouterr().out
 
 
+@pytest.mark.scipy_sums
 def test_a_stepped_slice_reads_a_filter_whole(source):
     """One read of a strided filter decodes every chunk of its box once (before: each
     block of one chunk read its own halo, up to 9 decodes per chunk in 2-D)."""
@@ -150,6 +153,7 @@ def test_the_write_with_its_cache_stays_within_the_budget(tmp_path):
     assert grew <= budget_mb + RUNTIME_MB, grew
 
 
+@pytest.mark.scipy_sums
 def test_without_a_budget_the_cache_is_capped(source):
     """Without memory_budget_mb a write's cache takes at most io._HALO_CACHE_MAX (64 MiB,
     measured 2026-11-27: as fast as the whole cache a Gaussian downscale asks for, with
@@ -167,6 +171,7 @@ def test_without_a_budget_the_cache_is_capped(source):
     assert mod._halo_cache_bytes(v, (4, 64, 64), 2, 1, None) == small
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.parametrize("budget_mb, whole", [(2000, True), (12, False)])
 def test_the_budget_plans_the_regions_first_then_the_cache(source, tmp_path, monkeypatch,
                                                           budget_mb, whole):

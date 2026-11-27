@@ -23,7 +23,9 @@ What the engine takes over, and only where it gives the Python path's exact valu
   gaussian_gradient_magnitude (float32 / float64: for integers scipy's square root goes
   through NumPy casts the engine does not follow), minimum_filter, maximum_filter,
   grey_erosion and grey_dilation (any numeric type), and uniform_filter for integers up
-  to 32 bits. The Gaussians run scipy's own kernel weights in scipy's order.
+  to 32 bits. The Gaussians run scipy's own kernel weights in scipy's order. The
+  filters with weighted sums (the Gaussians, correlate, convolve) go to the engine only
+  where it gives the installed scipy's values (see _scipy_sums_agree).
   median_filter, rank_filter and percentile_filter (step 4) for any numeric type on
   arrays of two or more dimensions, and for integers up to 32 bits on 1-D arrays (see
   _rank). correlate and convolve with a real n-D kernel (step 5), any numeric type.
@@ -58,6 +60,7 @@ from __future__ import annotations
 import operator
 import os
 import threading
+import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -321,6 +324,99 @@ def _label_tiles(t, spec):
 _FILTER_MODES = {"reflect", "mirror", "nearest", "wrap", "constant"}
 
 
+# -------------------------------------------------------------------- the scipy check
+
+#: whether the engine's weighted sums give this scipy's values (None: not checked yet)
+_sums_agree: Optional[bool] = None
+_sums_lock = threading.Lock()
+
+
+def _same_values(want, got) -> bool:
+    return want.dtype == got.dtype and want.shape == got.shape and bool(
+        np.array_equal(want, got))
+
+
+def _probe_sums(filters) -> bool:
+    """The engine's correlate1d and n-D correlate against this scipy's, in float64."""
+    import scipy.ndimage as ndi
+    from scipy.ndimage._filters import _gaussian_kernel1d
+
+    rng = np.random.default_rng(20261127)
+    kernels = []
+    for size in (3, 5, 9, 21, 31):          # symmetric: below and above 8 pairs of taps
+        w = rng.uniform(-1, 1, size)
+        kernels.append((w + w[::-1]) / 2)
+    for size in (3, 5, 21):                 # antisymmetric
+        w = rng.uniform(-1, 1, size)
+        kernels.append((w - w[::-1]) / 2)
+    for size in (2, 4, 7, 12):              # general, even and odd
+        kernels.append(rng.uniform(-1, 1, size))
+    for sigma, order in ((1.5, 0), (3.0, 0), (3.0, 1), (3.0, 2)):
+        # the Gaussians' own weights, reversed as gaussian_filter1d reverses them
+        kernels.append(_gaussian_kernel1d(sigma, order, int(4.0 * sigma + 0.5))[::-1])
+    x = rng.standard_normal((6, 67)) * 50
+    for w in kernels:
+        for axis in (0, 1):
+            got = np.empty_like(x)
+            filters.correlate1d(x, [float(v) for v in w], axis, got, mode="reflect")
+            if not _same_values(ndi.correlate1d(x, w, axis, mode="reflect"), got):
+                return False
+    y = rng.standard_normal((5, 7, 19)) * 50
+    for shape in ((3, 3, 3), (2, 4, 4), (1, 5, 3)):
+        w = rng.uniform(-1, 1, shape)
+        got = np.empty_like(y)
+        filters.correlate(y, list(shape), w.reshape(-1).tolist(), got, mode="reflect")
+        if not _same_values(ndi.correlate(y, w, mode="reflect"), got):
+            return False
+    return True
+
+
+def _scipy_sums_agree() -> bool:
+    """Whether the engine's weighted sums give the installed scipy's values bit for bit
+    (checked once per process).
+
+    The engine's kernels follow scipy's C loops and also how the reference wheels were
+    compiled: on arm64 the compiler fuses a multiply and an add into one FMA, and which
+    of scipy's sums it fuses depends on the scipy release and the build (scipy 1.10's
+    macOS arm64 wheel differs from 1.17's in the last bit; a conda-forge or distribution
+    build can differ again). So gaussian_filter, gaussian_laplace,
+    gaussian_gradient_magnitude, correlate and convolve go to the engine only where a
+    probe shows it gives this scipy's float64 values: correlate1d (the Gaussians' pass)
+    with symmetric, antisymmetric and general kernels and scipy's own Gaussian weights,
+    and the n-D correlate with odd and even kernels. Otherwise they keep the Python
+    path, of any type. laplace needs no check: its products by 1 and -2 are exact,
+    fused or not.
+    """
+    global _sums_agree
+    with _sums_lock:
+        if _sums_agree is None:
+            core = _engine.engine()
+            if core is None:
+                # the engine is off or missing: nothing measured, nothing kept (a later
+                # call with the engine on runs the check)
+                return False
+            try:
+                _sums_agree = _probe_sums(core.filters)
+            except Exception:                # noqa: BLE001 - no agreement: Python path
+                _sums_agree = False
+            else:
+                if not _sums_agree:
+                    _warn_scipy_sums()
+        return _sums_agree
+
+
+def _warn_scipy_sums():
+    """Once per process, when the check fails (not when the engine cannot run it)."""
+    import scipy
+    warnings.warn(
+        f"scipy {scipy.__version__} rounds the weighted sums of its filters in another way "
+        "than the scipy release dyna-zarr's engine follows (the current one), so "
+        "gaussian_filter, gaussian_laplace, gaussian_gradient_magnitude, correlate and "
+        "convolve run on the slower Python path here. Their values are this scipy's either "
+        'way. Upgrading scipy is strongly recommended: pip install --upgrade scipy',
+        UserWarning, stacklevel=2)
+
+
 def _gaussian_chain(ndim, sigma, order, mode, truncate):
     """scipy.ndimage.gaussian_filter as engine passes (axis, kind, values, origin, mode):
     per axis with sigma > 1e-15 (as scipy), scipy's own weights for (sigma, order,
@@ -345,7 +441,7 @@ def _gaussian(t, spec):
     ndim = t.array.ndim
     sigma = _per_axis(spec["sigma"], ndim)
     order = _per_axis(spec["order"], ndim)
-    if sigma is None or order is None:
+    if sigma is None or order is None or not _scipy_sums_agree():
         return None
     chain = _gaussian_chain(ndim, sigma, order, spec["mode"], spec["truncate"])
     eng = None if chain is None else _up(t.array)
@@ -364,7 +460,7 @@ def _gaussian_terms(t, spec, order, combine):
     if combine == "hypot" and np.dtype(t.dtype).kind != "f":
         return None
     sigma = _per_axis(spec["sigma"], ndim)
-    if sigma is None:
+    if sigma is None or not _scipy_sums_agree():
         return None
     chains = []
     for d in range(ndim):
@@ -505,7 +601,7 @@ def _correlate(t, spec):
     w = np.asarray(spec["weights"])
     if w.dtype.kind not in "biuf" or w.ndim != t.array.ndim or 0 in w.shape:
         return None
-    if np.dtype(t.dtype).name not in _RANK_TYPES:
+    if np.dtype(t.dtype).name not in _RANK_TYPES or not _scipy_sums_agree():
         return None
     try:
         cval = float(spec["cval"])

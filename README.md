@@ -37,6 +37,8 @@ Peak memory depends on the selected region size, the number of threads, the dtyp
 pip install dyna-zarr
 ```
 
+This also installs `dyna-zarr-core`, dyna-zarr's native engine, written in Rust on [zarrs](https://github.com/zarrs/zarrs). dyna-zarr uses it wherever it gives the same values as the Python path. Its filters follow the current scipy release bit for bit. An older scipy can round the weighted sums of its filters in another way (scipy 1.10 on Apple Silicon does): dyna-zarr checks this once per process, and where it finds a difference it keeps the Gaussians, `correlate` and `convolve` on the slower Python path and warns, recommending `pip install --upgrade scipy`. To run everything on the Python path instead, set the environment variable `DYNA_ZARR_ENGINE=0`.
+
 Optional GPU support: install the extra matching your CUDA setup.
 
 ```bash
@@ -310,9 +312,10 @@ For new processing chains that fit dyna-zarr's slice-based model, using dyna-zar
 - Core dependencies include Zarr, NumPy, SciPy, TensorStore, and tifffile. The optional `zarrista` extra also requires NumPy 2.1 or newer.
 - TensorStore 0.1.86 or newer is required. In every earlier release, a write can wait forever when several writes run at once in one process, for example the images of a plate written side by side: TensorStore's thread pool could lose a wakeup, which 0.1.86 fixed. Older releases had further problems too: 0.1.77–0.1.84 crash at process exit after S3 access, and 0.1.85 keeps memory while the coarser levels are built (a 959-plane image of 14040 x 24551 climbed from 2.4 GB to 115 GB). dyna-zarr warns at import when it finds an older TensorStore, which can happen in an environment pip did not update. Upgrade it with `pip install --upgrade "tensorstore>=0.1.86"`.
 
-Run the core tests locally:
+Run the core tests locally. The engine in `core/` needs a Rust toolchain to build; install it from the source tree first, so that the tests run against the engine of this checkout:
 
 ```bash
+pip install ./core
 pip install -e ".[dev]"
 pytest -m "not zarrista and not gpu"
 ```

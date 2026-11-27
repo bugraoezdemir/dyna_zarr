@@ -90,6 +90,7 @@ def test_write_levels_peak_within_the_budget(sharded, tmp_path, engine, case):
     assert grew <= budget_mb + RUNTIME_MB, grew
 
 
+@pytest.mark.scipy_sums
 @pytest.mark.engine
 def test_write_levels_plans_threads_with_the_engine_cost(sharded, tmp_path, capsys, monkeypatch):
     """With the engine reading the chain, a worker costs its block, the engine's own cost

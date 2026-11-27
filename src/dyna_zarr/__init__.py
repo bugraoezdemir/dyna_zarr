@@ -8,7 +8,7 @@ large-scale (terabyte+) Zarr datasets.
 Includes efficient TIFF reading via tifffile's zarr bridge with concurrent access support.
 """
 
-__version__ = "0.1.6"
+__version__ = "0.2.0"
 __author__ = "Bugra Oezdemir"
 
 # First, before anything starts threads: glibc arenas shared by dyna's threads, so a

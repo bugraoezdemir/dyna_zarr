@@ -351,6 +351,11 @@ class DynamicArray:
             # a real chunk grid and makes the numpy case behave like every other source -
             # one code path instead of a special case. Costs one copy into the MemoryStore.
             source = _ndarray_to_memory_zarr(source, chunks)
+        # A grid dyna picked only to stage a NumPy array (chunks=None above) is a read
+        # layout, not the data's storage grid: io.write and write_levels treat it as no
+        # grid, so the output gets dyna's default chunks instead of ~32 MiB strips
+        # (Workplan D10). A grid the caller gave (from_array(x, chunks=...)) is kept.
+        self._staging_grid = from_numpy and chunks is None
         if isinstance(source, DynamicArray):
             # Copy constructor
             self._source = source._source
@@ -367,6 +372,8 @@ class DynamicArray:
             self._shards = source._shards
             self._codecs = source._codecs
             self._persist_owner = getattr(source, "_persist_owner", None)
+            # a chain over a staged NumPy array keeps that grid, so it stays marked
+            self._staging_grid = getattr(source, "_staging_grid", False)
         else:
             # Wrap a real Zarr array or TensorStore array
             # Check if it's tensorstore
@@ -1308,6 +1315,7 @@ def from_array(source, chunks=None, *, lock=None) -> DynamicArray:
         arr = DynamicArray(source)
         if chunks is not None:
             arr._chunks = _clamped(_require_grid(chunks, arr.shape), arr.shape)
+            arr._staging_grid = False              # the caller's grid, kept on write
         return arr
 
     missing = [a for a in ('shape', 'dtype', '__getitem__') if not hasattr(source, a)]
