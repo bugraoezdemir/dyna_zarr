@@ -17,7 +17,7 @@ where = ["src"]
 
 [project]
 name = "dyna-zarr"
-version = "0.1.6"
+version = "0.2.0"
 description = "A lightweight library for lazy operations on Zarr arrays without task graph overhead"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -72,6 +72,9 @@ classifiers = [
 #     0.1.86 has wheels for CPython 3.11-3.14 on Windows, Linux and macOS.
 #   zarr-zip>=0.1.0 - io.open_zip (Zarr written straight into a zip) writes through its
 #     ZipWriter, and reads a zip being written through its zarr-python store.
+#   dyna-zarr-core>=0.0.2,<0.1 - dyna's native engine (core/, released with dyna from the
+#     same tag), required since 0.2.0 (Bugra, 2026-11-27): 0.0.1 has no writer, and
+#     _engine.CORE_RANGE refuses it. DYNA_ZARR_ENGINE=0 still runs the Python path.
 # (The unpinned `tensorstore`/`tifffile` used to resolve to 0.1.0 / 0.1.0 at the floor.)
 dependencies = [
     "zarr>=3.1.5",
@@ -80,6 +83,7 @@ dependencies = [
     "scipy>=1.10",
     "tensorstore>=0.1.86",
     "tifffile>=2025.5.21",
+    "dyna-zarr-core>=0.0.2,<0.1",
 ]
 
 [project.optional-dependencies]

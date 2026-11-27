@@ -345,7 +345,7 @@ dependencies = [
 
 [[package]]
 name = "dyna-zarr-core"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "dyna-zarr-arrays",
  "dyna-zarr-filters",

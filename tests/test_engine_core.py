@@ -82,6 +82,20 @@ def test_an_engine_outside_the_supported_range_is_not_used(monkeypatch):
         _engine.enabled()
 
 
+def test_the_first_engine_release_is_not_used(monkeypatch):
+    """dyna-zarr-core 0.0.1 (released with dyna 0.1.6) has no writer, which dyna 0.2.0
+    calls, so an environment that kept it must fall back to the Python path, not fail
+    on its first engine write."""
+    class First:
+        __version__ = "0.0.1"
+    monkeypatch.setattr(_engine.importlib, "import_module", lambda name: First)
+    monkeypatch.setattr(_engine, "_looked", False)
+    monkeypatch.setattr(_engine, "_module", None)
+    assert not _engine.available()
+    assert "0.0.1" in _engine._problem and "0.0.2" in _engine._problem
+    assert "0.0.2" in _engine.FIX
+
+
 def test_threads_that_first_use_the_engine_at_once_all_find_it(monkeypatch):
     """eubi converts several scenes in parallel, so the engine's first use can come
     from several threads together. Each must wait for the one import and see its
@@ -90,7 +104,7 @@ def test_threads_that_first_use_the_engine_at_once_all_find_it(monkeypatch):
     import time
 
     class Engine:
-        __version__ = "0.0.1"
+        __version__ = "0.0.2"
     imports = []
 
     def slow_import(name):

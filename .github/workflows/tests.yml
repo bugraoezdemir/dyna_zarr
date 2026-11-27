@@ -26,9 +26,10 @@ concurrency:
 
 jobs:
   # dyna's native engine (core/, dyna-zarr-core; Workplan WP15): its wheels, built
-  # once per run. The test job below installs exactly these wheels, so the engine is
-  # tested on every OS and Python. install-check and floors do NOT install it: dyna
-  # does not require it yet, and they keep testing the Python path.
+  # once per run. dyna requires it since 0.2.0, so EVERY job that installs dyna installs
+  # exactly these wheels (--find-links wheels): a new engine version is not on PyPI until
+  # its release, and an older one on PyPI must not stand in for the code under test.
+  # The test job runs with the engine required, coverage with it off (the Python path).
   core:
     uses: ./.github/workflows/build-core.yml
 
@@ -90,7 +91,7 @@ jobs:
       - name: Install, with the engine wheels just built
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev]"
+          python -m pip install --find-links wheels -e ".[dev]"
           # exactly the wheel of this run, even if PyPI has the same version
           python -m pip install --no-index --find-links wheels --force-reinstall --no-deps dyna-zarr-core
 
@@ -118,6 +119,7 @@ jobs:
     # inside the core run: if the extra ever fails to install, this job goes red
     # instead of 47 tests quietly skipping under a green check.
     name: zarrista backend (${{ matrix.os }})
+    needs: core
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -134,10 +136,17 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-wheel-*
+          merge-multiple: true
+          path: wheels
+
       - name: Install with the zarrista extra
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,zarrista]"
+          python -m pip install --find-links wheels -e ".[dev,zarrista]"
+          python -m pip install --no-index --find-links wheels --force-reinstall --no-deps dyna-zarr-core
 
       - name: Fail if the backend did not actually become available
         # Without this the suite below would SKIP rather than fail, which is the
@@ -156,6 +165,7 @@ jobs:
     # the core run and makes their absence explicit rather than invisible.
     name: GPU backend (manual / self-hosted)
     if: github.event_name == 'workflow_dispatch' && inputs.gpu
+    needs: core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -165,11 +175,18 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-wheel-*
+          merge-multiple: true
+          path: wheels
+
       - name: Install with a CUDA extra
         # gpu-cu12 matches most current runners; change it to match the device.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,gpu-cu12]"
+          python -m pip install --find-links wheels -e ".[dev,gpu-cu12]"
+          python -m pip install --no-index --find-links wheels --force-reinstall --no-deps dyna-zarr-core
 
       - name: Fail if no usable CUDA device
         # tests/test_gpu_device.py SKIPS as a whole without a usable CUDA runtime, so on
@@ -186,6 +203,7 @@ jobs:
 
   coverage:
     name: Coverage
+    needs: core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -195,12 +213,19 @@ jobs:
           python-version: "3.13"
           cache: pip
 
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-wheel-*
+          merge-multiple: true
+          path: wheels
+
       - name: Install
         # With [zarrista] so the optional backend is measured rather than reported
         # as dead code. The GPU path stays out: it needs hardware this runner lacks.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[dev,zarrista]"
+          python -m pip install --find-links wheels -e ".[dev,zarrista]"
+          python -m pip install --no-index --find-links wheels --force-reinstall --no-deps dyna-zarr-core
 
       - name: Run tests with coverage
         # The Python path: the "test" jobs run the same suite with the engine on (it
@@ -226,6 +251,7 @@ jobs:
     # `ModuleNotFoundError`, while CI stayed green and `twine check` (metadata only)
     # passed. It was yanked and fixed in 0.0.5 via `packages.find`.
     name: Wheel install-check (${{ matrix.os }})
+    needs: core
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -241,6 +267,12 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-wheel-*
+          merge-multiple: true
+          path: wheels
 
       # Driven from Python rather than shell so one script covers every OS: venv
       # layouts differ (bin/ vs Scripts/), and Windows runners have no cp/ls.
@@ -268,7 +300,12 @@ jobs:
           # Extras are requested through the WHEEL's own metadata, so this also
           # proves they and their pins survive packaging - not just that they are
           # spelled correctly in pyproject.toml.
-          run(py, "-m", "pip", "install", f"{wheel}[dev,zarrista]", "pytest")
+          # The engine is a required dependency: this run's wheel, found next to the
+          # repo (its version is not on PyPI before its release), then forced in.
+          engine_wheels = os.path.join(os.environ["GITHUB_WORKSPACE"], "wheels")
+          run(py, "-m", "pip", "install", "--find-links", engine_wheels, f"{wheel}[dev,zarrista]", "pytest")
+          run(py, "-m", "pip", "install", "--no-index", "--find-links", engine_wheels,
+              "--force-reinstall", "--no-deps", "dyna-zarr-core")
 
           # Import every shipped subpackage explicitly: this is the check that would
           # have caught 0.0.4, and it fails loudly rather than being skipped.
@@ -287,8 +324,11 @@ jobs:
               "assert zb.ZARRISTA_AVAILABLE, 'the [zarrista] extra did not resolve';"
               "assert zb.installed_version() == zb.TESTED_VERSION, "
               "f'pin resolved to {zb.installed_version()}, expected {zb.TESTED_VERSION}';"
+              # the engine came with the wheel's own requirement and is usable
+              "from dyna_zarr import _engine;"
+              "assert _engine.available(), _engine._problem;"
               "print('dyna_zarr', dyna_zarr.__version__, 'imports cleanly from the wheel; "
-              "zarrista', zb.installed_version(), 'pinned OK')"
+              "zarrista', zb.installed_version(), 'pinned OK; engine', _engine.version())"
           )
           outside = tempfile.mkdtemp(prefix="dz-run-")
           run(py, "-c", probe, cwd=outside)
@@ -314,6 +354,7 @@ jobs:
     # from couplings between OTHER packages (see the comments on `dependencies`), which
     # is exactly what moves when those packages release - hence a job, not a one-off check.
     name: Dependency floors (py3.11, ${{ matrix.variant }}, ${{ matrix.os }})
+    needs: core
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -333,6 +374,12 @@ jobs:
         with:
           # The oldest Python in requires-python (>=3.11): floors bite hardest there.
           python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-wheel-*
+          merge-multiple: true
+          path: wheels
 
       - name: Install at the floors, verify they resolved, run the suite
         shell: python
@@ -359,7 +406,13 @@ jobs:
           # lowest-direct: dyna's OWN dependencies at their floors; transitive ones
           # resolve normally, as they would for a user who pinned dyna's floors.
           target = repo + ("[zarrista]" if variant == "zarrista" else "")
-          run(*uv, "pip", "install", "--python", py, "--resolution", "lowest-direct", target)
+          # The engine (a required dependency) from this run's wheels: its floor version
+          # is not on PyPI before its release. Then exactly this run's wheel, forced in.
+          engine_wheels = os.path.join(repo, "wheels")
+          run(*uv, "pip", "install", "--python", py, "--resolution", "lowest-direct",
+              "--find-links", engine_wheels, target)
+          run(*uv, "pip", "install", "--python", py, "--reinstall-package", "dyna-zarr-core",
+              "--no-index", "--find-links", engine_wheels, "--no-deps", "dyna-zarr-core")
           # pytest separately and NOT at lowest - it is tooling, not a floor under test.
           run(*uv, "pip", "install", "--python", py, "pytest")
           run(*uv, "pip", "list", "--python", py)

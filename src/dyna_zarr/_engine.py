@@ -26,9 +26,9 @@ from typing import Optional
 #: the environment variable that switches the engine on or off
 ENV = "DYNA_ZARR_ENGINE"
 #: the dyna-zarr-core releases this dyna works with: at least the first, below the second
-CORE_RANGE = ((0, 0, 1), (0, 1, 0))
+CORE_RANGE = ((0, 0, 2), (0, 1, 0))
 #: what to install
-FIX = 'pip install "dyna-zarr-core>=0.0.1,<0.1"'
+FIX = 'pip install "dyna-zarr-core>=0.0.2,<0.1"'
 
 _ON = {"1", "on", "true", "yes"}
 _OFF = {"0", "off", "false", "no"}
