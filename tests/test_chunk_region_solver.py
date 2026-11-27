@@ -309,3 +309,60 @@ def test_chunk_size_mb_reaches_the_store_and_is_near_budget(tmp_path):
     out = zarr.open_array(str(out_path), mode="r")
     assert _mb(out.chunks) <= 0.375
     np.testing.assert_allclose(out[:], data)
+
+
+# --------------------------------------------------------------------------
+# A NumPy input's staging grid is not inherited (Workplan D10)
+# --------------------------------------------------------------------------
+# from_array(numpy) stages the array in an in-memory zarr with ~32 MiB chunks over the
+# trailing axes, a read layout. Inherited as "the input's own grid", it wrote 32 MiB
+# strips ((2048, 8192) for an 8k uint16 image) and set a 32 MiB memory floor per region.
+
+def _staged(shape, dtype="uint16"):
+    from dyna_zarr import from_array
+    from dyna_zarr.dynamic_array import _ndarray_to_memory_zarr
+    data = np.random.default_rng(0).integers(0, 1000, size=shape).astype(dtype)
+    return data, from_array(data), tuple(_ndarray_to_memory_zarr(data).chunks)
+
+
+def test_numpy_staging_grid_is_not_inherited(tmp_path):
+    data, arr, staging = _staged((4096, 4096))
+    assert arr.chunks == staging == (4096, 4096)            # 32 MiB: one staging chunk
+    io.write(arr, str(tmp_path / "o.zarr"))
+    out = zarr.open_array(str(tmp_path / "o.zarr"), mode="r")
+    expected, _, _ = _solve_grids(data.shape, None, data.dtype, data.dtype)
+    assert tuple(out.chunks) == expected == (512, 1024)     # dyna's 1 MiB default
+    np.testing.assert_array_equal(out[:], data)
+
+
+def test_numpy_staging_grid_not_inherited_through_a_chain(tmp_path):
+    # a lazy op over the staged array reports the same grid, still not the data's own
+    data, arr, staging = _staged((16, 512, 2048))
+    chain = arr + 1
+    assert chain.chunks == staging
+    io.write(chain, str(tmp_path / "o.zarr"))
+    out = zarr.open_array(str(tmp_path / "o.zarr"), mode="r")
+    assert tuple(out.chunks) == _solve_grids(data.shape, None, data.dtype, data.dtype)[0]
+    assert tuple(out.chunks) != staging
+    np.testing.assert_array_equal(out[:], data + 1)
+
+
+def test_numpy_with_chunks_given_keeps_them(tmp_path):
+    # chunks= on from_array is the caller's grid: preserved on write, as for zarr inputs
+    from dyna_zarr import from_array
+    data = np.arange(256 * 512, dtype="uint16").reshape(256, 512)
+    io.write(from_array(data, chunks=(64, 128)), str(tmp_path / "o.zarr"))
+    assert tuple(zarr.open_array(str(tmp_path / "o.zarr"), mode="r").chunks) == (64, 128)
+
+
+def test_write_levels_ignores_numpy_staging_grid(tmp_path):
+    data, arr, staging = _staged((4096, 4096))
+    outs = [dict(path=str(tmp_path / f"L{i}.zarr"), factors=(f, f))
+            for i, f in enumerate((1, 2))]
+    io.write_levels(arr, outs)
+    for i, f in enumerate((1, 2)):
+        out = zarr.open_array(outs[i]["path"], mode="r")
+        level = data[::f, ::f]
+        assert tuple(out.chunks) == _solve_grids(level.shape, None, data.dtype,
+                                                 data.dtype)[0]
+        np.testing.assert_array_equal(out[:], level)
