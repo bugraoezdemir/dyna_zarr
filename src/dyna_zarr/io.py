@@ -1865,21 +1865,29 @@ def _region_cost(array, extent, shape, out_dtype):
             int(np.prod([int(e) for e in extent], dtype=np.int64)) * out_itemsize)
 
 
-#: the most a write's chunk cache takes without a memory budget (with one: a third of it)
-_HALO_CACHE_MAX = 512 << 20
+#: the most a write's chunk cache takes without a memory budget. Measured 2026-11-27
+#: (dyna_zarr/reports/dr6_cache_cap_2026_11_26): a Gaussian downscale of three real
+#: pyramids at 4 and 16 threads was as fast with 64 MiB as with the whole cache the write
+#: asks for (69-277 MiB), which held 90-220 MB more at 16 threads. Chunks decoded twice
+#: cost little there; most of the cache's gain is reading unit by unit through it.
+_HALO_CACHE_MAX = 64 << 20
 
 
-def _halo_cache_bytes(array, extent, along_last, threads, budget_bytes):
+def _halo_cache_bytes(array, extent, along_last, threads, room_bytes):
     """Bytes of decoded chunks the engine keeps for a write over a filter or a
     resampling (Workplan DR6, 2026-11-25), 0 for any other write.
 
     A region's halo lies in its neighbours' chunks. Regions are written in C order (the
     last axis fastest), so the neighbour before it along the second-to-last axis was
-    read ``along_last`` regions earlier: the cache holds about that many regions' input
-    and the ones in flight (``threads`` at most), halo included. Without it, every chunk
-    at a region's border was decoded once per region touching it (2.5 to 3.5 times for a
-    Gaussian downscale of real pyramids). Capped at a third of the budget, which the
-    caller then plans the regions without; and at ``_HALO_CACHE_MAX`` without a budget.
+    read ``along_last`` regions earlier: the whole cache holds about that many regions'
+    input and the ones in flight (``threads`` at most), halo included, so that no chunk
+    is decoded twice. Without a cache, every chunk at a region's border was decoded once
+    per region touching it (2.5 to 3.5 times for a Gaussian downscale of real pyramids).
+
+    ``room_bytes`` is what a memory budget leaves once the write's regions and threads
+    are planned (Bugra 2026-11-26: the fast path when it fits the budget, a smaller cache
+    when it does not; the threads are not cut for the cache). Without a budget (None) the
+    cache takes at most ``_HALO_CACHE_MAX``.
     """
     if not _reads_halo(array):
         return 0
@@ -1887,7 +1895,7 @@ def _halo_cache_bytes(array, extent, along_last, threads, budget_bytes):
     per_region = (int(np.prod([int(e) for e in extent], dtype=np.int64)) * itemsize
                   * _chain_read_amplification(array))
     want = int(1.5 * (int(along_last) + int(threads) + 2) * per_region)
-    cap = _HALO_CACHE_MAX if budget_bytes is None else int(budget_bytes // 3)
+    cap = _HALO_CACHE_MAX if room_bytes is None else int(room_bytes)
     return max(0, min(want, cap))
 
 
@@ -3915,28 +3923,26 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
                                   if decodes < before else "")
                                + (f"; {n} levels instead of {first_n} so that regions "
                                   f"hold whole read units" if n < first_n else ""))
-        # a chain over a filter keeps the chunks its regions' halos share (DR6), off the
-        # budget first unless one thread would not fit without it
-        along_last = -(-shape[-1] // region[-1])
-        cache_bytes = _halo_cache_bytes(
-            array, region, along_last, max_threads,
-            None if memory_budget_mb is None else float(memory_budget_mb) * 2**20)
-        if (cache_bytes and memory_budget_mb is not None
-                and float(memory_budget_mb) * 2**20 - cache_bytes < worker_cost(region)):
-            cache_bytes = 0
-        cache_bytes = _claim_halo_cache(cache_bytes)
-        if cache_bytes:
-            decode_note += f", chunk cache ~{cache_bytes / 2**20:.0f} MiB for the halos"
+        room = None                     # what the budget leaves for a filter's chunk cache
         if memory_budget_mb is not None:
             # as in io.write: the budget caps the threads (a ceiling, never a target)
             per_thread = max(1, int(worker_cost(region)))
-            affordable = int((float(memory_budget_mb) * 2**20 - cache_bytes) // per_thread)
+            affordable = int(float(memory_budget_mb) * 2**20 // per_thread)
             if affordable < 1:
                 _budget_too_small(memory_budget_mb, per_thread,
                                   f"one thread (a region of {region})",
                                   "Running with one thread.", "reduce region_size_mb",
                                   say="[Levels]")
             max_threads = max(1, min(int(max_threads), affordable))
+            room = max(0.0, float(memory_budget_mb) * 2**20 - max_threads * per_thread)
+        # a chain over a filter keeps the chunks its regions' halos share (DR6), in what
+        # the budget leaves once the threads are planned (the threads come first)
+        along_last = -(-shape[-1] // region[-1])
+        cache_bytes = _claim_halo_cache(
+            _halo_cache_bytes(array, region, along_last, max_threads, room))
+        if cache_bytes:
+            decode_note += f", chunk cache ~{cache_bytes / 2**20:.0f} MiB for the halos"
+        if memory_budget_mb is not None:
 
             def grow_to(mb, threads, now):
                 return max(now, min(int(threads),
@@ -3997,19 +4003,38 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
             # the budget is what this write may ADD to the process (as in io.write); the
             # caller, who owns the process, accounts for what it already holds
             budget_bytes = float(memory_budget_mb) * 2**20
-            # a chain over a filter keeps a third for its chunk cache (DR6), unless the
-            # smallest pass needs it
-            reserve = budget_bytes / 3 if _reads_halo(array) else 0.0
-
             def xy_plan(b):
                 return _plan_xy_tiles(shape, factors, inner, level_shapes,
                                       np.dtype(final_dtype).itemsize, b,
                                       src_unit, workers=max_threads, block_cost=worker_cost,
                                       read_cost=cost, region_bytes=budget,
                                       src_chunks=src_chunks)
-            plan = xy_plan(budget_bytes - reserve)
-            if reserve and not plan["fits"]:
-                reserve, plan = 0.0, xy_plan(budget_bytes)
+            plan = xy_plan(budget_bytes)
+            # a chain over a filter keeps a chunk cache (DR6). The tiles are planned with
+            # the whole budget and with smaller shares of it; of those plans, the most
+            # levels per pass, then the most threads, then the largest part of its own
+            # cache that fits beside it (whole: the fast path when it fits, Bugra
+            # 2026-11-26), then the largest tiles. The cache gets what the plan leaves, at
+            # most its whole size. Measured 2026-11-27 (MouseBrain v3 sharded, 4 threads,
+            # 150 MB): the whole budget's plan, full-width tiles on 2 threads with 27 MiB
+            # left, took 2.43 s; 3/4 of it on 4 threads with 40 MiB, 1.95 s; 2/3 of it on
+            # 4 threads with 50 MiB (the old third kept for the cache), 1.63 s.
+            if _reads_halo(array) and plan["fits"]:
+
+                def used(p):
+                    return p["chunks"] + p["blocks"]
+
+                def want(p):
+                    blk, (_, tx) = p["block"], p["tile"]
+                    return _halo_cache_bytes(array, blk, -(-tx // blk[-1]), p["workers"],
+                                             1 << 62)
+                options = [(plan, 1.0)] + [(p, s) for s in (3 / 4, 2 / 3, 1 / 2)
+                                           for p in [xy_plan(budget_bytes * s)] if p["fits"]]
+                plan, _ = max(options, key=lambda o: (
+                    o[0]["n"], o[0]["workers"], int(np.prod(o[0]["block"], dtype=np.int64)),
+                    min(1.0, max(0.0, budget_bytes - used(o[0])) / max(1, want(o[0]))),
+                    o[1]))
+                reserve = float(min(want(plan), max(0.0, budget_bytes - used(plan))))
             n, max_threads, planned_block = plan["n"], plan["workers"], plan["block"]
             slab = plan["slab"]
             ty, tx = plan["tile"]
@@ -4050,7 +4075,7 @@ def _write_levels(array, outputs, *, method="simple", max_threads=None, region_s
         # blocks go row by row inside a tile: a block's halo reaches the row before it
         cache_bytes = _halo_cache_bytes(
             array, block, -(-tile[-1] // block[-1]), max_threads,
-            None if memory_budget_mb is None else 3 * reserve)
+            None if memory_budget_mb is None else reserve)
         cache_bytes = _claim_halo_cache(cache_bytes)
         if cache_bytes:
             plan_note += f", chunk cache ~{cache_bytes / 2**20:.0f} MiB for the halos"
@@ -4865,21 +4890,17 @@ def _write_array(
         # max_threads = every thread the write keeps busy (decision DR-5): regions in
         # flight x threads per region, TensorStore's pools limited to it (see _scope).
         # A budget caps the regions (a ceiling, never a target); the floor is one region.
-        # a write over a filter keeps the chunks its regions' halos share (DR6): the
-        # cache comes off the budget first, unless one region would not fit without it
-        cache_bytes = _halo_cache_bytes(input_array, _max_extent,
-                                        len({b[-1] for b in chunk_indices}),
-                                        requested_workers, budget_bytes)
-        plan = _plan_regions(
-            input_array, chunk_indices, input_shape, requested_workers,
-            None if budget_bytes is None else budget_bytes - cache_bytes,
-            worker_bytes, out_bytes)
-        if cache_bytes and not plan[3]:
-            cache_bytes = 0
-            plan = _plan_regions(input_array, chunk_indices, input_shape,
-                                 requested_workers, budget_bytes, worker_bytes, out_bytes)
+        plan = _plan_regions(input_array, chunk_indices, input_shape, requested_workers,
+                             budget_bytes, worker_bytes, out_bytes)
         workers, per_region, region_bytes, fits = plan
-        cache_bytes = _claim_halo_cache(cache_bytes)
+        # a write over a filter keeps the chunks its regions' halos share (DR6), in what
+        # the budget leaves once the regions are planned: the regions and threads come
+        # first, the cache is smaller when the budget is tight (Bugra 2026-11-26)
+        room = (None if budget_bytes is None
+                else max(0.0, budget_bytes - workers * region_bytes) if fits else 0.0)
+        cache_bytes = _claim_halo_cache(_halo_cache_bytes(
+            input_array, _max_extent, len({b[-1] for b in chunk_indices}),
+            requested_workers, room))
         if not fits:
             _budget_too_small(
                 memory_budget_mb, region_bytes,
