@@ -510,6 +510,32 @@ def test_the_reference_builds_agree_with_the_engine():
     assert _lowering._scipy_sums_agree()
 
 
+def test_a_failed_check_warns_once_and_recommends_upgrading_scipy(monkeypatch):
+    """A scipy that sums otherwise gets one warning per process, naming its version, the
+    filters that stay on the Python path and the upgrade; an engine that cannot run the
+    check (no agreement, no claim about scipy) gets none."""
+    import warnings
+
+    import scipy
+    monkeypatch.setattr(_lowering, "_probe_sums", lambda filters: False)
+    monkeypatch.setattr(_lowering, "_sums_agree", None)
+    with pytest.warns(UserWarning, match="pip install --upgrade scipy") as seen:
+        assert _lowering._scipy_sums_agree() is False
+    text = str(seen[0].message)
+    assert scipy.__version__ in text and "gaussian_filter" in text and "convolve" in text
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _lowering._scipy_sums_agree() is False      # checked once: no second warning
+
+    def broken(filters):
+        raise RuntimeError("no engine")
+    monkeypatch.setattr(_lowering, "_probe_sums", broken)
+    monkeypatch.setattr(_lowering, "_sums_agree", None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert _lowering._scipy_sums_agree() is False
+
+
 def test_a_scipy_that_sums_otherwise_keeps_the_python_path(tmp_path, monkeypatch):
     """Where the check fails, the filters with weighted sums keep the Python path (of
     any type), the others still go to the engine, and every value stays scipy's."""

@@ -27,6 +27,20 @@ def pytest_configure(config):
         config.addinivalue_line("markers", marker)
 
 
+def pytest_sessionstart(session):
+    """Run the scipy check once before any test: where it fails it warns (once per
+    process), and that warning must not land in a test that asserts it sees none."""
+    import warnings
+    try:
+        from dyna_zarr import _engine, _lowering
+    except Exception:                                  # noqa: BLE001 - tests report it
+        return
+    if _engine.available():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            _lowering._scipy_sums_agree()
+
+
 def pytest_runtest_setup(item):
     """``scipy_sums``: the test compares the engine's weighted sums (correlate1d, the
     Gaussians, the n-D correlate) with scipy's, or needs such a filter lowered. Where

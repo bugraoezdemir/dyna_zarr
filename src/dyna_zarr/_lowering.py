@@ -60,6 +60,7 @@ from __future__ import annotations
 import operator
 import os
 import threading
+import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -393,7 +394,22 @@ def _scipy_sums_agree() -> bool:
                 _sums_agree = _probe_sums(_engine.engine().filters)
             except Exception:                # noqa: BLE001 - no agreement: Python path
                 _sums_agree = False
+            else:
+                if not _sums_agree:
+                    _warn_scipy_sums()
         return _sums_agree
+
+
+def _warn_scipy_sums():
+    """Once per process, when the check fails (not when the engine cannot run it)."""
+    import scipy
+    warnings.warn(
+        f"scipy {scipy.__version__} rounds the weighted sums of its filters in another way "
+        "than the scipy release dyna-zarr's engine follows (the current one), so "
+        "gaussian_filter, gaussian_laplace, gaussian_gradient_magnitude, correlate and "
+        "convolve run on the slower Python path here. Their values are this scipy's either "
+        'way. Upgrading scipy is strongly recommended: pip install --upgrade scipy',
+        UserWarning, stacklevel=2)
 
 
 def _gaussian_chain(ndim, sigma, order, mode, truncate):

@@ -37,7 +37,7 @@ Peak memory depends on the selected region size, the number of threads, the dtyp
 pip install dyna-zarr
 ```
 
-This also installs `dyna-zarr-core`, dyna-zarr's native engine, written in Rust on [zarrs](https://github.com/zarrs/zarrs). dyna-zarr uses it wherever it gives the same values as the Python path. To run everything on the Python path instead, set the environment variable `DYNA_ZARR_ENGINE=0`.
+This also installs `dyna-zarr-core`, dyna-zarr's native engine, written in Rust on [zarrs](https://github.com/zarrs/zarrs). dyna-zarr uses it wherever it gives the same values as the Python path. Its filters follow the current scipy release bit for bit. An older scipy can round the weighted sums of its filters in another way (scipy 1.10 on Apple Silicon does): dyna-zarr checks this once per process, and where it finds a difference it keeps the Gaussians, `correlate` and `convolve` on the slower Python path and warns, recommending `pip install --upgrade scipy`. To run everything on the Python path instead, set the environment variable `DYNA_ZARR_ENGINE=0`.
 
 Optional GPU support: install the extra matching your CUDA setup.
 
