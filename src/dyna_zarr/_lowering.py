@@ -390,8 +390,13 @@ def _scipy_sums_agree() -> bool:
     global _sums_agree
     with _sums_lock:
         if _sums_agree is None:
+            core = _engine.engine()
+            if core is None:
+                # the engine is off or missing: nothing measured, nothing kept (a later
+                # call with the engine on runs the check)
+                return False
             try:
-                _sums_agree = _probe_sums(_engine.engine().filters)
+                _sums_agree = _probe_sums(core.filters)
             except Exception:                # noqa: BLE001 - no agreement: Python path
                 _sums_agree = False
             else:

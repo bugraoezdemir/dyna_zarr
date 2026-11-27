@@ -510,6 +510,20 @@ def test_the_reference_builds_agree_with_the_engine():
     assert _lowering._scipy_sums_agree()
 
 
+def test_the_check_with_the_engine_off_keeps_nothing(monkeypatch):
+    """With the engine off (DYNA_ZARR_ENGINE=0, as the coverage job runs, and conftest
+    asks at the session's start) the check measures nothing and keeps nothing: once the
+    engine is switched on, it is checked."""
+    calls = []
+    monkeypatch.setattr(_lowering, "_probe_sums", lambda filters: calls.append(1) or True)
+    monkeypatch.setattr(_lowering, "_sums_agree", None)
+    _engine.set_engine(False)
+    assert _lowering._scipy_sums_agree() is False
+    assert _lowering._sums_agree is None and not calls
+    _engine.set_engine(True)
+    assert _lowering._scipy_sums_agree() is True and calls == [1]
+
+
 def test_a_failed_check_warns_once_and_recommends_upgrading_scipy(monkeypatch):
     """A scipy that sums otherwise gets one warning per process, naming its version, the
     filters that stay on the Python path and the upgrade; an engine that cannot run the
